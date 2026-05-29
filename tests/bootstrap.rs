@@ -1,6 +1,6 @@
 mod common;
 
-use std::{env, fs};
+use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 use wecode::{
     bootstrap_plan_with_backend_command, default_config, patch_openclaw_text_command_routing,
     BootstrapChannel, CommandStep,
@@ -182,6 +182,158 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
 }
 
 #[test]
+fn bootstrap_suppresses_openclaw_output_and_prints_wecode_success_banner() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let project_dir = temp.path().join("project");
+    let runtime_dir = temp.path().join("openclaw-runtime");
+    let state_dir = temp.path().join("openclaw-state");
+    let workspace_dir = temp.path().join("workspace");
+    let config_path = temp.path().join("wecode.json");
+    fs::create_dir(&project_dir).expect("project dir");
+
+    write_executable(
+        &temp.path().join("node"),
+        r#"#!/bin/sh
+echo v24.0.0
+"#,
+    );
+    write_executable(
+        &temp.path().join("codex"),
+        r#"#!/bin/sh
+echo codex 1.0.0
+"#,
+    );
+    write_executable(
+        &temp.path().join("npx"),
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 10.0.0
+  exit 0
+fi
+echo "Weixin QR code stdout"
+echo "openclaw-weixin internal stdout"
+echo "Weixin login stderr" >&2
+"#,
+    );
+    write_executable(
+        &temp.path().join("npm"),
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 10.0.0
+  exit 0
+fi
+prefix=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--prefix" ]; then
+    shift
+    prefix="$1"
+  fi
+  shift
+done
+mkdir -p "$prefix/node_modules/openclaw/dist" "$prefix/node_modules/.bin"
+cat > "$prefix/node_modules/openclaw/dist/commands-text-routing-test.js" <<'EOF'
+{routing_source}
+EOF
+cat > "$prefix/node_modules/.bin/openclaw" <<'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "OpenClaw 2026.5.27"
+  exit 0
+fi
+echo "OpenClaw noisy gateway stdout"
+echo "OpenClaw noisy gateway stderr" >&2
+EOF
+chmod 755 "$prefix/node_modules/.bin/openclaw"
+echo "OpenClaw noisy npm stdout"
+echo "OpenClaw noisy npm stderr" >&2
+"#,
+            routing_source = openclaw_text_routing_source()
+        ),
+    );
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{
+                "runtimeDir": "{}",
+                "stateDir": "{}",
+                "configPath": "{}",
+                "workspaceDir": "{}",
+                "nodeBinDir": "{}"
+              }},
+              "codex": {{"cwd": "{}"}},
+              "commands": []
+            }}"#,
+            runtime_dir.display(),
+            state_dir.display(),
+            state_dir.join("openclaw.json").display(),
+            workspace_dir.display(),
+            temp.path().display(),
+            project_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "bootstrap",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--weixin",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run bootstrap");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(stdout.contains("Wecode 启动成功"), "stdout:\n{stdout}");
+    assert!(stdout.contains("🚀"), "stdout:\n{stdout}");
+    assert!(
+        combined.contains("Wecode 启动中"),
+        "combined output:\n{combined}"
+    );
+    assert!(
+        stdout.contains("Weixin QR code stdout"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("openclaw"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stderr.contains("Weixin login stderr"), "stderr:\n{stderr}");
+    assert!(
+        !combined.contains("OpenClaw noisy"),
+        "combined output:\n{combined}"
+    );
+    assert!(
+        !combined.contains("$ "),
+        "bootstrap should not print raw child commands:\n{combined}"
+    );
+
+    let log = fs::read_to_string(state_dir.join("bootstrap.log")).expect("bootstrap log");
+    assert!(log.contains("OpenClaw noisy npm stdout"), "log:\n{log}");
+    assert!(log.contains("OpenClaw noisy npm stderr"), "log:\n{log}");
+    assert!(log.contains("OpenClaw noisy gateway stdout"), "log:\n{log}");
+    assert!(log.contains("OpenClaw noisy gateway stderr"), "log:\n{log}");
+    assert!(!log.contains("Weixin QR code stdout"), "log:\n{log}");
+    assert!(!log.contains("Weixin login stderr"), "log:\n{log}");
+}
+
+#[test]
 fn patch_openclaw_text_routing_disables_non_native_fallback() {
     let temp = tempfile::tempdir().expect("temp dir");
     let dist = temp
@@ -286,4 +438,20 @@ fn bootstrap_plan_prepends_configured_node_bin_dir_to_node_based_steps() {
             "~/.wecode/openclaw-runtime/node_modules/.bin"
         ]
     );
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write executable");
+    let mut permissions = fs::metadata(path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod executable");
+}
+
+fn openclaw_text_routing_source() -> &'static str {
+    r#"function shouldHandleTextCommands(params) {
+	if (params.commandSource === "native") return true;
+	if (params.cfg.commands?.text !== false) return true;
+	return !isNativeCommandSurface(params.surface);
+}
+"#
 }

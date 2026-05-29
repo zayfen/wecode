@@ -37,6 +37,7 @@ fn lists_codex_sessions_for_current_project_only() {
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0].id, "019e746e-4c43-74c2-b47a-424fd4f025c7");
     assert_eq!(sessions[0].title, "new project session");
+    assert_eq!(sessions[0].initial_prompt, "new project session");
     assert_eq!(sessions[1].id, "019e6f79-2feb-7f42-9880-629b573262f5");
 }
 

@@ -1,9 +1,10 @@
 use std::{
     env, fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Command, ExitStatus, Output, Stdio},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use wecode::{
@@ -79,8 +80,7 @@ fn run(command: CliCommand) -> Result<(), String> {
             dry_run,
             channel,
         } => {
-            let (config, source) = load_config(config_path)?;
-            eprintln!("using config: {source}");
+            let (config, _) = load_config(config_path)?;
             let backend_command = current_exe_string()?;
             let steps = bootstrap_plan_with_backend_command(&config, channel, &backend_command);
 
@@ -91,7 +91,10 @@ fn run(command: CliCommand) -> Result<(), String> {
 
             validate_bootstrap_prereqs(&config, true)?;
             ensure_private_openclaw_dirs(&config)?;
-            run_steps(&config, &steps)
+            let log_path = bootstrap_log_path(&config);
+            run_steps_logged(&config, &steps, &log_path)?;
+            print_bootstrap_success();
+            Ok(())
         }
         CliCommand::PatchOpenclawRuntime { runtime_dir } => {
             patch_openclaw_text_command_routing(Path::new(&expand_tilde(&runtime_dir)))?;
@@ -205,7 +208,6 @@ fn validate_bootstrap_prereqs(
 ) -> Result<(), String> {
     let snapshot = probe_tools(config);
     let report = diagnose_tools(&snapshot);
-    print_report(&report);
 
     let required_ok = report.items.iter().all(|item| match item.name.as_str() {
         "openclaw" => item.ok || openclaw_will_be_installed,
@@ -216,17 +218,52 @@ fn validate_bootstrap_prereqs(
     if required_ok {
         Ok(())
     } else {
+        print_report(&report);
         Err("bootstrap prerequisites are not satisfied".to_string())
     }
 }
 
 fn run_steps(config: &WecodeConfig, steps: &[CommandStep]) -> Result<(), String> {
+    run_steps_with_output(config, steps, StepOutput::Inherit)
+}
+
+fn run_steps_logged(
+    config: &WecodeConfig,
+    steps: &[CommandStep],
+    log_path: &Path,
+) -> Result<(), String> {
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create bootstrap log dir: {err}"))?;
+    }
+    fs::write(log_path, "Wecode bootstrap log\n").map_err(|err| {
+        format!(
+            "failed to initialize bootstrap log {}: {err}",
+            log_path.display()
+        )
+    })?;
+    run_steps_with_output(config, steps, StepOutput::Bootstrap(log_path.to_path_buf()))
+}
+
+#[derive(Clone)]
+enum StepOutput {
+    Inherit,
+    Bootstrap(PathBuf),
+}
+
+fn run_steps_with_output(
+    config: &WecodeConfig,
+    steps: &[CommandStep],
+    output_mode: StepOutput,
+) -> Result<(), String> {
     let runtime_node_bin_dir = resolve_supported_node_bin_dir(config);
 
     for step in steps {
         let path_prepend = runtime_path_prepend(&runtime_node_bin_dir, &step.path_prepend);
         let display_step = step_with_path_prepend(step, path_prepend.clone());
-        eprintln!("$ {}", display_step.display_shell());
+        if matches!(output_mode, StepOutput::Inherit) {
+            eprintln!("$ {}", display_step.display_shell());
+        }
 
         let program = expand_tilde(&step.program);
         let args = step
@@ -248,16 +285,184 @@ fn run_steps(config: &WecodeConfig, steps: &[CommandStep]) -> Result<(), String>
             command.env(key, expand_tilde(value));
         }
 
-        let status = command
-            .status()
-            .map_err(|err| format!("failed to start `{}`: {err}", step.program))?;
+        match output_mode {
+            StepOutput::Inherit => {
+                command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+                let status = command
+                    .status()
+                    .map_err(|err| format!("failed to start `{}`: {err}", step.program))?;
 
-        if !status.success() {
-            return Err(format!("command failed: {}", display_step.display_shell()));
+                if !status.success() {
+                    return Err(format!("command failed: {}", display_step.display_shell()));
+                }
+            }
+            StepOutput::Bootstrap(_) if is_weixin_install_step(step) => {
+                run_visible_step_with_filtered_stdout(&mut command, &display_step)?;
+            }
+            StepOutput::Bootstrap(ref log_path) => {
+                run_logged_step(
+                    &mut command,
+                    &display_step,
+                    log_path,
+                    is_openclaw_install_step(step),
+                )?;
+            }
         }
     }
 
     Ok(())
+}
+
+fn run_visible_step_with_filtered_stdout(
+    command: &mut Command,
+    display_step: &CommandStep,
+) -> Result<(), String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to start `{}`: {err}", display_step.program))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("failed to capture stdout for `{}`", display_step.program))?;
+    let stdout_filter = thread::spawn(move || filter_openclaw_lines_to_stdout(stdout));
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed to wait for `{}`: {err}", display_step.program))?;
+    stdout_filter
+        .join()
+        .map_err(|_| "bootstrap stdout filter panicked".to_string())?
+        .map_err(|err| format!("failed to filter bootstrap stdout: {err}"))?;
+
+    if !status.success() {
+        return Err(format!("command failed: {}", display_step.display_shell()));
+    }
+
+    Ok(())
+}
+
+fn filter_openclaw_lines_to_stdout<R: Read>(reader: R) -> io::Result<()> {
+    let mut reader = BufReader::new(reader);
+    let mut stdout = io::stdout().lock();
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        let bytes = reader.read_until(b'\n', &mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        if !String::from_utf8_lossy(&line)
+            .to_ascii_lowercase()
+            .contains("openclaw")
+        {
+            stdout.write_all(&line)?;
+            stdout.flush()?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_logged_step(
+    command: &mut Command,
+    display_step: &CommandStep,
+    log_path: &Path,
+    show_spinner: bool,
+) -> Result<(), String> {
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|err| format!("failed to open bootstrap log {}: {err}", log_path.display()))?;
+    writeln!(log, "\n$ {}", display_step.display_shell()).map_err(|err| {
+        format!(
+            "failed to write bootstrap log {}: {err}",
+            log_path.display()
+        )
+    })?;
+    let stdout = log.try_clone().map_err(|err| {
+        format!(
+            "failed to clone bootstrap log {}: {err}",
+            log_path.display()
+        )
+    })?;
+    let stderr = log.try_clone().map_err(|err| {
+        format!(
+            "failed to clone bootstrap log {}: {err}",
+            log_path.display()
+        )
+    })?;
+    command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let status = if show_spinner {
+        run_status_with_spinner(command, "Wecode 启动中")
+    } else {
+        command.status()
+    }
+    .map_err(|err| format!("failed to start `{}`: {err}", display_step.program))?;
+
+    if !status.success() {
+        return Err(format!(
+            "command failed: {}\nBootstrap log: {}",
+            display_step.display_shell(),
+            log_path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn run_status_with_spinner(command: &mut Command, label: &str) -> std::io::Result<ExitStatus> {
+    let mut child = command.spawn()?;
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut idx = 0;
+    eprint!("\r{} {label}", frames[0]);
+    io::stderr().flush().ok();
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            eprint!("\r\x1b[2K");
+            io::stderr().flush().ok();
+            return Ok(status);
+        }
+        eprint!("\r{} {label}", frames[idx % frames.len()]);
+        io::stderr().flush().ok();
+        idx += 1;
+        thread::sleep(Duration::from_millis(80));
+    }
+}
+
+fn is_openclaw_install_step(step: &CommandStep) -> bool {
+    step.program == "npm"
+        && step.args.iter().any(|arg| arg == "install")
+        && step.args.iter().any(|arg| arg == "openclaw@latest")
+}
+
+fn is_weixin_install_step(step: &CommandStep) -> bool {
+    step.program == "npx"
+        && step
+            .args
+            .iter()
+            .any(|arg| arg.contains("openclaw-weixin-cli"))
+}
+
+fn print_bootstrap_success() {
+    println!(
+        "{}",
+        [
+            "╭────────────────────────╮",
+            "│   🚀 Wecode 启动成功   │",
+            "╰────────────────────────╯"
+        ]
+        .join("\n")
+    );
+}
+
+fn bootstrap_log_path(config: &WecodeConfig) -> PathBuf {
+    PathBuf::from(expand_tilde(&config.openclaw.state_dir)).join("bootstrap.log")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -744,6 +949,9 @@ fn emit_resume_list(config: &WecodeConfig, jsonl: bool) -> Result<(), String> {
                 session.id,
                 title
             ));
+            if !session.initial_prompt.is_empty() {
+                lines.push(format!("   Prompt: {}", session.initial_prompt));
+            }
         }
         lines.push("Reply `/resume <session_id>` to bind this chat.".to_string());
         lines.join("\n")
@@ -831,53 +1039,83 @@ fn read_pending_approval(path: &Path) -> Result<PendingApproval, String> {
 
 fn weixin_help_message(config: &WecodeConfig) -> String {
     let mut lines = vec![
-        "Wecode help".to_string(),
+        "# Wecode 帮助".to_string(),
         "".to_string(),
-        "Shell commands (local, no Codex):".to_string(),
-        "/pwd - show current Codex project directory".to_string(),
-        "/ls [path] - list a directory with absolute paths".to_string(),
-        "/cat <path> - read a local text file".to_string(),
-        "/cd <path> - switch Codex project directory".to_string(),
-        "/shell <command> - run a shell command in the current Codex project directory".to_string(),
-        "/diff - show current git diff".to_string(),
-        "/status - show backend, project, session, approvals, and git status".to_string(),
+        "`/help` 和 `/commands` 由 Wecode 本地直接返回，不会请求 Codex。".to_string(),
         "".to_string(),
-        "Codex commands:".to_string(),
-        "/init [notes] - create or update AGENTS.md for this project".to_string(),
-        "/review [instructions] - run codex exec review on uncommitted changes".to_string(),
-        "/new [prompt] - start a fresh Codex session".to_string(),
-        "/compact [notes] - compact current context into a handoff summary".to_string(),
-        "/plan [task] - ask Codex for a plan without editing files".to_string(),
-        "/goal [objective] - ask Codex to report or update the active goal".to_string(),
-        "/agent [task] - ask Codex to use subagents where useful".to_string(),
-        "/side [question] - ask Codex for side analysis without file changes".to_string(),
-        "/report [notes] - ask Codex for task status through a side query".to_string(),
+        "## 普通消息".to_string(),
         "".to_string(),
-        "Session and approval commands:".to_string(),
-        "/resume - list Codex sessions for this project".to_string(),
-        "/sessions - same as /resume".to_string(),
-        "/resume <session_id> - bind this chat to a Codex session".to_string(),
-        "/approve <id> - approve a pending command".to_string(),
-        "/deny <id> - deny a pending command".to_string(),
+        "非 slash 消息会发送给 Codex，并在当前项目目录执行。当前聊天如果已绑定 session，Wecode 会自动续接该 Codex session。".to_string(),
         "".to_string(),
-        "Model commands:".to_string(),
-        "/model - show current Codex model".to_string(),
-        "/models - list configured Codex models".to_string(),
-        "/model <model> - set Codex model for the current project".to_string(),
-        "/model default - clear the project model override".to_string(),
+        "## 本地命令（不调用 Codex）".to_string(),
+        "".to_string(),
+        "- `/help` / `/commands` - 显示本帮助，不请求 Codex".to_string(),
+        "- `/pwd` - 显示当前 Codex 项目目录".to_string(),
+        "- `/ls [path]` - 列出目录，返回绝对路径".to_string(),
+        "- `/cat <path>` - 读取项目内文本文件".to_string(),
+        "- `/cd <path>` - 切换 Codex 项目目录，下一次任务会新开 session".to_string(),
+        "- `/shell <command>` - 在当前 Codex 项目目录执行 shell 命令".to_string(),
+        "- `/diff` - 显示当前项目 git diff".to_string(),
+        "- `/status` - 显示后端、项目、session、审批、模型和 git 状态".to_string(),
+        "".to_string(),
+        "## Codex 命令（会调用 Codex）".to_string(),
+        "".to_string(),
+        "- `/init [notes]` - 创建或更新 AGENTS.md".to_string(),
+        "- `/review [instructions]` - 对未提交改动执行 Codex review".to_string(),
+        "- `/new [prompt]` - 新开 Codex session".to_string(),
+        "- `/compact [notes]` - 请求 Codex 压缩上下文".to_string(),
+        "- `/plan [task]` - 让 Codex 先写计划".to_string(),
+        "- `/goal [objective]` - 查询或更新当前 goal".to_string(),
+        "- `/agent [task]` - 让 Codex 在适合时使用 subagent".to_string(),
+        "- `/side [question]` - 请求旁路分析，不直接改文件".to_string(),
+        "- `/report [notes]` - 查询任务进展".to_string(),
+        "".to_string(),
+        "## Session 命令".to_string(),
+        "".to_string(),
+        "- `/resume` - 列出当前项目的 Codex sessions，并显示最初 prompt".to_string(),
+        "- `/sessions` - 等同于 `/resume`".to_string(),
+        "- `/resume <session_id>` - 把当前聊天绑定到指定 Codex session".to_string(),
+        "".to_string(),
+        "## 审批命令".to_string(),
+        "".to_string(),
+        "- `/approve <id>` - 批准并执行待确认命令".to_string(),
+        "- `/deny <id>` - 拒绝待确认命令".to_string(),
+        "".to_string(),
+        "## 模型命令".to_string(),
+        "".to_string(),
+        "- `/model` - 显示当前项目使用的 Codex 模型".to_string(),
+        "- `/models` - 列出配置中的 Codex 模型候选".to_string(),
+        "- `/model <model>` - 设置当前项目后续使用的 Codex 模型".to_string(),
+        "- `/model default` - 清除项目模型覆盖".to_string(),
     ];
     if !config.commands.is_empty() {
         lines.push("".to_string());
-        lines.push("Custom prompt commands:".to_string());
+        lines.push("## 自定义命令".to_string());
+        lines.push("".to_string());
         for command in &config.commands {
+            let approval = if command.require_confirm {
+                "（需要审批）"
+            } else {
+                ""
+            };
             lines.push(format!(
-                "{}... - {}",
-                command.prefix.trim_end(),
-                command.name
+                "- `{}` - {}{}",
+                custom_command_usage(&command.prefix),
+                command.name,
+                approval
             ));
         }
     }
     lines.join("\n")
+}
+
+fn custom_command_usage(prefix: &str) -> String {
+    let trimmed = prefix.trim_end();
+    if prefix.chars().last().is_some_and(char::is_whitespace) {
+        format!("{trimmed} <text>")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn weixin_status_message(

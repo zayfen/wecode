@@ -122,6 +122,7 @@ pub struct CodexSessionSummary {
     pub cwd: String,
     pub originator: String,
     pub title: String,
+    pub initial_prompt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1105,6 +1106,7 @@ fn read_codex_session(path: &Path) -> Result<Option<CodexSessionSummary>, String
     let reader = BufReader::new(file);
     let mut meta = None;
     let mut title = String::new();
+    let mut initial_prompt = String::new();
 
     for (line_idx, line) in reader.lines().enumerate() {
         if line_idx >= 200 {
@@ -1126,7 +1128,10 @@ fn read_codex_session(path: &Path) -> Result<Option<CodexSessionSummary>, String
         if title.is_empty() {
             title = extract_session_title(&value);
         }
-        if meta.is_some() && !title.is_empty() {
+        if initial_prompt.is_empty() {
+            initial_prompt = extract_session_prompt(&value);
+        }
+        if meta.is_some() && !title.is_empty() && !initial_prompt.is_empty() {
             break;
         }
     }
@@ -1141,6 +1146,7 @@ fn read_codex_session(path: &Path) -> Result<Option<CodexSessionSummary>, String
         cwd,
         originator,
         title,
+        initial_prompt,
     }))
 }
 
@@ -1191,9 +1197,53 @@ fn extract_session_title(value: &Value) -> String {
     String::new()
 }
 
+fn extract_session_prompt(value: &Value) -> String {
+    if value.get("type").and_then(Value::as_str) == Some("event_msg") {
+        if let Some(payload) = value.get("payload") {
+            if payload.get("type").and_then(Value::as_str) == Some("user_message") {
+                if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                    return sanitize_prompt(message);
+                }
+            }
+        }
+    }
+
+    if value.get("type").and_then(Value::as_str) == Some("response_item") {
+        let Some(payload) = value.get("payload") else {
+            return String::new();
+        };
+        if payload.get("role").and_then(Value::as_str) != Some("user") {
+            return String::new();
+        }
+        if let Some(content) = payload.get("content").and_then(Value::as_array) {
+            for item in content {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    return sanitize_prompt(text);
+                }
+            }
+        }
+    }
+
+    String::new()
+}
+
 fn sanitize_title(input: &str) -> String {
+    truncate_single_line(input, 80)
+}
+
+fn sanitize_prompt(input: &str) -> String {
+    truncate_single_line(input, 160)
+}
+
+fn truncate_single_line(input: &str, max_chars: usize) -> String {
     let collapsed = input.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed.chars().take(80).collect()
+    let mut chars = collapsed.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 fn comparable_path(path: &Path) -> PathBuf {

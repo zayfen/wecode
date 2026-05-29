@@ -683,6 +683,75 @@ fn local_filesystem_commands_do_not_invoke_codex() {
 }
 
 #[test]
+fn sessions_command_includes_initial_prompt_without_invoking_codex() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let project_dir = temp.path().join("project");
+    fs::create_dir(&project_dir).expect("project dir");
+    let project_dir = project_dir.canonicalize().expect("canonical project dir");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    let codex_home = temp.path().join("codex-home");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+
+    write_fake_codex(&codex_path, &calls_path);
+    fs::create_dir_all(codex_home.join("sessions/2026/05/29")).expect("session dirs");
+    fs::write(
+        codex_home
+            .join("sessions/2026/05/29/rollout-019e746e-4c43-74c2-b47a-424fd4f025c7.jsonl"),
+        format!(
+            r#"{{"timestamp":"2026-05-29T15:50:46.110Z","type":"session_meta","payload":{{"id":"019e746e-4c43-74c2-b47a-424fd4f025c7","timestamp":"2026-05-29T15:50:46.110Z","cwd":"{}","originator":"codex_exec"}}}}
+{{"timestamp":"2026-05-29T15:50:47.110Z","type":"event_msg","payload":{{"type":"user_message","message":"Implement account export command"}}}}
+"#,
+            project_dir.display()
+        ),
+    )
+    .expect("write session");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{"cwd": "{}"}}
+            }}"#,
+            state_dir.display(),
+            project_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "/sessions",
+        ])
+        .env("CODEX_HOME", &codex_home)
+        .env("PATH", path)
+        .output()
+        .expect("run sessions");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Prompt: Implement account export command"),
+        "stdout:\n{stdout}"
+    );
+    assert!(!calls_path.exists(), "sessions must not invoke codex");
+}
+
+#[test]
 fn help_lists_shell_and_codex_commands_without_invoking_codex() {
     let temp = tempfile::tempdir().expect("temp dir");
     let codex_path = temp.path().join("codex");
@@ -707,23 +776,39 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     for expected in [
-        "Wecode help",
-        "Shell commands",
-        "/pwd",
-        "/ls [path]",
-        "/cat <path>",
-        "/cd <path>",
-        "/shell <command>",
-        "Codex commands",
-        "/init [notes]",
-        "/review [instructions]",
-        "/new [prompt]",
-        "/compact [notes]",
-        "/plan [task]",
-        "/goal [objective]",
-        "/agent [task]",
-        "/side [question]",
-        "/report [notes]",
+        "# Wecode 帮助",
+        "`/help` 和 `/commands` 由 Wecode 本地直接返回，不会请求 Codex。",
+        "## 普通消息",
+        "## 本地命令（不调用 Codex）",
+        "- `/help` / `/commands` - 显示本帮助，不请求 Codex",
+        "- `/pwd` - 显示当前 Codex 项目目录",
+        "- `/ls [path]` - 列出目录，返回绝对路径",
+        "- `/cat <path>` - 读取项目内文本文件",
+        "- `/cd <path>` - 切换 Codex 项目目录，下一次任务会新开 session",
+        "- `/shell <command>` - 在当前 Codex 项目目录执行 shell 命令",
+        "- `/diff` - 显示当前项目 git diff",
+        "- `/status` - 显示后端、项目、session、审批、模型和 git 状态",
+        "## Codex 命令（会调用 Codex）",
+        "- `/init [notes]` - 创建或更新 AGENTS.md",
+        "- `/review [instructions]` - 对未提交改动执行 Codex review",
+        "- `/new [prompt]` - 新开 Codex session",
+        "- `/compact [notes]` - 请求 Codex 压缩上下文",
+        "- `/plan [task]` - 让 Codex 先写计划",
+        "- `/goal [objective]` - 查询或更新当前 goal",
+        "- `/agent [task]` - 让 Codex 在适合时使用 subagent",
+        "- `/side [question]` - 请求旁路分析，不直接改文件",
+        "- `/report [notes]` - 查询任务进展",
+        "## Session 命令",
+        "- `/resume` - 列出当前项目的 Codex sessions，并显示最初 prompt",
+        "- `/sessions` - 等同于 `/resume`",
+        "- `/resume <session_id>` - 把当前聊天绑定到指定 Codex session",
+        "## 审批命令",
+        "- `/approve <id>` - 批准并执行待确认命令",
+        "- `/deny <id>` - 拒绝待确认命令",
+        "## 模型命令",
+        "- `/model default` - 清除项目模型覆盖",
+        "## 自定义命令",
+        "- `/codex <text>` - ask",
     ] {
         assert!(
             stdout.contains(expected),
