@@ -37,6 +37,8 @@ fn parses_cli_commands() {
         Ok(CliCommand::CodexBackend {
             config_path: Some("wecode.json".to_string()),
             jsonl: false,
+            model: None,
+            cwd: None,
             prompt: Some("hello".to_string()),
             resume_session_id: None,
         })
@@ -47,6 +49,8 @@ fn parses_cli_commands() {
         Ok(CliCommand::CodexBackend {
             config_path: None,
             jsonl: false,
+            model: None,
+            cwd: None,
             prompt: None,
             resume_session_id: None,
         })
@@ -63,8 +67,48 @@ fn parses_cli_commands() {
         Ok(CliCommand::CodexBackend {
             config_path: None,
             jsonl: true,
+            model: None,
+            cwd: None,
             prompt: None,
             resume_session_id: Some("019e715e-a44c-70d3-a732-9e9e55e1a1c1".to_string()),
+        })
+    );
+
+    assert_eq!(
+        parse_cli_args([
+            "wecode",
+            "codex-backend",
+            "--jsonl",
+            "--model",
+            "wecode-codex/gpt-5.4",
+            "hello"
+        ]),
+        Ok(CliCommand::CodexBackend {
+            config_path: None,
+            jsonl: true,
+            model: Some("wecode-codex/gpt-5.4".to_string()),
+            cwd: None,
+            prompt: Some("hello".to_string()),
+            resume_session_id: None,
+        })
+    );
+
+    assert_eq!(
+        parse_cli_args([
+            "wecode",
+            "codex-backend",
+            "--jsonl",
+            "--cwd",
+            "/Users/riven/Github/wecode",
+            "hello"
+        ]),
+        Ok(CliCommand::CodexBackend {
+            config_path: None,
+            jsonl: true,
+            model: None,
+            cwd: Some("/Users/riven/Github/wecode".to_string()),
+            prompt: Some("hello".to_string()),
+            resume_session_id: None,
         })
     );
 }

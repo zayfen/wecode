@@ -1,5 +1,6 @@
 mod common;
 
+use std::env;
 use wecode::{bootstrap_plan_with_backend_command, default_config, CommandStep};
 
 #[test]
@@ -28,16 +29,30 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
             ["config", "set", "gateway.port", "19789"]
         )
     ));
+    let project_dir = env::current_dir()
+        .expect("current dir")
+        .display()
+        .to_string();
+    let openclaw_workspace = std::path::PathBuf::from(env::var("HOME").expect("HOME"))
+        .join(".wecode")
+        .join("workspace")
+        .display()
+        .to_string();
+    assert!(steps.iter().any(|step| {
+        step.program == "~/.wecode/openclaw-runtime/node_modules/.bin/openclaw"
+            && step.args
+                == vec![
+                    "config".to_string(),
+                    "set".to_string(),
+                    "agents.defaults.workspace".to_string(),
+                    openclaw_workspace.clone(),
+                ]
+    }));
     assert!(common::has_step(
         &steps,
         &CommandStep::new(
             "~/.wecode/openclaw-runtime/node_modules/.bin/openclaw",
-            [
-                "config",
-                "set",
-                "agents.defaults.workspace",
-                "~/.wecode/workspace"
-            ]
+            ["config", "set", "commands.text", "false", "--strict-json"]
         )
     ));
     assert!(!steps
@@ -47,24 +62,30 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
         .args
         .iter()
         .any(|arg| arg == "plugins.entries.codex.enabled")));
-    assert!(common::has_openclaw_args(
-        &steps,
-        &[
-            "config",
-            "set",
-            "agents.defaults.cliBackends",
-            "{\"wecode-codex\":{\"args\":[\"codex-backend\",\"--jsonl\"],\"command\":\"/usr/local/bin/wecode\",\"input\":\"stdin\",\"output\":\"jsonl\",\"resumeArgs\":[\"codex-backend\",\"--jsonl\",\"--resume\",\"{sessionId}\"],\"resumeOutput\":\"jsonl\",\"serialize\":true,\"sessionIdFields\":[\"thread_id\"]}}",
-            "--strict-json",
-            "--merge"
-        ]
-    ));
+    let cli_backend_json = format!(
+        "{{\"wecode-codex\":{{\"args\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{}],\"command\":\"/usr/local/bin/wecode\",\"input\":\"stdin\",\"modelArg\":\"--model\",\"output\":\"jsonl\",\"resumeArgs\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{},\"--resume\",\"{{sessionId}}\"],\"resumeOutput\":\"jsonl\",\"serialize\":true,\"sessionIdFields\":[\"thread_id\"]}}}}",
+        serde_json::to_string(&project_dir).expect("project dir json"),
+        serde_json::to_string(&project_dir).expect("project dir json")
+    );
+    assert!(steps.iter().any(|step| {
+        step.program == "~/.wecode/openclaw-runtime/node_modules/.bin/openclaw"
+            && step.args
+                == vec![
+                    "config".to_string(),
+                    "set".to_string(),
+                    "agents.defaults.cliBackends".to_string(),
+                    cli_backend_json.clone(),
+                    "--strict-json".to_string(),
+                    "--merge".to_string(),
+                ]
+    }));
     assert!(common::has_openclaw_args(
         &steps,
         &[
             "config",
             "set",
             "agents.defaults.models",
-            "{\"wecode-codex/default\":{\"alias\":\"Wecode Codex\"}}",
+            "{\"wecode-codex/default\":{\"alias\":\"Wecode Codex\"},\"wecode-codex/gpt-5.4\":{\"alias\":\"Wecode Codex gpt-5.4\"}}",
             "--strict-json",
             "--merge"
         ]

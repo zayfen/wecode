@@ -12,7 +12,9 @@
   },
   "codex": {
     "sandbox": "workspace-write",
-    "cwd": "."
+    "cwd": ".",
+    "model": null,
+    "models": ["default", "gpt-5.4"]
   },
   "commands": [
     {
@@ -22,10 +24,46 @@
       "requireConfirm": false
     },
     {
-      "name": "review",
-      "prefix": "/review ",
-      "prompt": "Review this path and report bugs first: {{message}}",
+      "name": "explain",
+      "prefix": "/explain ",
+      "prompt": "Explain this clearly: {{message}}",
       "requireConfirm": false
+    },
+    {
+      "name": "fix",
+      "prefix": "/fix ",
+      "prompt": "Find and implement a focused fix, then verify it: {{message}}",
+      "requireConfirm": false
+    },
+    {
+      "name": "test",
+      "prefix": "/test ",
+      "prompt": "Run, add, or repair focused tests for: {{message}}",
+      "requireConfirm": false
+    },
+    {
+      "name": "debug",
+      "prefix": "/debug ",
+      "prompt": "Debug this systematically and fix it when appropriate: {{message}}",
+      "requireConfirm": false
+    },
+    {
+      "name": "refactor",
+      "prefix": "/refactor ",
+      "prompt": "Refactor while preserving behavior and verify it: {{message}}",
+      "requireConfirm": false
+    },
+    {
+      "name": "docs",
+      "prefix": "/docs ",
+      "prompt": "Write or update clear project documentation for: {{message}}",
+      "requireConfirm": false
+    },
+    {
+      "name": "deploy",
+      "prefix": "/deploy ",
+      "prompt": "Deploy request: {{message}}",
+      "requireConfirm": true
     }
   ]
 }

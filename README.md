@@ -1,20 +1,108 @@
 # wecode
 
-`wecode` is a personal Rust CLI that wires OpenClaw's Weixin channel to the
-local Codex CLI. This version does not implement the Weixin protocol itself; it
-manages the local tools that already own those surfaces:
+`wecode` 是一个个人用的 Rust CLI，用来把微信消息接入本机 Codex CLI。它不重新实现微信协议，也不替代 Codex，而是把现有工具组合成一个可维护的个人微信编程助手。
 
-- Weixin login and message delivery: OpenClaw + `@tencent-weixin/openclaw-weixin`
-- OpenClaw agent runtime: session-aware custom CLI backend `wecode-codex/default`
-- Codex execution: `wecode codex-backend` calling your already logged-in `codex exec`
+GitHub 默认展示的文档就是本文件 `README.md`，因此这里使用中文作为主 README。
 
-By default, `wecode` installs OpenClaw into a private runtime under
-`~/.wecode/openclaw-runtime` and keeps OpenClaw state/config/workspace under
-`~/.wecode/`. It does not install `openclaw` globally. The private Gateway uses
-OpenClaw profile `wecode` and port `19789`, leaving the global OpenClaw default
-profile and port `18789` untouched.
+## 它解决什么问题
 
-## Commands
+在手机微信里给自己的账号发消息，就可以让本机 Codex 在指定项目目录里工作：
+
+- 微信负责入口和通知。
+- OpenClaw 负责微信通道、Gateway、会话保存和 CLI 后端调用。
+- `wecode` 负责本地配置、命令转换、Codex 调用、会话恢复和审批。
+- Codex CLI 负责实际代码理解、修改、评审和调试。
+
+目标是让你在不打开电脑的情况下，也能从微信发起代码任务、查看 diff、切换 Codex session、审批高风险命令，并保持同一个项目上下文。
+
+## 核心能力
+
+- 微信接入本机 Codex：通过 OpenClaw 微信插件转发消息到 `wecode codex-backend`。
+- Codex session 续接：OpenClaw 保存 Codex 返回的 `thread_id`，后续消息自动用 `--resume` 继续同一会话。
+- Codex 内置命令适配：支持 `/init`、`/diff`、`/status`、`/model`、`/review`、`/new`、`/compact`、`/plan`、`/goal`、`/agent`、`/side`。
+- 微信中列出和绑定 session：`/resume` 列出当前项目的本机 Codex session，`/resume <session_id>` 绑定到微信会话。
+- 微信审批：配置了 `requireConfirm: true` 的命令会先生成审批 id，微信发送 `/approve <id>` 后才执行。
+- 私有 OpenClaw 运行时：默认安装到 `~/.wecode/openclaw-runtime`，不污染全局 OpenClaw 配置。
+
+## 架构
+
+```text
+个人微信
+  |
+  v
+OpenClaw Weixin 插件
+  |
+  v
+OpenClaw Gateway, profile=wecode, port=19789
+  |
+  v
+OpenClaw agent runtime
+  |
+  v
+wecode codex-backend --jsonl --cwd <project_dir> [--model wecode-codex/<model>] [--resume <thread_id>]
+  |
+  v
+codex exec / codex exec resume / codex exec review
+  |
+  v
+当前项目目录
+```
+
+职责边界：
+
+- OpenClaw 管理微信登录、消息投递、Gateway、微信会话和 CLI session binding。
+- `wecode` 管理本地安装计划、配置、诊断、命令模板、审批队列、Codex session 扫描和 Codex CLI 调用。
+- Codex CLI 管理模型调用、工具执行、代码修改、上下文和本机 session 文件。
+
+## 优势
+
+- 不锁死在一个聊天窗口：微信只是入口，真正上下文仍在 Codex 本机 session 中。
+- 可恢复：同一个微信会话会继续同一个 Codex `thread_id`，不会每条消息都变成新任务。
+- 可审计：本地审批文件存放在 `openclaw.stateDir/approvals`，高风险命令不会静默执行。
+- 可控：默认 sandbox 是 `workspace-write`，不默认开启危险全权限。
+- 可迁移：OpenClaw、Codex、微信通道都是独立组件，后续可以把 `codex exec` 换成 `codex app-server` 或 remote-control。
+- 不污染全局环境：OpenClaw 默认安装在 `~/.wecode` 下，使用独立 profile 和端口。
+
+## 快速开始
+
+前置条件：
+
+- Node 24，或者至少 Node `>=22.19.0`。
+- 已安装并登录 Codex CLI。
+- 当前机器能使用 OpenClaw 微信插件扫码登录。
+
+初始化：
+
+```bash
+cargo run -- bootstrap --install-openclaw
+```
+
+这个命令会执行私有 OpenClaw 安装、Gateway 配置、Codex CLI 后端配置、微信插件安装和 Gateway 安装。微信插件安装过程中会出现二维码，需要用微信扫码确认。
+
+`wecode` 会把 OpenClaw 的文本内置命令处理关闭，让微信里的 `/help`、`/status`、`/pwd`、`/ls`、`/cat`、`/cd` 等 slash 命令先进入 `wecode codex-backend`。这样 `/help` 返回的是 wecode 帮助，而不是 OpenClaw 默认帮助。
+
+完成后，给已连接的微信账号发消息。OpenClaw 会把消息路由到 `wecode-codex/default`，实际调用：
+
+```bash
+wecode codex-backend --jsonl --cwd /Users/riven/Github/wecode --model wecode-codex/default
+```
+
+第一次 Codex 运行会返回 `thread_id`，OpenClaw 会把它存到微信会话里。后续同一微信会话会调用：
+
+```bash
+wecode codex-backend --jsonl --cwd /Users/riven/Github/wecode --model wecode-codex/default --resume <thread_id>
+```
+
+切换 Codex 模型用 wecode 的项目级模型命令。默认配置会把 `default` 和 `gpt-5.4` 加入候选列表，因此微信里可以发送：
+
+```text
+/models
+/model gpt-5.4
+```
+
+`/model <model>` 会把模型保存到当前项目自己的状态文件中，不同项目互不影响。后续 `wecode` 调用 Codex 时会使用 Codex CLI 原生参数 `codex exec -m <model> -C <project_dir>`，同时把 Codex 子进程的工作目录切到该项目，确保 `workspace-write` 沙箱能写当前项目。
+
+## 常用本地命令
 
 ```bash
 cargo run -- doctor
@@ -30,48 +118,49 @@ cargo run -- render "/codex explain this repo"
 node scripts/openclaw-agent-smoke.mjs
 ```
 
-## First Setup
+## 微信命令
 
-1. Install Node 24, or at least Node `>=22.19.0`.
-   `wecode` prefers a supported system Node and can also auto-detect mise, nvm,
-   or Volta installs. If your default shell still points at an old Node, set
-   `openclaw.nodeBinDir` in the config.
-2. Make sure Codex CLI is installed and logged in. This is normal Codex CLI
-   login, not OpenClaw Codex OAuth.
-3. Run:
+`wecode codex-backend` 会识别适合微信使用的 Codex 风格 slash 命令：
 
-```bash
-cargo run -- bootstrap --install-openclaw
+```text
+/help                     显示命令列表
+/init [说明]              让 Codex 创建或更新 AGENTS.md
+/diff                     显示当前 git diff
+/pwd                      显示当前 Codex 项目目录的绝对路径
+/ls [目录]                本地列出目录下的文件和目录，返回绝对路径
+/cat <文件>               本地读取文件内容并返回
+/cd <目录>                切换 Codex 项目根目录，后续 Codex 任务使用该目录
+/status                   显示后端、session、审批和 git 状态
+/model                    显示当前项目使用的 Codex 模型
+/models                   列出配置中的 Codex 模型候选
+/model <model>            设置当前项目后续 Codex 调用使用的模型
+/model default            清除当前项目的模型覆盖，回到 Codex 默认模型
+/review [说明]            执行 codex exec review --uncommitted
+/new [prompt]             开启新的 Codex thread，并让微信会话改绑新 thread_id
+/compact [说明]           让 Codex 压缩当前上下文为 handoff summary
+/plan [任务]              让 Codex 先写计划，不直接改文件
+/goal [目标]              让 Codex 汇报或更新当前目标
+/agent [任务]             让 Codex 在适合时使用 subagent
+/side [问题]              作为旁路分析回答，不主动改文件
+/resume                   列出当前项目的本机 Codex sessions
+/sessions                 等同于 /resume
+/resume <session_id>      把当前微信会话绑定到指定 Codex session
+/approve <id>             批准待执行命令
+/deny <id>                拒绝待执行命令
 ```
 
-The bootstrap command runs these steps in order. If `wecode` detects that the
-current `node` is too old, the dry-run and actual execution prepend the detected
-Node bin directory to `PATH` before `npm`, `npx`, and `openclaw` commands:
+处理方式：
 
-```bash
-npm install --prefix ~/.wecode/openclaw-runtime openclaw@latest
-OPENCLAW_PROFILE=wecode OPENCLAW_STATE_DIR=~/.wecode/openclaw-state OPENCLAW_CONFIG_PATH=~/.wecode/openclaw-state/openclaw.json ~/.wecode/openclaw-runtime/node_modules/.bin/openclaw config set gateway.port 19789
-OPENCLAW_PROFILE=wecode OPENCLAW_STATE_DIR=~/.wecode/openclaw-state OPENCLAW_CONFIG_PATH=~/.wecode/openclaw-state/openclaw.json ~/.wecode/openclaw-runtime/node_modules/.bin/openclaw config set agents.defaults.workspace ~/.wecode/workspace
-OPENCLAW_PROFILE=wecode OPENCLAW_STATE_DIR=~/.wecode/openclaw-state OPENCLAW_CONFIG_PATH=~/.wecode/openclaw-state/openclaw.json ~/.wecode/openclaw-runtime/node_modules/.bin/openclaw config set agents.defaults.cliBackends '{"wecode-codex":{"args":["codex-backend","--jsonl"],"command":"<path-to-wecode>","input":"stdin","output":"jsonl","resumeArgs":["codex-backend","--jsonl","--resume","{sessionId}"],"resumeOutput":"jsonl","serialize":true,"sessionIdFields":["thread_id"]}}' --strict-json --merge
-OPENCLAW_PROFILE=wecode OPENCLAW_STATE_DIR=~/.wecode/openclaw-state OPENCLAW_CONFIG_PATH=~/.wecode/openclaw-state/openclaw.json ~/.wecode/openclaw-runtime/node_modules/.bin/openclaw config set agents.defaults.models '{"wecode-codex/default":{"alias":"Wecode Codex"}}' --strict-json --merge
-OPENCLAW_PROFILE=wecode OPENCLAW_STATE_DIR=~/.wecode/openclaw-state OPENCLAW_CONFIG_PATH=~/.wecode/openclaw-state/openclaw.json ~/.wecode/openclaw-runtime/node_modules/.bin/openclaw config set agents.defaults.model '"wecode-codex/default"' --strict-json
-OPENCLAW_PROFILE=wecode OPENCLAW_STATE_DIR=~/.wecode/openclaw-state OPENCLAW_CONFIG_PATH=~/.wecode/openclaw-state/openclaw.json PATH=~/.wecode/openclaw-runtime/node_modules/.bin:$PATH npx -y @tencent-weixin/openclaw-weixin-cli@latest install
-OPENCLAW_PROFILE=wecode OPENCLAW_STATE_DIR=~/.wecode/openclaw-state OPENCLAW_CONFIG_PATH=~/.wecode/openclaw-state/openclaw.json ~/.wecode/openclaw-runtime/node_modules/.bin/openclaw gateway install --force --port 19789
-```
+- `/help`、`/diff`、`/pwd`、`/ls`、`/cat`、`/cd`、`/status`、`/resume`、`/approve`、`/deny` 由 `wecode` 本地直接回答，不会进入 Codex。
+- `/cd <目录>` 会把目标目录写入 `openclaw.stateDir/codex-cwd.txt`，并让下一次 Codex 请求新开 thread，避免续接旧项目 session。
+- `/model` 和 `/models` 由 `wecode` 本地处理；模型状态按项目目录保存到 `openclaw.stateDir/codex-models/`。
+- `/review` 调用 Codex 的非交互评审子命令。
+- `/new` 忽略当前 `--resume`，强制开启新 Codex thread。
+- `/init`、`/compact`、`/plan`、`/goal`、`/agent`、`/side` 会转换成明确的 `codex exec` prompt。
 
-Only the Weixin login is interactive during bootstrap. The Weixin installer
-shows a QR code through OpenClaw; scan it with Weixin and confirm on the phone.
+## 配置
 
-After setup, send a message to the connected Weixin account. OpenClaw routes the
-message to the `wecode-codex/default` CLI backend, which calls
-`wecode codex-backend --jsonl`, then `codex exec`. The first Codex run emits a
-`thread_id`; OpenClaw stores that id on the Weixin session and later calls
-`wecode codex-backend --jsonl --resume <thread_id>` so the same chat continues
-the same Codex exec thread.
-
-## Config
-
-By default, `wecode` looks for:
+`wecode` 按以下顺序寻找配置：
 
 ```text
 $WECODE_CONFIG
@@ -79,38 +168,98 @@ $XDG_CONFIG_HOME/wecode/config.json
 ~/.config/wecode/config.json
 ```
 
-If no file exists, built-in defaults are used. See
-[`examples/wecode.config.json`](examples/wecode.config.json).
+没有配置文件时使用内置默认值。示例见 [examples/wecode.config.json](examples/wecode.config.json)。
 
-`openclaw.nodeBinDir` is optional. Leave it as `null` for auto-detection, or set
-it when you want to pin OpenClaw commands to a specific Node install:
+关键配置：
 
 ```json
 {
   "openclaw": {
-    "nodeBinDir": "~/.local/share/mise/installs/node/24.16.0/bin"
+    "profile": "wecode",
+    "runtimeDir": "~/.wecode/openclaw-runtime",
+    "stateDir": "~/.wecode/openclaw-state",
+    "configPath": "~/.wecode/openclaw-state/openclaw.json",
+    "workspaceDir": "~/.wecode/workspace",
+    "gatewayPort": 19789,
+    "nodeBinDir": null
+  },
+  "codex": {
+    "sandbox": "workspace-write",
+    "cwd": ".",
+    "model": null,
+    "models": ["default", "gpt-5.4"]
   }
 }
 ```
 
-This is useful when `/usr/local/bin/node` or an old Homebrew `node@22` appears
-first on `PATH`.
+`openclaw.workspaceDir` 是 OpenClaw 自己的工作区，用来保存 OpenClaw agent 的 workspace 文件；不要把它设置成你的代码项目目录，否则 OpenClaw 可能会在项目里生成 `SOUL.md`、`IDENTITY.md`、`.openclaw/` 等文件。
 
-Custom commands are prefix-based. They are currently used by
-`wecode render` and by `wecode codex-backend` before invoking Codex:
+要切换 Codex 处理的项目，只设置 `codex.cwd`，或在微信里发送 `/cd <项目目录>`：
 
-```bash
-cargo run -- render "/review src/main.rs"
-printf '/review src/main.rs' | cargo run -- codex-backend
+```json
+{
+  "openclaw": {
+    "workspaceDir": "~/.wecode/workspace"
+  },
+  "codex": {
+    "cwd": "/Users/riven/Github/wecode",
+    "sandbox": "workspace-write",
+    "model": null,
+    "models": ["default", "gpt-5.4"]
+  }
+}
 ```
 
-Commands marked `requireConfirm: true` are rejected by `codex-backend` in this
-version because the Weixin bridge does not yet implement a confirmation
-round-trip.
+这样 OpenClaw 的工作区保持固定，`wecode` 会把 `codex.cwd` 作为 `--cwd` 传给后端，并在调用 Codex 时使用 `codex exec -C <project_dir>`。`/resume` 扫描 `~/.codex/sessions/**/rollout-*.jsonl` 时，也会按该项目目录过滤。
 
-## Verification
+`codex.models` 会生成 OpenClaw 的 `agents.defaults.models` 白名单。想在微信中使用更多 Codex 模型时，把模型名追加到这里，然后重新执行：
 
-Run the local checks first:
+```bash
+cargo run -- configure-codex
+```
+
+例如：
+
+```json
+{
+  "codex": {
+    "models": ["default", "gpt-5.4", "your-next-model"]
+  }
+}
+```
+
+## 自定义命令和审批
+
+自定义命令按前缀匹配，把微信消息转换为 Codex prompt：
+
+```json
+{
+  "name": "deploy",
+  "prefix": "/deploy ",
+  "prompt": "Deploy request: {{message}}",
+  "requireConfirm": true
+}
+```
+
+如果 `requireConfirm` 是 `true`，微信里第一次发送：
+
+```text
+/deploy production
+```
+
+`wecode` 不会立即调用 Codex，而是返回类似：
+
+```text
+Command `deploy` requires approval.
+Approve: /approve appr-...
+Deny: /deny appr-...
+```
+
+发送 `/approve <id>` 后才会执行保存的 prompt；发送 `/deny <id>` 会删除待审批请求。
+
+## 验证
+
+本地检查：
 
 ```bash
 cargo fmt -- --check
@@ -119,19 +268,15 @@ cargo test
 cargo run -- config validate examples/wecode.config.json
 ```
 
-After `cargo run -- configure-codex` and a running private Gateway on port
-`19789`, run the Gateway smoke test:
+Gateway smoke test：
 
 ```bash
 node scripts/openclaw-agent-smoke.mjs
 ```
 
-The script simulates the part after Weixin has delivered a message to OpenClaw:
-it opens a local WebSocket to the private Gateway, sends two `agent` requests
-with the same `sessionKey`, and checks that both turns use the same Codex
-`thread_id` through OpenClaw's `cliSessionBinding`.
+该脚本模拟微信消息已进入 OpenClaw 之后的流程：它连接私有 Gateway，用同一个 `sessionKey` 发送两次 agent 请求，并检查第二次是否复用了同一个 Codex `thread_id`。
 
-Expected output shape:
+期望输出形状：
 
 ```text
 sessionKey: agent:main:wecode-smoke-...
@@ -141,45 +286,35 @@ cliSessionId: 019e...
 resumeVerified: true
 ```
 
-## Context And Approval
+## 当前限制
 
-`wecode` no longer treats every Weixin message as an unrelated Codex task when
-it is launched through OpenClaw. The configured backend is JSONL/session-aware:
-OpenClaw parses Codex's `thread_id`, stores it with the Weixin session, and
-passes it back through `--resume` on later turns. The working directory, git
-state, files, and Codex exec conversation therefore continue for the same
-Weixin session.
+- 当前后端基于 `codex exec`，不是 Codex TUI。
+- Codex 原生工具审批弹窗暂时不能直接变成微信按钮。
+- 现在的微信审批是 `wecode` 自己的确认队列，适合保护自定义高风险命令。
+- 后续更完整的方案是接入 `codex app-server` 或 `codex --remote <ADDR>`，让微信加入实时 Codex 会话并承接原生审批事件。
 
-Direct local calls without OpenClaw are different. `wecode codex-backend "..."` starts
-a fresh Codex exec thread unless you pass `--resume <thread_id>` yourself.
-
-Tool approval is deliberately conservative in this version. The Weixin path is a
-background CLI call, not the interactive Codex TUI, so native Codex approval
-prompts are not exposed as Weixin buttons yet. For personal use, keep
-`codex.sandbox` at `workspace-write` and let Codex fail/adjust when it cannot
-run a command. Commands that need an explicit `wecode` confirmation can be
-marked `requireConfirm: true`; the backend rejects them until a Weixin approval
-round-trip is implemented.
-
-The next architecture step is a `wecode daemon` that talks to Codex app-server
-or `codex --remote <ADDR>`. That would let Weixin messages join a live Codex
-thread and route command/file approval requests back through a terminal or a
-Weixin `/approve <id>` flow. This version stays on `codex exec` because it is
-smaller, reproducible, and already supports session resume.
-
-## Project Structure
-
-The tests are split by responsibility:
+## 项目结构
 
 ```text
-tests/bootstrap.rs    OpenClaw setup plan and private Gateway wiring
-tests/cli.rs          CLI argument parsing
-tests/commands.rs     custom command rendering and confirmation boundary
-tests/config.rs       default and JSON config parsing
-tests/diagnostics.rs  local tool diagnostics
-tests/common/         shared test helpers
+src/lib.rs                         配置、命令解析、OpenClaw 配置计划、session 扫描
+src/main.rs                        CLI 入口、Codex 调用、微信本地命令、审批队列
+scripts/openclaw-agent-smoke.mjs   Gateway session 续接 smoke test
+examples/wecode.config.json        示例配置
+tests/bootstrap.rs                 OpenClaw setup plan 和私有 Gateway 配置
+tests/cli.rs                       CLI 参数解析
+tests/codex_backend.rs             Codex 后端、resume、审批、model、/new 行为
+tests/commands.rs                  命令模板和微信 slash 命令解析
+tests/config.rs                    默认配置和 JSON 配置解析
+tests/diagnostics.rs               本地工具诊断
+tests/resume_sessions.rs           Codex session 扫描和项目过滤
 ```
 
-OpenClaw owns channel delivery, Weixin session storage, CLI session binding,
-and replies. `wecode` owns setup, diagnostics, JSON command expansion, the
-Codex CLI backend process, and repeatable local verification scripts.
+## 设计取舍
+
+这个版本优先选择可复现、可测试、可渐进升级的实现：
+
+- 用 `codex exec` 保持后端简单。
+- 用 JSONL 与 OpenClaw 对接，方便 OpenClaw 提取 `thread_id`。
+- 用本机 Codex session 文件实现 `/resume` 列表。
+- 用 `openclaw.stateDir` 保存 `model` override 和待审批请求。
+- 把微信命令分成本地控制命令和 Codex prompt 命令，避免把 TUI-only 行为硬塞进非交互后端。
