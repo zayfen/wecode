@@ -1,0 +1,30 @@
+{
+  "openclaw": {
+    "model": "wecode-codex/default",
+    "autoInstallOpenclaw": false,
+    "profile": "wecode",
+    "runtimeDir": "~/.wecode/openclaw-runtime",
+    "stateDir": "~/.wecode/openclaw-state",
+    "configPath": "~/.wecode/openclaw-state/openclaw.json",
+    "workspaceDir": "~/.wecode/workspace",
+    "gatewayPort": 19789
+  },
+  "codex": {
+    "sandbox": "workspace-write",
+    "cwd": "."
+  },
+  "commands": [
+    {
+      "name": "ask",
+      "prefix": "/codex ",
+      "prompt": "{{message}}",
+      "requireConfirm": false
+    },
+    {
+      "name": "review",
+      "prefix": "/review ",
+      "prompt": "Review this path and report bugs first: {{message}}",
+      "requireConfirm": false
+    }
+  ]
+}
