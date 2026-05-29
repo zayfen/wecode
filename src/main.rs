@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
@@ -8,9 +8,9 @@ use std::{
 
 use wecode::{
     bootstrap_plan_with_backend_command, codex_config_plan_with_backend_command, default_config,
-    diagnose_tools, openclaw_bin_path, parse_cli_args, prepare_backend_prompt, read_config_str,
-    render_command_input, weixin_install_step, CliCommand, CommandStep, ToolReport, ToolSnapshot,
-    WecodeConfig,
+    diagnose_tools, openclaw_bin_path, parse_cli_args, parse_node_version, prepare_backend_prompt,
+    read_config_str, render_command_input, weixin_install_step, CliCommand, CommandStep,
+    ToolReport, ToolSnapshot, WecodeConfig,
 };
 
 fn main() {
@@ -77,7 +77,7 @@ fn run(command: CliCommand) -> Result<(), String> {
                 bootstrap_plan_with_backend_command(&config, install_openclaw, &backend_command);
 
             if dry_run {
-                print_steps(&steps);
+                print_steps(&config, &steps);
                 return Ok(());
             }
 
@@ -86,23 +86,23 @@ fn run(command: CliCommand) -> Result<(), String> {
                 install_openclaw || config.openclaw.auto_install_openclaw,
             )?;
             ensure_private_openclaw_dirs(&config)?;
-            run_steps(&steps)
+            run_steps(&config, &steps)
         }
         CliCommand::InstallWeixin => {
             let (config, source) = load_config(None)?;
             eprintln!("using config: {source}");
             ensure_private_openclaw_dirs(&config)?;
-            run_steps(&[weixin_install_step(&config)])
+            run_steps(&config, &[weixin_install_step(&config)])
         }
         CliCommand::ConfigureCodex { config_path } => {
             let (config, source) = load_config(config_path)?;
             eprintln!("using config: {source}");
             ensure_private_openclaw_dirs(&config)?;
             let backend_command = current_exe_string()?;
-            run_steps(&codex_config_plan_with_backend_command(
+            run_steps(
                 &config,
-                &backend_command,
-            ))
+                &codex_config_plan_with_backend_command(&config, &backend_command),
+            )
         }
         CliCommand::Codex {
             config_path,
@@ -175,9 +175,14 @@ fn validate_bootstrap_prereqs(
     }
 }
 
-fn run_steps(steps: &[CommandStep]) -> Result<(), String> {
+fn run_steps(config: &WecodeConfig, steps: &[CommandStep]) -> Result<(), String> {
+    let runtime_node_bin_dir = resolve_supported_node_bin_dir(config);
+
     for step in steps {
-        eprintln!("$ {}", step.display_shell());
+        let path_prepend = runtime_path_prepend(&runtime_node_bin_dir, &step.path_prepend);
+        let display_step = step_with_path_prepend(step, path_prepend.clone());
+        eprintln!("$ {}", display_step.display_shell());
+
         let program = expand_tilde(&step.program);
         let args = step
             .args
@@ -191,8 +196,8 @@ fn run_steps(steps: &[CommandStep]) -> Result<(), String> {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        if !step.path_prepend.is_empty() {
-            command.env("PATH", path_with_prepend(&step.path_prepend));
+        if !path_prepend.is_empty() {
+            command.env("PATH", path_with_prepend(&path_prepend));
         }
         for (key, value) in &step.env {
             command.env(key, expand_tilde(value));
@@ -203,7 +208,7 @@ fn run_steps(steps: &[CommandStep]) -> Result<(), String> {
             .map_err(|err| format!("failed to start `{}`: {err}", step.program))?;
 
         if !status.success() {
-            return Err(format!("command failed: {}", step.display_shell()));
+            return Err(format!("command failed: {}", display_step.display_shell()));
         }
     }
 
@@ -220,10 +225,6 @@ enum CodexRunMode {
 }
 
 fn run_codex_prompt(config: &WecodeConfig, prompt: &str, mode: CodexRunMode) -> Result<(), String> {
-    let output_path = codex_output_path();
-    let mut command = Command::new("codex");
-    command.arg("exec");
-
     let resume_session_id = match &mode {
         CodexRunMode::Backend {
             resume_session_id, ..
@@ -231,60 +232,38 @@ fn run_codex_prompt(config: &WecodeConfig, prompt: &str, mode: CodexRunMode) -> 
         CodexRunMode::Interactive => None,
     };
 
-    if resume_session_id.is_some() {
-        command.arg("resume");
-    }
-
-    command.arg("--json").arg("-o").arg(&output_path);
-
-    if let Some(session_id) = resume_session_id {
-        command.arg(session_id);
-    } else {
-        command.arg("-s").arg(&config.codex.sandbox);
-        if let Some(cwd) = config.codex.cwd.as_deref() {
-            command.arg("-C").arg(cwd);
-        }
-    }
-    command.arg("--").arg(prompt);
-
-    if let Some(session_id) = resume_session_id {
-        eprintln!(
-            "$ codex exec resume --json -o {} {}",
-            output_path.display(),
-            session_id
-        );
-    } else {
-        eprintln!(
-            "$ codex exec --json -o {} -s {}",
-            output_path.display(),
-            config.codex.sandbox
-        );
-    }
-
-    match mode {
+    let output_path = match &mode {
         CodexRunMode::Interactive => {
-            command
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
+            let output_path = codex_output_path();
+            if !run_codex_interactive_attempt(config, prompt, &output_path)? {
+                return Err("codex exec failed".to_string());
+            }
+            output_path
         }
         CodexRunMode::Backend { jsonl, .. } => {
-            command.stdin(Stdio::null()).stderr(Stdio::inherit());
-            if jsonl {
-                command.stdout(Stdio::inherit());
-            } else {
-                command.stdout(Stdio::null());
+            let mut output_path = codex_output_path();
+            let mut result =
+                run_codex_backend_attempt(config, prompt, &output_path, resume_session_id)?;
+
+            if !result.success
+                && resume_session_id.is_some()
+                && codex_resume_rollout_is_missing(&result.stderr)
+            {
+                eprintln!(
+                    "codex resume thread is unavailable locally; starting a fresh Codex thread"
+                );
+                let _ = fs::remove_file(&output_path);
+                output_path = codex_output_path();
+                result = run_codex_backend_attempt(config, prompt, &output_path, None)?;
             }
+
+            emit_codex_backend_result(&result, *jsonl)?;
+            if !result.success {
+                return Err("codex exec failed".to_string());
+            }
+            output_path
         }
-    }
-
-    let status = command
-        .status()
-        .map_err(|err| format!("failed to start codex: {err}"))?;
-
-    if !status.success() {
-        return Err("codex exec failed".to_string());
-    }
+    };
 
     if !matches!(mode, CodexRunMode::Backend { jsonl: true, .. }) {
         let final_message = fs::read_to_string(&output_path).map_err(|err| {
@@ -299,6 +278,112 @@ fn run_codex_prompt(config: &WecodeConfig, prompt: &str, mode: CodexRunMode) -> 
     Ok(())
 }
 
+struct CodexBackendResult {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_codex_interactive_attempt(
+    config: &WecodeConfig,
+    prompt: &str,
+    output_path: &Path,
+) -> Result<bool, String> {
+    let mut command = codex_exec_command(config, prompt, output_path, None);
+    print_codex_exec_command(config, output_path, None);
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to start codex: {err}"))?;
+    Ok(status.success())
+}
+
+fn run_codex_backend_attempt(
+    config: &WecodeConfig,
+    prompt: &str,
+    output_path: &Path,
+    resume_session_id: Option<&str>,
+) -> Result<CodexBackendResult, String> {
+    let mut command = codex_exec_command(config, prompt, output_path, resume_session_id);
+    print_codex_exec_command(config, output_path, resume_session_id);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to start codex: {err}"))?;
+    Ok(CodexBackendResult {
+        success: output.status.success(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn codex_exec_command(
+    config: &WecodeConfig,
+    prompt: &str,
+    output_path: &Path,
+    resume_session_id: Option<&str>,
+) -> Command {
+    let mut command = Command::new("codex");
+    command.arg("exec");
+    if resume_session_id.is_some() {
+        command.arg("resume");
+    }
+    command.arg("--json").arg("-o").arg(output_path);
+    if let Some(session_id) = resume_session_id {
+        command.arg(session_id);
+    } else {
+        command.arg("-s").arg(&config.codex.sandbox);
+        if let Some(cwd) = config.codex.cwd.as_deref() {
+            command.arg("-C").arg(cwd);
+        }
+    }
+    command.arg("--").arg(prompt);
+    command
+}
+
+fn print_codex_exec_command(
+    config: &WecodeConfig,
+    output_path: &Path,
+    resume_session_id: Option<&str>,
+) {
+    if let Some(session_id) = resume_session_id {
+        eprintln!(
+            "$ codex exec resume --json -o {} {}",
+            output_path.display(),
+            session_id
+        );
+    } else {
+        eprintln!(
+            "$ codex exec --json -o {} -s {}",
+            output_path.display(),
+            config.codex.sandbox
+        );
+    }
+}
+
+fn emit_codex_backend_result(result: &CodexBackendResult, jsonl: bool) -> Result<(), String> {
+    if jsonl {
+        io::stdout()
+            .write_all(&result.stdout)
+            .map_err(|err| format!("failed to write Codex JSONL stdout: {err}"))?;
+    }
+    io::stderr()
+        .write_all(&result.stderr)
+        .map_err(|err| format!("failed to write Codex stderr: {err}"))?;
+    Ok(())
+}
+
+fn codex_resume_rollout_is_missing(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("thread/resume") && stderr.contains("no rollout found for thread id")
+}
+
 fn read_stdin_prompt() -> Result<String, String> {
     let mut input = String::new();
     io::stdin()
@@ -308,19 +393,35 @@ fn read_stdin_prompt() -> Result<String, String> {
 }
 
 fn probe_tools(config: &WecodeConfig) -> ToolSnapshot {
+    let runtime_node_bin_dir = resolve_supported_node_bin_dir(config);
+    let path_prepend = runtime_node_bin_dir.iter().cloned().collect::<Vec<_>>();
+
     ToolSnapshot {
-        node_version: capture_version("node", &["--version"]),
-        npm_found: capture_version("npm", &["--version"]).is_some(),
-        npx_found: capture_version("npx", &["--version"]).is_some(),
-        openclaw_version: capture_version(&openclaw_bin_path(config), &["--version"])
-            .or_else(|| capture_version("openclaw", &["--version"])),
-        codex_version: capture_version("codex", &["--version"]),
+        node_version: capture_version_with_path("node", &["--version"], &path_prepend),
+        npm_found: capture_version_with_path("npm", &["--version"], &path_prepend).is_some(),
+        npx_found: capture_version_with_path("npx", &["--version"], &path_prepend).is_some(),
+        openclaw_version: capture_version_with_path(
+            &openclaw_bin_path(config),
+            &["--version"],
+            &path_prepend,
+        )
+        .or_else(|| capture_version_with_path("openclaw", &["--version"], &path_prepend)),
+        codex_version: capture_version_with_path("codex", &["--version"], &[]),
     }
 }
 
-fn capture_version(program: &str, args: &[&str]) -> Option<String> {
+fn capture_version_with_path(
+    program: &str,
+    args: &[&str],
+    path_prepend: &[String],
+) -> Option<String> {
     let program = expand_tilde(program);
-    let output = Command::new(program).args(args).output().ok()?;
+    let mut command = Command::new(program);
+    command.args(args);
+    if !path_prepend.is_empty() {
+        command.env("PATH", path_with_prepend(path_prepend));
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -389,9 +490,14 @@ fn current_exe_string() -> Result<String, String> {
         .map(|path| path.display().to_string())
 }
 
-fn print_steps(steps: &[CommandStep]) {
+fn print_steps(config: &WecodeConfig, steps: &[CommandStep]) {
+    let runtime_node_bin_dir = resolve_supported_node_bin_dir(config);
     for step in steps {
-        println!("{}", step.display_shell());
+        let path_prepend = runtime_path_prepend(&runtime_node_bin_dir, &step.path_prepend);
+        println!(
+            "{}",
+            step_with_path_prepend(step, path_prepend).display_shell()
+        );
     }
 }
 
@@ -437,6 +543,93 @@ Personal bridge flow:
      `wecode` then calls your already logged-in local Codex CLI.
 "#
     );
+}
+
+fn runtime_path_prepend(
+    runtime_node_bin_dir: &Option<String>,
+    step_path_prepend: &[String],
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(node_bin_dir) = runtime_node_bin_dir {
+        paths.push(node_bin_dir.clone());
+    }
+    for path in step_path_prepend {
+        let expanded = expand_tilde(path);
+        if !paths.iter().any(|existing| existing == &expanded) {
+            paths.push(expanded);
+        }
+    }
+    paths
+}
+
+fn step_with_path_prepend(step: &CommandStep, path_prepend: Vec<String>) -> CommandStep {
+    let mut copy = step.clone();
+    copy.path_prepend = path_prepend;
+    copy
+}
+
+fn resolve_supported_node_bin_dir(config: &WecodeConfig) -> Option<String> {
+    if let Some(configured) = config.openclaw.node_bin_dir.as_deref() {
+        return Some(expand_tilde(configured));
+    }
+
+    if capture_version_with_path("node", &["--version"], &[])
+        .as_deref()
+        .and_then(parse_node_version)
+        .is_some_and(|version| version >= (22, 19, 0))
+    {
+        return None;
+    }
+
+    supported_node_bin_dir_candidates()
+        .into_iter()
+        .find(|candidate| node_bin_dir_is_supported(candidate))
+        .map(|path| path.display().to_string())
+}
+
+fn node_bin_dir_is_supported(path: &Path) -> bool {
+    let node = path.join("node");
+    let version = capture_version_with_path(&node.display().to_string(), &["--version"], &[]);
+    version
+        .as_deref()
+        .and_then(parse_node_version)
+        .is_some_and(|version| version >= (22, 19, 0))
+}
+
+fn supported_node_bin_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/opt/node/bin"),
+        PathBuf::from("/opt/homebrew/opt/node@24/bin"),
+        PathBuf::from("/opt/homebrew/opt/node@22/bin"),
+        PathBuf::from("/usr/local/opt/node/bin"),
+        PathBuf::from("/usr/local/opt/node@24/bin"),
+        PathBuf::from("/usr/local/opt/node@22/bin"),
+    ];
+
+    if let Ok(home) = env::var("HOME") {
+        candidates.extend(versioned_node_bin_dirs(
+            Path::new(&home).join(".local/share/mise/installs/node"),
+        ));
+        candidates.extend(versioned_node_bin_dirs(
+            Path::new(&home).join(".nvm/versions/node"),
+        ));
+        candidates.push(Path::new(&home).join(".volta/bin"));
+    }
+
+    candidates
+}
+
+fn versioned_node_bin_dirs(root: PathBuf) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+
+    let mut dirs = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("bin"))
+        .collect::<Vec<_>>();
+    dirs.sort_by(|left, right| right.cmp(left));
+    dirs
 }
 
 fn path_with_prepend(paths: &[String]) -> String {

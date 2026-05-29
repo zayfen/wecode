@@ -7,7 +7,8 @@
     "stateDir": "~/.wecode/openclaw-state",
     "configPath": "~/.wecode/openclaw-state/openclaw.json",
     "workspaceDir": "~/.wecode/workspace",
-    "gatewayPort": 19789
+    "gatewayPort": 19789,
+    "nodeBinDir": null
   },
   "codex": {
     "sandbox": "workspace-write",

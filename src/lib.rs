@@ -34,6 +34,8 @@ pub struct OpenclawConfig {
     pub workspace_dir: String,
     #[serde(default = "default_gateway_port", rename = "gatewayPort")]
     pub gateway_port: u16,
+    #[serde(default, rename = "nodeBinDir")]
+    pub node_bin_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -326,7 +328,7 @@ pub fn bootstrap_plan_with_backend_command(
     let mut steps = Vec::new();
 
     if install_openclaw || config.openclaw.auto_install_openclaw {
-        steps.push(CommandStep::from_vec(
+        let mut npm_install = CommandStep::from_vec(
             "npm",
             vec![
                 "install".to_string(),
@@ -334,7 +336,11 @@ pub fn bootstrap_plan_with_backend_command(
                 config.openclaw.runtime_dir.clone(),
                 "openclaw@latest".to_string(),
             ],
-        ));
+        );
+        for path in openclaw_node_path_prepend(config) {
+            npm_install = npm_install.with_path_prepend(path);
+        }
+        steps.push(npm_install);
     }
 
     steps.extend(codex_bridge_config_plan(config, backend_command));
@@ -372,16 +378,19 @@ pub fn gateway_install_step(config: &WecodeConfig) -> CommandStep {
 }
 
 pub fn weixin_install_step(config: &WecodeConfig) -> CommandStep {
-    CommandStep::new(
+    let mut step = CommandStep::new(
         "npx",
         [
             "-y",
             "@tencent-weixin/openclaw-weixin-cli@latest",
             "install",
         ],
-    )
-    .with_path_prepend(openclaw_bin_dir(config))
-    .with_envs(openclaw_env(config))
+    );
+    for path in openclaw_node_path_prepend(config) {
+        step = step.with_path_prepend(path);
+    }
+    step.with_path_prepend(openclaw_bin_dir(config))
+        .with_envs(openclaw_env(config))
 }
 
 pub fn openclaw_bin_path(config: &WecodeConfig) -> String {
@@ -462,6 +471,7 @@ impl Default for OpenclawConfig {
             config_path: default_openclaw_config_path(),
             workspace_dir: default_openclaw_workspace_dir(),
             gateway_port: default_gateway_port(),
+            node_bin_dir: None,
         }
     }
 }
@@ -559,6 +569,10 @@ fn trim_trailing_slashes(value: &str) -> &str {
     value.trim_end_matches('/')
 }
 
+fn openclaw_node_path_prepend(config: &WecodeConfig) -> Vec<String> {
+    config.openclaw.node_bin_dir.iter().cloned().collect()
+}
+
 fn openclaw_env(config: &WecodeConfig) -> Vec<(String, String)> {
     vec![
         (
@@ -581,7 +595,11 @@ fn openclaw_step(
     program: impl Into<String>,
     args: Vec<String>,
 ) -> CommandStep {
-    CommandStep::from_vec(program, args).with_envs(openclaw_env(config))
+    let mut step = CommandStep::from_vec(program, args).with_envs(openclaw_env(config));
+    for path in openclaw_node_path_prepend(config) {
+        step = step.with_path_prepend(path);
+    }
+    step
 }
 
 fn codex_bridge_config_plan(config: &WecodeConfig, backend_command: &str) -> Vec<CommandStep> {

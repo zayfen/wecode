@@ -33,6 +33,9 @@ node scripts/openclaw-agent-smoke.mjs
 ## First Setup
 
 1. Install Node 24, or at least Node `>=22.19.0`.
+   `wecode` prefers a supported system Node and can also auto-detect mise, nvm,
+   or Volta installs. If your default shell still points at an old Node, set
+   `openclaw.nodeBinDir` in the config.
 2. Make sure Codex CLI is installed and logged in. This is normal Codex CLI
    login, not OpenClaw Codex OAuth.
 3. Run:
@@ -41,7 +44,9 @@ node scripts/openclaw-agent-smoke.mjs
 cargo run -- bootstrap --install-openclaw
 ```
 
-The bootstrap command runs these steps in order:
+The bootstrap command runs these steps in order. If `wecode` detects that the
+current `node` is too old, the dry-run and actual execution prepend the detected
+Node bin directory to `PATH` before `npm`, `npx`, and `openclaw` commands:
 
 ```bash
 npm install --prefix ~/.wecode/openclaw-runtime openclaw@latest
@@ -76,6 +81,20 @@ $XDG_CONFIG_HOME/wecode/config.json
 
 If no file exists, built-in defaults are used. See
 [`examples/wecode.config.json`](examples/wecode.config.json).
+
+`openclaw.nodeBinDir` is optional. Leave it as `null` for auto-detection, or set
+it when you want to pin OpenClaw commands to a specific Node install:
+
+```json
+{
+  "openclaw": {
+    "nodeBinDir": "~/.local/share/mise/installs/node/24.16.0/bin"
+  }
+}
+```
+
+This is useful when `/usr/local/bin/node` or an old Homebrew `node@22` appears
+first on `PATH`.
 
 Custom commands are prefix-based. They are currently used by
 `wecode render` and by `wecode codex-backend` before invoking Codex:

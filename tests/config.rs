@@ -35,6 +35,7 @@ fn parses_config_with_custom_command() {
     );
     assert_eq!(cfg.openclaw.workspace_dir, "~/.wecode/workspace");
     assert_eq!(cfg.openclaw.gateway_port, 19789);
+    assert_eq!(cfg.openclaw.node_bin_dir, None);
     assert_eq!(cfg.codex.sandbox, "workspace-write");
     assert_eq!(cfg.commands[0].name, "review");
     assert_eq!(cfg.commands[0].prefix, "/review ");
@@ -55,6 +56,7 @@ fn default_config_is_personal_codex_weixin_bridge() {
     );
     assert_eq!(cfg.openclaw.workspace_dir, "~/.wecode/workspace");
     assert_eq!(cfg.openclaw.gateway_port, 19789);
+    assert_eq!(cfg.openclaw.node_bin_dir, None);
     assert_eq!(cfg.codex.sandbox, "workspace-write");
     assert_eq!(cfg.commands[0].name, "ask");
     assert_eq!(cfg.commands[0].prefix, "/codex ");

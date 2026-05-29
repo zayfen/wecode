@@ -142,3 +142,35 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
         vec!["gateway", "install", "--force", "--port", "19789"]
     );
 }
+
+#[test]
+fn bootstrap_plan_prepends_configured_node_bin_dir_to_node_based_steps() {
+    let mut cfg = default_config();
+    cfg.openclaw.node_bin_dir = Some("~/node24/bin".to_string());
+
+    let steps = bootstrap_plan_with_backend_command(&cfg, true, "/usr/local/bin/wecode");
+
+    assert_eq!(steps[0].program, "npm");
+    assert_eq!(steps[0].path_prepend, vec!["~/node24/bin"]);
+
+    let openclaw_steps = steps
+        .iter()
+        .filter(|step| step.program.ends_with("/openclaw"))
+        .collect::<Vec<_>>();
+    assert!(!openclaw_steps.is_empty());
+    assert!(openclaw_steps
+        .iter()
+        .all(|step| step.path_prepend == vec!["~/node24/bin"]));
+
+    let weixin_install = steps
+        .iter()
+        .find(|step| step.program == "npx")
+        .expect("npx installer step");
+    assert_eq!(
+        weixin_install.path_prepend,
+        vec![
+            "~/node24/bin",
+            "~/.wecode/openclaw-runtime/node_modules/.bin"
+        ]
+    );
+}
