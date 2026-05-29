@@ -540,6 +540,7 @@ pub fn feishu_install_steps(config: &WecodeConfig) -> Vec<CommandStep> {
                 "plugins".to_string(),
                 "install".to_string(),
                 "@openclaw/feishu".to_string(),
+                "--force".to_string(),
             ],
         ),
         openclaw_step(

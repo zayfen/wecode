@@ -212,6 +212,7 @@ if [ "$1" = "--version" ]; then
 fi
 echo "Weixin QR code stdout"
 echo "openclaw-weixin internal stdout"
+echo "OpenClaw mixed-case stdout"
 echo "Weixin login stderr" >&2
 "#,
     );
@@ -307,7 +308,19 @@ echo "OpenClaw noisy npm stderr" >&2
         "combined output:\n{combined}"
     );
     assert!(
+        combined.contains("安装微信"),
+        "combined output:\n{combined}"
+    );
+    assert!(
         stdout.contains("Weixin QR code stdout"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("wecode-weixin internal stdout"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("wecode mixed-case stdout"),
         "stdout:\n{stdout}"
     );
     assert!(
@@ -331,6 +344,154 @@ echo "OpenClaw noisy npm stderr" >&2
     assert!(log.contains("OpenClaw noisy gateway stderr"), "log:\n{log}");
     assert!(!log.contains("Weixin QR code stdout"), "log:\n{log}");
     assert!(!log.contains("Weixin login stderr"), "log:\n{log}");
+}
+
+#[test]
+fn feishu_bootstrap_shows_login_prompts_and_forces_plugin_install() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let project_dir = temp.path().join("project");
+    let runtime_dir = temp.path().join("openclaw-runtime");
+    let state_dir = temp.path().join("openclaw-state");
+    let workspace_dir = temp.path().join("workspace");
+    let config_path = temp.path().join("wecode.json");
+    fs::create_dir(&project_dir).expect("project dir");
+
+    write_executable(
+        &temp.path().join("node"),
+        r#"#!/bin/sh
+echo v24.0.0
+"#,
+    );
+    write_executable(
+        &temp.path().join("codex"),
+        r#"#!/bin/sh
+echo codex 1.0.0
+"#,
+    );
+    write_executable(
+        &temp.path().join("npm"),
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 10.0.0
+  exit 0
+fi
+prefix=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--prefix" ]; then
+    shift
+    prefix="$1"
+  fi
+  shift
+done
+mkdir -p "$prefix/node_modules/openclaw/dist" "$prefix/node_modules/.bin"
+cat > "$prefix/node_modules/openclaw/dist/commands-text-routing-test.js" <<'EOF'
+{routing_source}
+EOF
+cat > "$prefix/node_modules/.bin/openclaw" <<'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "OpenClaw 2026.5.27"
+  exit 0
+fi
+case "$*" in
+  *"plugins install @openclaw/feishu --force"*)
+    echo "OpenClaw feishu plugin replaced"
+    exit 0
+    ;;
+  *"plugins install @openclaw/feishu"*)
+    echo "plugin already exists" >&2
+    exit 1
+    ;;
+  *"channels login --channel feishu"*)
+    printf "OpenClaw Feishu App ID: "
+    echo "Feishu App Secret prompt" >&2
+    exit 0
+    ;;
+  *)
+    echo "OpenClaw setup stdout"
+    exit 0
+    ;;
+esac
+EOF
+chmod 755 "$prefix/node_modules/.bin/openclaw"
+"#,
+            routing_source = openclaw_text_routing_source()
+        ),
+    );
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{
+                "runtimeDir": "{}",
+                "stateDir": "{}",
+                "configPath": "{}",
+                "workspaceDir": "{}",
+                "nodeBinDir": "{}"
+              }},
+              "codex": {{"cwd": "{}"}},
+              "commands": []
+            }}"#,
+            runtime_dir.display(),
+            state_dir.display(),
+            state_dir.join("openclaw.json").display(),
+            workspace_dir.display(),
+            temp.path().display(),
+            project_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "bootstrap",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--feishu",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run feishu bootstrap");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.contains("Wecode 启动中"),
+        "combined output:\n{combined}"
+    );
+    assert!(
+        combined.contains("安装飞书"),
+        "combined output:\n{combined}"
+    );
+    assert!(
+        stdout.contains("wecode Feishu App ID: "),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("openclaw"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("Feishu App Secret prompt"),
+        "stderr:\n{stderr}"
+    );
+
+    let log = fs::read_to_string(state_dir.join("bootstrap.log")).expect("bootstrap log");
+    assert!(log.contains("@openclaw/feishu --force"), "log:\n{log}");
+    assert!(!log.contains("Feishu App Secret prompt"), "log:\n{log}");
 }
 
 #[test]
@@ -386,7 +547,7 @@ fn bootstrap_plan_connects_feishu_to_wecode_codex_backend() {
     );
     assert!(common::has_openclaw_args(
         &steps,
-        &["plugins", "install", "@openclaw/feishu"]
+        &["plugins", "install", "@openclaw/feishu", "--force"]
     ));
     assert!(common::has_openclaw_args(
         &steps,

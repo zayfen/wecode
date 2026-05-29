@@ -296,15 +296,19 @@ fn run_steps_with_output(
                     return Err(format!("command failed: {}", display_step.display_shell()));
                 }
             }
-            StepOutput::Bootstrap(_) if is_weixin_install_step(step) => {
-                run_visible_step_with_filtered_stdout(&mut command, &display_step)?;
+            StepOutput::Bootstrap(_) if is_visible_bootstrap_step(step) => {
+                run_visible_step_with_rewritten_stdout(
+                    &mut command,
+                    &display_step,
+                    visible_bootstrap_spinner_label(step),
+                )?;
             }
             StepOutput::Bootstrap(ref log_path) => {
                 run_logged_step(
                     &mut command,
                     &display_step,
                     log_path,
-                    is_openclaw_install_step(step),
+                    logged_bootstrap_spinner_label(step),
                 )?;
             }
         }
@@ -313,9 +317,10 @@ fn run_steps_with_output(
     Ok(())
 }
 
-fn run_visible_step_with_filtered_stdout(
+fn run_visible_step_with_rewritten_stdout(
     command: &mut Command,
     display_step: &CommandStep,
+    spinner_label: Option<&str>,
 ) -> Result<(), String> {
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
     let mut child = command
@@ -325,15 +330,14 @@ fn run_visible_step_with_filtered_stdout(
         .stdout
         .take()
         .ok_or_else(|| format!("failed to capture stdout for `{}`", display_step.program))?;
-    let stdout_filter = thread::spawn(move || filter_openclaw_lines_to_stdout(stdout));
+    let stdout_rewriter = thread::spawn(move || rewrite_openclaw_lines_to_stdout(stdout));
 
-    let status = child
-        .wait()
+    let status = wait_for_child_with_spinner(&mut child, spinner_label)
         .map_err(|err| format!("failed to wait for `{}`: {err}", display_step.program))?;
-    stdout_filter
+    stdout_rewriter
         .join()
-        .map_err(|_| "bootstrap stdout filter panicked".to_string())?
-        .map_err(|err| format!("failed to filter bootstrap stdout: {err}"))?;
+        .map_err(|_| "bootstrap stdout rewriter panicked".to_string())?
+        .map_err(|err| format!("failed to rewrite bootstrap stdout: {err}"))?;
 
     if !status.success() {
         return Err(format!("command failed: {}", display_step.display_shell()));
@@ -342,7 +346,7 @@ fn run_visible_step_with_filtered_stdout(
     Ok(())
 }
 
-fn filter_openclaw_lines_to_stdout<R: Read>(reader: R) -> io::Result<()> {
+fn rewrite_openclaw_lines_to_stdout<R: Read>(reader: R) -> io::Result<()> {
     let mut reader = BufReader::new(reader);
     let mut stdout = io::stdout().lock();
     let mut line = Vec::new();
@@ -353,23 +357,35 @@ fn filter_openclaw_lines_to_stdout<R: Read>(reader: R) -> io::Result<()> {
         if bytes == 0 {
             break;
         }
-        if !String::from_utf8_lossy(&line)
-            .to_ascii_lowercase()
-            .contains("openclaw")
-        {
-            stdout.write_all(&line)?;
-            stdout.flush()?;
-        }
+        let rewritten = replace_openclaw_case_insensitive(&String::from_utf8_lossy(&line));
+        stdout.write_all(rewritten.as_bytes())?;
+        stdout.flush()?;
     }
 
     Ok(())
+}
+
+fn replace_openclaw_case_insensitive(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while let Some(offset) = lower[cursor..].find("openclaw") {
+        let start = cursor + offset;
+        output.push_str(&input[cursor..start]);
+        output.push_str("wecode");
+        cursor = start + "openclaw".len();
+    }
+
+    output.push_str(&input[cursor..]);
+    output
 }
 
 fn run_logged_step(
     command: &mut Command,
     display_step: &CommandStep,
     log_path: &Path,
-    show_spinner: bool,
+    spinner_label: Option<&str>,
 ) -> Result<(), String> {
     let mut log = fs::OpenOptions::new()
         .create(true)
@@ -397,12 +413,8 @@ fn run_logged_step(
     command
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    let status = if show_spinner {
-        run_status_with_spinner(command, "Wecode 启动中")
-    } else {
-        command.status()
-    }
-    .map_err(|err| format!("failed to start `{}`: {err}", display_step.program))?;
+    let status = run_status_with_spinner(command, spinner_label)
+        .map_err(|err| format!("failed to start `{}`: {err}", display_step.program))?;
 
     if !status.success() {
         return Err(format!(
@@ -415,8 +427,21 @@ fn run_logged_step(
     Ok(())
 }
 
-fn run_status_with_spinner(command: &mut Command, label: &str) -> std::io::Result<ExitStatus> {
+fn run_status_with_spinner(
+    command: &mut Command,
+    label: Option<&str>,
+) -> std::io::Result<ExitStatus> {
     let mut child = command.spawn()?;
+    wait_for_child_with_spinner(&mut child, label)
+}
+
+fn wait_for_child_with_spinner(
+    child: &mut std::process::Child,
+    label: Option<&str>,
+) -> std::io::Result<ExitStatus> {
+    let Some(label) = label else {
+        return child.wait();
+    };
     let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut idx = 0;
     eprint!("\r{} {label}", frames[0]);
@@ -441,12 +466,42 @@ fn is_openclaw_install_step(step: &CommandStep) -> bool {
         && step.args.iter().any(|arg| arg == "openclaw@latest")
 }
 
+fn is_feishu_plugin_install_step(step: &CommandStep) -> bool {
+    step.args == ["plugins", "install", "@openclaw/feishu", "--force"]
+}
+
 fn is_weixin_install_step(step: &CommandStep) -> bool {
     step.program == "npx"
         && step
             .args
             .iter()
             .any(|arg| arg.contains("openclaw-weixin-cli"))
+}
+
+fn is_feishu_login_step(step: &CommandStep) -> bool {
+    step.args == ["channels", "login", "--channel", "feishu"]
+}
+
+fn is_visible_bootstrap_step(step: &CommandStep) -> bool {
+    is_weixin_install_step(step) || is_feishu_login_step(step)
+}
+
+fn visible_bootstrap_spinner_label(step: &CommandStep) -> Option<&'static str> {
+    if is_weixin_install_step(step) {
+        Some("Wecode 启动中 · 安装微信")
+    } else {
+        None
+    }
+}
+
+fn logged_bootstrap_spinner_label(step: &CommandStep) -> Option<&'static str> {
+    if is_openclaw_install_step(step) {
+        Some("Wecode 启动中")
+    } else if is_feishu_plugin_install_step(step) {
+        Some("Wecode 启动中 · 安装飞书")
+    } else {
+        None
+    }
 }
 
 fn print_bootstrap_success() {
