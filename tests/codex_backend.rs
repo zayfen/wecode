@@ -647,11 +647,38 @@ fn local_filesystem_commands_do_not_invoke_codex() {
             "/cat",
             "README.md",
         ])
-        .env("PATH", path)
+        .env("PATH", &path)
         .output()
         .expect("run cat");
     assert!(cat.status.success());
     assert!(String::from_utf8_lossy(&cat.stdout).contains("hello from project"));
+
+    let shell = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "/shell",
+            "pwd",
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("run shell");
+    assert!(
+        shell.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&shell.stderr)
+    );
+    let shell_stdout = String::from_utf8_lossy(&shell.stdout);
+    assert!(
+        shell_stdout.contains("Exit code: 0"),
+        "stdout:\n{shell_stdout}"
+    );
+    assert!(
+        shell_stdout.contains(&project_dir.display().to_string()),
+        "stdout:\n{shell_stdout}"
+    );
     assert!(!calls_path.exists(), "local commands must not invoke codex");
 }
 
@@ -686,6 +713,7 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
         "/ls [path]",
         "/cat <path>",
         "/cd <path>",
+        "/shell <command>",
         "Codex commands",
         "/init [notes]",
         "/review [instructions]",
@@ -695,6 +723,7 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
         "/goal [objective]",
         "/agent [task]",
         "/side [question]",
+        "/report [notes]",
     ] {
         assert!(
             stdout.contains(expected),

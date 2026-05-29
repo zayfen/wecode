@@ -1,13 +1,53 @@
-use wecode::{parse_cli_args, CliCommand};
+use wecode::{parse_cli_args, BootstrapChannel, CliCommand};
 
 #[test]
 fn parses_cli_commands() {
     assert_eq!(
-        parse_cli_args(["wecode", "bootstrap", "--dry-run", "--install-openclaw"]),
+        parse_cli_args(["wecode", "bootstrap", "--dry-run"]),
         Ok(CliCommand::Bootstrap {
             config_path: None,
             dry_run: true,
-            install_openclaw: true,
+            channel: BootstrapChannel::Weixin,
+        })
+    );
+
+    assert_eq!(
+        parse_cli_args(["wecode", "bootstrap", "--dry-run", "--weixin"]),
+        Ok(CliCommand::Bootstrap {
+            config_path: None,
+            dry_run: true,
+            channel: BootstrapChannel::Weixin,
+        })
+    );
+
+    assert_eq!(
+        parse_cli_args(["wecode", "bootstrap", "--dry-run", "--feishu"]),
+        Ok(CliCommand::Bootstrap {
+            config_path: None,
+            dry_run: true,
+            channel: BootstrapChannel::Feishu,
+        })
+    );
+
+    assert_eq!(
+        parse_cli_args(["wecode", "bootstrap", "--weixin", "--feishu"]),
+        Err("bootstrap channel flags are mutually exclusive".to_string())
+    );
+
+    assert_eq!(
+        parse_cli_args(["wecode", "bootstrap", "--install-openclaw"]),
+        Err("unexpected bootstrap argument: --install-openclaw".to_string())
+    );
+
+    assert_eq!(
+        parse_cli_args([
+            "wecode",
+            "patch-openclaw-runtime",
+            "--runtime-dir",
+            "~/.wecode/openclaw-runtime"
+        ]),
+        Ok(CliCommand::PatchOpenclawRuntime {
+            runtime_dir: "~/.wecode/openclaw-runtime".to_string()
         })
     );
 

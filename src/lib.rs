@@ -91,6 +91,9 @@ pub enum BackendInput {
     Cd {
         path: String,
     },
+    Shell {
+        command: String,
+    },
     ModelShow,
     ModelsList,
     ModelSet {
@@ -216,6 +219,12 @@ pub struct ToolCheck {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapChannel {
+    Weixin,
+    Feishu,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
     Help,
@@ -227,7 +236,10 @@ pub enum CliCommand {
     Bootstrap {
         config_path: Option<String>,
         dry_run: bool,
-        install_openclaw: bool,
+        channel: BootstrapChannel,
+    },
+    PatchOpenclawRuntime {
+        runtime_dir: String,
     },
     InstallWeixin,
     ConfigureCodex {
@@ -402,7 +414,7 @@ pub fn diagnose_tools(snapshot: &ToolSnapshot) -> ToolReport {
         Some(version) => ToolCheck::ok("openclaw", format!("found {version}")),
         None => ToolCheck::fail(
             "openclaw",
-            "not found in wecode private runtime. Run `wecode bootstrap --install-openclaw`",
+            "not found in wecode private runtime. Run `wecode bootstrap`",
         ),
     });
 
@@ -420,38 +432,58 @@ pub fn diagnose_tools(snapshot: &ToolSnapshot) -> ToolReport {
     }
 }
 
-pub fn bootstrap_plan(config: &WecodeConfig, install_openclaw: bool) -> Vec<CommandStep> {
-    bootstrap_plan_with_backend_command(config, install_openclaw, "wecode")
+pub fn bootstrap_plan(config: &WecodeConfig, channel: BootstrapChannel) -> Vec<CommandStep> {
+    bootstrap_plan_with_backend_command(config, channel, "wecode")
 }
 
 pub fn bootstrap_plan_with_backend_command(
     config: &WecodeConfig,
-    install_openclaw: bool,
+    channel: BootstrapChannel,
     backend_command: &str,
 ) -> Vec<CommandStep> {
     let mut steps = Vec::new();
 
-    if install_openclaw || config.openclaw.auto_install_openclaw {
-        let mut npm_install = CommandStep::from_vec(
-            "npm",
-            vec![
-                "install".to_string(),
-                "--prefix".to_string(),
-                config.openclaw.runtime_dir.clone(),
-                "openclaw@latest".to_string(),
-            ],
-        );
-        for path in openclaw_node_path_prepend(config) {
-            npm_install = npm_install.with_path_prepend(path);
-        }
-        steps.push(npm_install);
-    }
-
+    steps.push(openclaw_install_step(config));
+    steps.push(openclaw_runtime_patch_step(config, backend_command));
     steps.extend(codex_bridge_config_plan(config, backend_command));
-    steps.push(weixin_install_step(config));
+    steps.extend(channel_install_steps(config, channel));
     steps.push(gateway_install_step(config));
 
     steps
+}
+
+pub fn openclaw_install_step(config: &WecodeConfig) -> CommandStep {
+    let mut npm_install = CommandStep::from_vec(
+        "npm",
+        vec![
+            "install".to_string(),
+            "--prefix".to_string(),
+            config.openclaw.runtime_dir.clone(),
+            "openclaw@latest".to_string(),
+        ],
+    );
+    for path in openclaw_node_path_prepend(config) {
+        npm_install = npm_install.with_path_prepend(path);
+    }
+    npm_install
+}
+
+pub fn openclaw_runtime_patch_step(config: &WecodeConfig, backend_command: &str) -> CommandStep {
+    CommandStep::from_vec(
+        backend_command,
+        vec![
+            "patch-openclaw-runtime".to_string(),
+            "--runtime-dir".to_string(),
+            config.openclaw.runtime_dir.clone(),
+        ],
+    )
+}
+
+pub fn channel_install_steps(config: &WecodeConfig, channel: BootstrapChannel) -> Vec<CommandStep> {
+    match channel {
+        BootstrapChannel::Weixin => vec![weixin_install_step(config)],
+        BootstrapChannel::Feishu => feishu_install_steps(config),
+    }
 }
 
 pub fn codex_config_plan(config: &WecodeConfig) -> Vec<CommandStep> {
@@ -497,6 +529,31 @@ pub fn weixin_install_step(config: &WecodeConfig) -> CommandStep {
         .with_envs(openclaw_env(config))
 }
 
+pub fn feishu_install_steps(config: &WecodeConfig) -> Vec<CommandStep> {
+    let openclaw = openclaw_bin_path(config);
+    vec![
+        openclaw_step(
+            config,
+            &openclaw,
+            vec![
+                "plugins".to_string(),
+                "install".to_string(),
+                "@openclaw/feishu".to_string(),
+            ],
+        ),
+        openclaw_step(
+            config,
+            &openclaw,
+            vec![
+                "channels".to_string(),
+                "login".to_string(),
+                "--channel".to_string(),
+                "feishu".to_string(),
+            ],
+        ),
+    ]
+}
+
 pub fn openclaw_bin_path(config: &WecodeConfig) -> String {
     format!(
         "{}/node_modules/.bin/openclaw",
@@ -530,6 +587,7 @@ where
         "doctor" => Ok(CliCommand::Doctor),
         "sample-config" => Ok(CliCommand::SampleConfig),
         "install-weixin" => Ok(CliCommand::InstallWeixin),
+        "patch-openclaw-runtime" => parse_patch_openclaw_runtime_command(&args[1..]),
         "config" => parse_config_command(&args[1..]),
         "bootstrap" => parse_bootstrap_command(&args[1..]),
         "configure-codex" => {
@@ -743,6 +801,63 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
+pub fn patch_openclaw_text_command_routing(runtime_dir: &Path) -> Result<(), String> {
+    const ORIGINAL: &str = r#"function shouldHandleTextCommands(params) {
+	if (params.commandSource === "native") return true;
+	if (params.cfg.commands?.text !== false) return true;
+	return !isNativeCommandSurface(params.surface);
+}"#;
+    const PATCHED: &str = r#"function shouldHandleTextCommands(params) {
+	if (params.commandSource === "native") return true;
+	return params.cfg.commands?.text !== false;
+}"#;
+
+    let dist_dir = runtime_dir
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    let entries = fs::read_dir(&dist_dir).map_err(|err| {
+        format!(
+            "failed to read OpenClaw dist dir {}: {err}",
+            dist_dir.display()
+        )
+    })?;
+    let mut candidates = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("commands-text-routing-") && name.ends_with(".js"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+
+    if candidates.is_empty() {
+        return Err(format!(
+            "OpenClaw commands text routing file not found in {}",
+            dist_dir.display()
+        ));
+    }
+
+    for path in candidates {
+        let source = fs::read_to_string(&path)
+            .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        if source.contains(PATCHED) {
+            return Ok(());
+        }
+        if source.contains(ORIGINAL) {
+            let patched = source.replace(ORIGINAL, PATCHED);
+            fs::write(&path, patched)
+                .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+            return Ok(());
+        }
+    }
+
+    Err("unsupported OpenClaw commands text routing format; expected text command fallback was not found".to_string())
+}
+
 fn parse_control_command(input: &str) -> Result<Option<BackendInput>, String> {
     let trimmed = input.trim();
     if matches!(trimmed, "/help" | "/commands") {
@@ -773,6 +888,13 @@ fn parse_control_command(input: &str) -> Result<Option<BackendInput>, String> {
     if let Some(rest) = trimmed.strip_prefix("/cd ") {
         let path = parse_path_arg(rest, "/cd")?;
         return Ok(Some(BackendInput::Cd { path }));
+    }
+    if trimmed == "/shell" {
+        return Err("/shell expects a command".to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("/shell ") {
+        let command = parse_shell_command(rest)?;
+        return Ok(Some(BackendInput::Shell { command }));
     }
     if trimmed == "/model" {
         return Ok(Some(BackendInput::ModelShow));
@@ -820,6 +942,10 @@ fn parse_control_command(input: &str) -> Result<Option<BackendInput>, String> {
         let details = trimmed.strip_prefix("/side").unwrap_or("").trim();
         return Ok(Some(BackendInput::Prompt(side_prompt(details))));
     }
+    if trimmed == "/report" || trimmed.starts_with("/report ") {
+        let details = trimmed.strip_prefix("/report").unwrap_or("").trim();
+        return Ok(Some(BackendInput::Prompt(report_prompt(details))));
+    }
     if matches!(trimmed, "/resume" | "/sessions") {
         return Ok(Some(BackendInput::ResumeList));
     }
@@ -864,6 +990,14 @@ fn parse_path_arg(input: &str, command: &str) -> Result<String, String> {
         return Err(format!("{command} expects a path"));
     }
     Ok(value.to_string())
+}
+
+fn parse_shell_command(input: &str) -> Result<String, String> {
+    let command = input.trim();
+    if command.is_empty() {
+        return Err("/shell expects a command".to_string());
+    }
+    Ok(command.to_string())
 }
 
 fn init_prompt(details: &str) -> String {
@@ -916,6 +1050,15 @@ fn side_prompt(details: &str) -> String {
         "Handle this as a side analysis: answer without changing files unless explicitly requested, and keep it separate from the main implementation path.",
         details,
     )
+}
+
+fn report_prompt(details: &str) -> String {
+    let request = if details.is_empty() {
+        "任务状态".to_string()
+    } else {
+        format!("任务状态\n\n补充说明: {details}")
+    };
+    side_prompt(&request)
 }
 
 fn append_details(base: &str, details: &str) -> String {
@@ -1293,13 +1436,14 @@ fn parse_config_command(args: &[String]) -> Result<CliCommand, String> {
 fn parse_bootstrap_command(args: &[String]) -> Result<CliCommand, String> {
     let mut config_path = None;
     let mut dry_run = false;
-    let mut install_openclaw = false;
+    let mut channel = None;
     let mut idx = 0;
 
     while idx < args.len() {
         match args[idx].as_str() {
             "--dry-run" => dry_run = true,
-            "--install-openclaw" => install_openclaw = true,
+            "--weixin" => set_bootstrap_channel(&mut channel, BootstrapChannel::Weixin)?,
+            "--feishu" => set_bootstrap_channel(&mut channel, BootstrapChannel::Feishu)?,
             "--config" => {
                 idx += 1;
                 config_path = Some(
@@ -1316,8 +1460,48 @@ fn parse_bootstrap_command(args: &[String]) -> Result<CliCommand, String> {
     Ok(CliCommand::Bootstrap {
         config_path,
         dry_run,
-        install_openclaw,
+        channel: channel.unwrap_or(BootstrapChannel::Weixin),
     })
+}
+
+fn parse_patch_openclaw_runtime_command(args: &[String]) -> Result<CliCommand, String> {
+    let mut runtime_dir = None;
+    let mut idx = 0;
+
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--runtime-dir" => {
+                idx += 1;
+                runtime_dir = Some(
+                    args.get(idx)
+                        .ok_or_else(|| "--runtime-dir requires a path".to_string())?
+                        .clone(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "unexpected patch-openclaw-runtime argument: {other}"
+                ))
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(CliCommand::PatchOpenclawRuntime {
+        runtime_dir: runtime_dir
+            .ok_or_else(|| "patch-openclaw-runtime requires --runtime-dir".to_string())?,
+    })
+}
+
+fn set_bootstrap_channel(
+    current: &mut Option<BootstrapChannel>,
+    next: BootstrapChannel,
+) -> Result<(), String> {
+    if matches!(current, Some(existing) if *existing != next) {
+        return Err("bootstrap channel flags are mutually exclusive".to_string());
+    }
+    *current = Some(next);
+    Ok(())
 }
 
 fn parse_codex_backend_command(args: &[String]) -> Result<CliCommand, String> {

@@ -2,16 +2,16 @@ use std::{
     env, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use wecode::{
     bootstrap_plan_with_backend_command, codex_config_plan_with_backend_command,
     codex_model_from_openclaw_model, default_config, diagnose_tools, list_codex_sessions,
-    openclaw_bin_path, parse_cli_args, parse_node_version, prepare_backend_input, read_config_str,
-    render_command_input, weixin_install_step, BackendInput, CliCommand, CommandStep, ToolReport,
-    ToolSnapshot, WecodeConfig,
+    openclaw_bin_path, parse_cli_args, parse_node_version, patch_openclaw_text_command_routing,
+    prepare_backend_input, read_config_str, render_command_input, weixin_install_step,
+    BackendInput, CliCommand, CommandStep, ToolReport, ToolSnapshot, WecodeConfig,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -77,25 +77,26 @@ fn run(command: CliCommand) -> Result<(), String> {
         CliCommand::Bootstrap {
             config_path,
             dry_run,
-            install_openclaw,
+            channel,
         } => {
             let (config, source) = load_config(config_path)?;
             eprintln!("using config: {source}");
             let backend_command = current_exe_string()?;
-            let steps =
-                bootstrap_plan_with_backend_command(&config, install_openclaw, &backend_command);
+            let steps = bootstrap_plan_with_backend_command(&config, channel, &backend_command);
 
             if dry_run {
                 print_steps(&config, &steps);
                 return Ok(());
             }
 
-            validate_bootstrap_prereqs(
-                &config,
-                install_openclaw || config.openclaw.auto_install_openclaw,
-            )?;
+            validate_bootstrap_prereqs(&config, true)?;
             ensure_private_openclaw_dirs(&config)?;
             run_steps(&config, &steps)
+        }
+        CliCommand::PatchOpenclawRuntime { runtime_dir } => {
+            patch_openclaw_text_command_routing(Path::new(&expand_tilde(&runtime_dir)))?;
+            eprintln!("patched OpenClaw text command routing in {runtime_dir}");
+            Ok(())
         }
         CliCommand::InstallWeixin => {
             let (config, source) = load_config(None)?;
@@ -163,6 +164,7 @@ fn run(command: CliCommand) -> Result<(), String> {
                 BackendInput::Ls { path } => emit_ls(&config, &path, jsonl),
                 BackendInput::Cat { path } => emit_cat(&config, &path, jsonl),
                 BackendInput::Cd { path } => set_project_cwd(&mut config, &path, jsonl),
+                BackendInput::Shell { command } => emit_shell(&config, &command, jsonl),
                 BackendInput::ModelShow => emit_model_status(&config, model.as_deref(), jsonl),
                 BackendInput::ModelsList => emit_models_list(&config, jsonl),
                 BackendInput::ModelSet { model } => set_model_override(&config, &model, jsonl),
@@ -543,9 +545,8 @@ fn emit_local_message(message: &str, jsonl: bool) -> Result<(), String> {
 }
 
 fn emit_resume_bind(session_id: &str, jsonl: bool) -> Result<(), String> {
-    let message = format!(
-        "Bound this Weixin session to Codex session {session_id}.\nNext messages will resume it."
-    );
+    let message =
+        format!("Bound this chat to Codex session {session_id}.\nNext messages will resume it.");
     if jsonl {
         println!("{}", serde_json::json!({ "thread_id": session_id }));
     }
@@ -638,6 +639,23 @@ fn set_project_cwd(config: &mut WecodeConfig, path: &str, jsonl: bool) -> Result
     )
 }
 
+fn emit_shell(config: &WecodeConfig, command: &str, jsonl: bool) -> Result<(), String> {
+    let cwd = codex_target_cwd(config)?;
+    if !cwd.is_dir() {
+        return Err(format!(
+            "Codex project directory does not exist: {}",
+            cwd.display()
+        ));
+    }
+    let (program, args) = shell_program_and_args(command);
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(&cwd)
+        .output()
+        .map_err(|err| format!("failed to run shell command: {err}"))?;
+    emit_local_message(&format_shell_output(command, &cwd, &output), jsonl)
+}
+
 fn emit_model_status(
     config: &WecodeConfig,
     selected_model: Option<&str>,
@@ -727,7 +745,7 @@ fn emit_resume_list(config: &WecodeConfig, jsonl: bool) -> Result<(), String> {
                 title
             ));
         }
-        lines.push("Reply `/resume <session_id>` to bind this Weixin chat.".to_string());
+        lines.push("Reply `/resume <session_id>` to bind this chat.".to_string());
         lines.join("\n")
     };
 
@@ -820,6 +838,7 @@ fn weixin_help_message(config: &WecodeConfig) -> String {
         "/ls [path] - list a directory with absolute paths".to_string(),
         "/cat <path> - read a local text file".to_string(),
         "/cd <path> - switch Codex project directory".to_string(),
+        "/shell <command> - run a shell command in the current Codex project directory".to_string(),
         "/diff - show current git diff".to_string(),
         "/status - show backend, project, session, approvals, and git status".to_string(),
         "".to_string(),
@@ -832,11 +851,12 @@ fn weixin_help_message(config: &WecodeConfig) -> String {
         "/goal [objective] - ask Codex to report or update the active goal".to_string(),
         "/agent [task] - ask Codex to use subagents where useful".to_string(),
         "/side [question] - ask Codex for side analysis without file changes".to_string(),
+        "/report [notes] - ask Codex for task status through a side query".to_string(),
         "".to_string(),
         "Session and approval commands:".to_string(),
         "/resume - list Codex sessions for this project".to_string(),
         "/sessions - same as /resume".to_string(),
-        "/resume <session_id> - bind this Weixin chat to a Codex session".to_string(),
+        "/resume <session_id> - bind this chat to a Codex session".to_string(),
         "/approve <id> - approve a pending command".to_string(),
         "/deny <id> - deny a pending command".to_string(),
         "".to_string(),
@@ -1063,6 +1083,46 @@ fn run_git(config: &WecodeConfig, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+#[cfg(windows)]
+fn shell_program_and_args(command: &str) -> (&'static str, Vec<&str>) {
+    ("cmd", vec!["/C", command])
+}
+
+#[cfg(not(windows))]
+fn shell_program_and_args(command: &str) -> (&'static str, Vec<&str>) {
+    ("sh", vec!["-lc", command])
+}
+
+fn format_shell_output(command: &str, cwd: &Path, output: &Output) -> String {
+    let code = output
+        .status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated by signal".to_string());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = stdout.trim_end();
+    let stderr = stderr.trim_end();
+
+    let mut message = format!(
+        "Command: {command}\nDirectory: {}\nExit code: {code}",
+        cwd.display()
+    );
+    if stdout.is_empty() && stderr.is_empty() {
+        message.push_str("\n\n(no output)");
+    } else {
+        if !stdout.is_empty() {
+            message.push_str("\n\nstdout:\n");
+            message.push_str(&truncate_for_weixin(stdout, 12000));
+        }
+        if !stderr.is_empty() {
+            message.push_str("\n\nstderr:\n");
+            message.push_str(&truncate_for_weixin(stderr, 8000));
+        }
+    }
+    message
+}
+
 fn truncate_for_weixin(input: &str, max_chars: usize) -> String {
     let mut output = input.chars().take(max_chars).collect::<String>();
     if input.chars().count() > max_chars {
@@ -1214,24 +1274,24 @@ fn ensure_private_openclaw_dirs(config: &WecodeConfig) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        r#"wecode - personal Codex <-> Weixin bridge manager
+        r#"wecode - personal Codex <-> Weixin/Feishu bridge manager
 
 Usage:
   wecode doctor
   wecode sample-config
   wecode config validate [path]
-  wecode bootstrap [--config path] [--dry-run] [--install-openclaw]
+  wecode bootstrap [--config path] [--dry-run] [--weixin|--feishu]
+  wecode patch-openclaw-runtime --runtime-dir path
   wecode configure-codex [--config path]
-  wecode install-weixin
   wecode codex [--config path] <prompt...>
   wecode codex-backend [--config path] [--jsonl] [--cwd project-dir] [--model model-id] [--resume thread-id] [prompt...]
   wecode render [--config path] <message...>
 
 Personal bridge flow:
   1. Install Node 24 or Node >=22.19.0.
-  2. Run `wecode bootstrap --install-openclaw`.
-  3. Complete the Weixin QR login prompt.
-  4. OpenClaw receives Weixin messages and calls `wecode codex-backend`;
+  2. Run `wecode bootstrap --weixin` or `wecode bootstrap --feishu`.
+  3. Complete the channel login prompt.
+  4. OpenClaw receives channel messages and calls `wecode codex-backend`;
      `wecode` then calls your already logged-in local Codex CLI.
 "#
     );

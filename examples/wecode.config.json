@@ -1,7 +1,6 @@
 {
   "openclaw": {
     "model": "wecode-codex/default",
-    "autoInstallOpenclaw": false,
     "profile": "wecode",
     "runtimeDir": "~/.wecode/openclaw-runtime",
     "stateDir": "~/.wecode/openclaw-state",

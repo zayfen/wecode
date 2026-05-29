@@ -131,6 +131,14 @@ fn backend_input_recognizes_control_commands() {
         prepare_backend_input(&cfg, "/cd /tmp").expect("cd"),
         BackendInput::Cd { path } if path == "/tmp"
     ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, "/shell ls -al").expect("shell"),
+        BackendInput::Shell { command } if command == "ls -al"
+    ));
+    assert_eq!(
+        prepare_backend_input(&cfg, "/shell"),
+        Err("/shell expects a command".to_string())
+    );
 }
 
 #[test]
@@ -165,8 +173,15 @@ fn backend_input_recognizes_codex_builtin_commands() {
         prepare_backend_input(&cfg, "/new investigate bug").expect("new"),
         BackendInput::FreshPrompt(prompt) if prompt == "investigate bug"
     ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, "/report").expect("report"),
+        BackendInput::Prompt(prompt)
+            if prompt.contains("side analysis") && prompt.contains("User request: 任务状态")
+    ));
 
-    for command in ["/init", "/compact", "/plan", "/goal", "/agent", "/side"] {
+    for command in [
+        "/init", "/compact", "/plan", "/goal", "/agent", "/side", "/report",
+    ] {
         assert!(
             matches!(
                 prepare_backend_input(&cfg, command).expect(command),

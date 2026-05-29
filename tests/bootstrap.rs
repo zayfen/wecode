@@ -1,14 +1,20 @@
 mod common;
 
-use std::env;
-use wecode::{bootstrap_plan_with_backend_command, default_config, CommandStep};
+use std::{env, fs};
+use wecode::{
+    bootstrap_plan_with_backend_command, default_config, patch_openclaw_text_command_routing,
+    BootstrapChannel, CommandStep,
+};
 
 #[test]
 fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
-    let mut cfg = default_config();
-    cfg.openclaw.auto_install_openclaw = true;
+    let cfg = default_config();
 
-    let steps = bootstrap_plan_with_backend_command(&cfg, true, "/usr/local/bin/wecode");
+    let steps = bootstrap_plan_with_backend_command(
+        &cfg,
+        BootstrapChannel::Weixin,
+        "/usr/local/bin/wecode",
+    );
 
     assert_eq!(
         steps[0],
@@ -19,6 +25,17 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
                 "--prefix",
                 "~/.wecode/openclaw-runtime",
                 "openclaw@latest"
+            ]
+        )
+    );
+    assert_eq!(
+        steps[1],
+        CommandStep::new(
+            "/usr/local/bin/wecode",
+            [
+                "patch-openclaw-runtime",
+                "--runtime-dir",
+                "~/.wecode/openclaw-runtime"
             ]
         )
     );
@@ -165,11 +182,86 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
 }
 
 #[test]
+fn patch_openclaw_text_routing_disables_non_native_fallback() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dist = temp
+        .path()
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&dist).expect("dist dir");
+    let routing_file = dist.join("commands-text-routing-test.js");
+    fs::write(
+        &routing_file,
+        r#"function shouldHandleTextCommands(params) {
+	if (params.commandSource === "native") return true;
+	if (params.cfg.commands?.text !== false) return true;
+	return !isNativeCommandSurface(params.surface);
+}
+"#,
+    )
+    .expect("routing file");
+
+    patch_openclaw_text_command_routing(temp.path()).expect("patch routing");
+    patch_openclaw_text_command_routing(temp.path()).expect("patch routing again");
+
+    let patched = fs::read_to_string(&routing_file).expect("patched routing");
+    assert!(patched.contains(r#"return params.cfg.commands?.text !== false;"#));
+    assert!(!patched.contains("return !isNativeCommandSurface(params.surface);"));
+}
+
+#[test]
+fn bootstrap_plan_connects_feishu_to_wecode_codex_backend() {
+    let cfg = default_config();
+
+    let steps = bootstrap_plan_with_backend_command(
+        &cfg,
+        BootstrapChannel::Feishu,
+        "/usr/local/bin/wecode",
+    );
+
+    assert_eq!(
+        steps[0],
+        CommandStep::new(
+            "npm",
+            [
+                "install",
+                "--prefix",
+                "~/.wecode/openclaw-runtime",
+                "openclaw@latest"
+            ]
+        )
+    );
+    assert!(common::has_openclaw_args(
+        &steps,
+        &["plugins", "install", "@openclaw/feishu"]
+    ));
+    assert!(common::has_openclaw_args(
+        &steps,
+        &["channels", "login", "--channel", "feishu"]
+    ));
+    assert!(!steps.iter().any(|step| step.program == "npx"));
+    let last = steps.last().expect("last step");
+    assert_eq!(
+        last.program,
+        "~/.wecode/openclaw-runtime/node_modules/.bin/openclaw"
+    );
+    assert_eq!(
+        last.args,
+        vec!["gateway", "install", "--force", "--port", "19789"]
+    );
+}
+
+#[test]
 fn bootstrap_plan_prepends_configured_node_bin_dir_to_node_based_steps() {
     let mut cfg = default_config();
     cfg.openclaw.node_bin_dir = Some("~/node24/bin".to_string());
 
-    let steps = bootstrap_plan_with_backend_command(&cfg, true, "/usr/local/bin/wecode");
+    let steps = bootstrap_plan_with_backend_command(
+        &cfg,
+        BootstrapChannel::Weixin,
+        "/usr/local/bin/wecode",
+    );
 
     assert_eq!(steps[0].program, "npm");
     assert_eq!(steps[0].path_prepend, vec!["~/node24/bin"]);
