@@ -1,16 +1,20 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use crate::{
     cli::BootstrapChannel,
     command_step::CommandStep,
     config::{
-        WecodeConfig, WECODE_CLI_BACKEND_ALIAS, WECODE_CLI_BACKEND_ID, WECODE_CLI_BACKEND_MODEL,
+        PreventSleepMode, WecodeConfig, WECODE_CLI_BACKEND_ALIAS, WECODE_CLI_BACKEND_ID,
+        WECODE_CLI_BACKEND_MODEL,
     },
     paths::{canonical_path_string, expand_tilde, trim_trailing_slashes},
 };
+
+const CAFFEINATE_PATH: &str = "/usr/bin/caffeinate";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
@@ -123,6 +127,65 @@ pub fn gateway_install_step(config: &WecodeConfig) -> CommandStep {
     )
 }
 
+pub fn gateway_launch_agent_path(config: &WecodeConfig) -> PathBuf {
+    PathBuf::from(expand_tilde("~/Library/LaunchAgents"))
+        .join(format!("ai.openclaw.{}.plist", config.openclaw.profile))
+}
+
+pub fn prevent_sleep_program_arguments(args: &[String], mode: PreventSleepMode) -> Vec<String> {
+    let stripped = strip_wecode_caffeinate_wrapper(args);
+    match mode {
+        PreventSleepMode::Off => stripped,
+        PreventSleepMode::Ac => {
+            let mut wrapped = Vec::with_capacity(stripped.len() + 2);
+            wrapped.push(CAFFEINATE_PATH.to_string());
+            wrapped.push("-s".to_string());
+            wrapped.extend(stripped);
+            wrapped
+        }
+    }
+}
+
+pub fn patch_gateway_launch_agent_prevent_sleep(config: &WecodeConfig) -> Result<(), String> {
+    patch_gateway_launch_agent_prevent_sleep_at(
+        &gateway_launch_agent_path(config),
+        config.openclaw.prevent_sleep,
+    )
+}
+
+pub fn patch_gateway_launch_agent_prevent_sleep_at(
+    path: &Path,
+    mode: PreventSleepMode,
+) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    if !path.exists() {
+        if mode == PreventSleepMode::Off {
+            return Ok(());
+        }
+        return Err(format!(
+            "OpenClaw LaunchAgent plist not found at {}; cannot apply openclaw.preventSleep",
+            path.display()
+        ));
+    }
+
+    let args = read_launch_agent_program_arguments(path)?;
+    let patched = prevent_sleep_program_arguments(&args, mode);
+    if patched == args {
+        return Ok(());
+    }
+    write_launch_agent_program_arguments(path, &patched)
+}
+
+fn strip_wecode_caffeinate_wrapper(args: &[String]) -> Vec<String> {
+    if args.len() >= 2 && args[0] == CAFFEINATE_PATH && args[1] == "-s" {
+        args[2..].to_vec()
+    } else {
+        args.to_vec()
+    }
+}
+
 pub fn weixin_install_step(config: &WecodeConfig) -> CommandStep {
     let mut step = CommandStep::new(
         "npx",
@@ -137,6 +200,46 @@ pub fn weixin_install_step(config: &WecodeConfig) -> CommandStep {
     }
     step.with_path_prepend(openclaw_bin_dir(config))
         .with_envs(openclaw_env(config))
+}
+
+fn read_launch_agent_program_arguments(path: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-extract", "ProgramArguments", "json", "-o", "-"])
+        .arg(path)
+        .output()
+        .map_err(|err| format!("failed to run plutil for {}: {err}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read LaunchAgent ProgramArguments from {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|err| {
+        format!(
+            "failed to parse LaunchAgent ProgramArguments from {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn write_launch_agent_program_arguments(path: &Path, args: &[String]) -> Result<(), String> {
+    let json = serde_json::to_string(args)
+        .map_err(|err| format!("failed to serialize LaunchAgent ProgramArguments: {err}"))?;
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-replace", "ProgramArguments", "-json", &json])
+        .arg(path)
+        .output()
+        .map_err(|err| format!("failed to run plutil for {}: {err}", path.display()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to update LaunchAgent ProgramArguments in {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 pub fn feishu_install_steps(config: &WecodeConfig) -> Vec<CommandStep> {
@@ -355,6 +458,16 @@ fn codex_bridge_config_plan(config: &WecodeConfig, backend_command: &str) -> Vec
             vec![
                 "config".to_string(),
                 "set".to_string(),
+                "agents.defaults.timeoutSeconds".to_string(),
+                config.openclaw.timeout_seconds.to_string(),
+            ],
+        ),
+        openclaw_step(
+            config,
+            &openclaw,
+            vec![
+                "config".to_string(),
+                "set".to_string(),
                 "agents.defaults.cliBackends".to_string(),
                 cli_backend_config_json(config, backend_command),
                 "--strict-json".to_string(),
@@ -397,6 +510,16 @@ fn cli_backend_config_json(config: &WecodeConfig, backend_command: &str) -> Stri
             "input": "stdin",
             "modelArg": "--model",
             "output": "jsonl",
+            "reliability": {
+                "watchdog": {
+                    "fresh": {
+                        "noOutputTimeoutMs": config.openclaw.cli_no_output_timeout_ms
+                    },
+                    "resume": {
+                        "noOutputTimeoutMs": config.openclaw.cli_no_output_timeout_ms
+                    }
+                }
+            },
             "resumeArgs": ["codex-backend", "--jsonl", "--cwd", project_cwd, "--resume", "{sessionId}"],
             "resumeOutput": "jsonl",
             "serialize": true,

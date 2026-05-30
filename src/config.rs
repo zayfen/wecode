@@ -32,8 +32,27 @@ pub struct OpenclawConfig {
     pub workspace_dir: String,
     #[serde(default = "default_gateway_port", rename = "gatewayPort")]
     pub gateway_port: u16,
+    #[serde(
+        default = "default_openclaw_timeout_seconds",
+        rename = "timeoutSeconds"
+    )]
+    pub timeout_seconds: u32,
+    #[serde(
+        default = "default_openclaw_cli_no_output_timeout_ms",
+        rename = "cliNoOutputTimeoutMs"
+    )]
+    pub cli_no_output_timeout_ms: u64,
+    #[serde(default = "default_openclaw_prevent_sleep", rename = "preventSleep")]
+    pub prevent_sleep: PreventSleepMode,
     #[serde(default, rename = "nodeBinDir")]
     pub node_bin_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PreventSleepMode {
+    Off,
+    Ac,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +99,9 @@ impl Default for OpenclawConfig {
             config_path: default_openclaw_config_path(),
             workspace_dir: default_openclaw_workspace_dir(),
             gateway_port: default_gateway_port(),
+            timeout_seconds: default_openclaw_timeout_seconds(),
+            cli_no_output_timeout_ms: default_openclaw_cli_no_output_timeout_ms(),
+            prevent_sleep: default_openclaw_prevent_sleep(),
             node_bin_dir: None,
         }
     }
@@ -122,6 +144,18 @@ fn default_openclaw_workspace_dir() -> String {
 
 fn default_gateway_port() -> u16 {
     19789
+}
+
+fn default_openclaw_timeout_seconds() -> u32 {
+    1200
+}
+
+fn default_openclaw_cli_no_output_timeout_ms() -> u64 {
+    900_000
+}
+
+fn default_openclaw_prevent_sleep() -> PreventSleepMode {
+    PreventSleepMode::Ac
 }
 
 fn default_codex_sandbox() -> String {

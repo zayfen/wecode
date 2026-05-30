@@ -3,7 +3,7 @@ mod common;
 use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 use wecode::{
     bootstrap_plan_with_backend_command, default_config, patch_openclaw_text_command_routing,
-    BootstrapChannel, CommandStep,
+    prevent_sleep_program_arguments, BootstrapChannel, CommandStep, PreventSleepMode,
 };
 
 #[test]
@@ -72,7 +72,7 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
         .iter()
         .any(|arg| arg == "plugins.entries.codex.enabled")));
     let cli_backend_json = format!(
-        "{{\"wecode-codex\":{{\"args\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{}],\"command\":\"/usr/local/bin/wecode\",\"input\":\"stdin\",\"modelArg\":\"--model\",\"output\":\"jsonl\",\"resumeArgs\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{},\"--resume\",\"{{sessionId}}\"],\"resumeOutput\":\"jsonl\",\"serialize\":true,\"sessionIdFields\":[\"thread_id\"]}}}}",
+        "{{\"wecode-codex\":{{\"args\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{}],\"command\":\"/usr/local/bin/wecode\",\"input\":\"stdin\",\"modelArg\":\"--model\",\"output\":\"jsonl\",\"reliability\":{{\"watchdog\":{{\"fresh\":{{\"noOutputTimeoutMs\":900000}},\"resume\":{{\"noOutputTimeoutMs\":900000}}}}}},\"resumeArgs\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{},\"--resume\",\"{{sessionId}}\"],\"resumeOutput\":\"jsonl\",\"serialize\":true,\"sessionIdFields\":[\"thread_id\"]}}}}",
         serde_json::to_string(&project_dir).expect("project dir json"),
         serde_json::to_string(&project_dir).expect("project dir json")
     );
@@ -98,6 +98,13 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
             "--strict-json",
             "--merge"
         ]
+    ));
+    assert!(common::has_step(
+        &steps,
+        &CommandStep::new(
+            "~/.wecode/openclaw-runtime/node_modules/.bin/openclaw",
+            ["config", "set", "agents.defaults.timeoutSeconds", "1200"]
+        )
     ));
     assert!(common::has_step(
         &steps,
@@ -234,6 +241,29 @@ if [ "$1" = "--version" ]; then
   echo "OpenClaw 2026.5.27"
   exit 0
 fi
+if [ "$1" = "gateway" ] && [ "$2" = "install" ]; then
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$HOME/Library/LaunchAgents/ai.openclaw.wecode.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.openclaw.wecode</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/tmp/wecode-env-wrapper.sh</string>
+    <string>/tmp/wecode.env</string>
+    <string>/tmp/node</string>
+    <string>/tmp/openclaw/dist/index.js</string>
+    <string>gateway</string>
+    <string>--port</string>
+    <string>19789</string>
+  </array>
+</dict>
+</plist>
+PLIST
+fi
 echo "OpenClaw noisy gateway stdout"
 echo "OpenClaw noisy gateway stderr" >&2
 EOF
@@ -281,6 +311,7 @@ echo "OpenClaw noisy npm stderr" >&2
             config_path.to_str().expect("utf-8 config"),
             "--weixin",
         ])
+        .env("HOME", temp.path())
         .env("PATH", path)
         .output()
         .expect("run bootstrap");
@@ -336,6 +367,7 @@ echo "OpenClaw noisy npm stderr" >&2
     assert!(log.contains("OpenClaw noisy gateway stderr"), "log:\n{log}");
     assert!(!log.contains("Weixin QR code stdout"), "log:\n{log}");
     assert!(!log.contains("Weixin login stderr"), "log:\n{log}");
+    assert_launch_agent_prevents_sleep(temp.path());
 }
 
 #[test]
@@ -384,6 +416,31 @@ cat > "$prefix/node_modules/.bin/openclaw" <<'EOF'
 #!/bin/sh
 if [ "$1" = "--version" ]; then
   echo "OpenClaw 2026.5.27"
+  exit 0
+fi
+if [ "$1" = "gateway" ] && [ "$2" = "install" ]; then
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$HOME/Library/LaunchAgents/ai.openclaw.wecode.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.openclaw.wecode</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/tmp/wecode-env-wrapper.sh</string>
+    <string>/tmp/wecode.env</string>
+    <string>/tmp/node</string>
+    <string>/tmp/openclaw/dist/index.js</string>
+    <string>gateway</string>
+    <string>--port</string>
+    <string>19789</string>
+  </array>
+</dict>
+</plist>
+PLIST
+  echo "OpenClaw gateway installed"
   exit 0
 fi
 case "$*" in
@@ -448,6 +505,7 @@ chmod 755 "$prefix/node_modules/.bin/openclaw"
             config_path.to_str().expect("utf-8 config"),
             "--feishu",
         ])
+        .env("HOME", temp.path())
         .env("PATH", path)
         .output()
         .expect("run feishu bootstrap");
@@ -484,6 +542,7 @@ chmod 755 "$prefix/node_modules/.bin/openclaw"
     let log = fs::read_to_string(state_dir.join("bootstrap.log")).expect("bootstrap log");
     assert!(log.contains("@openclaw/feishu --force"), "log:\n{log}");
     assert!(!log.contains("Feishu App Secret prompt"), "log:\n{log}");
+    assert_launch_agent_prevents_sleep(temp.path());
 }
 
 #[test]
@@ -691,6 +750,36 @@ fn patch_openclaw_runtime_disables_builtin_compact_when_text_commands_disabled()
 }
 
 #[test]
+fn prevent_sleep_wraps_gateway_launch_agent_arguments_on_ac_power() {
+    let original = vec![
+        "/Users/riven/.wecode/openclaw-state/service-env/ai.openclaw.wecode-env-wrapper.sh"
+            .to_string(),
+        "/Users/riven/.wecode/openclaw-state/service-env/ai.openclaw.wecode.env".to_string(),
+        "/opt/homebrew/opt/node@22/bin/node".to_string(),
+        "/Users/riven/.wecode/openclaw-runtime/node_modules/openclaw/dist/index.js".to_string(),
+        "gateway".to_string(),
+        "--port".to_string(),
+        "19789".to_string(),
+    ];
+
+    let wrapped = prevent_sleep_program_arguments(&original, PreventSleepMode::Ac);
+
+    assert_eq!(wrapped[0], "/usr/bin/caffeinate");
+    assert_eq!(wrapped[1], "-s");
+    assert_eq!(&wrapped[2..], original.as_slice());
+    assert_eq!(
+        prevent_sleep_program_arguments(&wrapped, PreventSleepMode::Ac),
+        wrapped,
+        "sleep prevention wrapper should be idempotent"
+    );
+    assert_eq!(
+        prevent_sleep_program_arguments(&wrapped, PreventSleepMode::Off),
+        original,
+        "turning the mode off should remove the wecode caffeinate wrapper"
+    );
+}
+
+#[test]
 fn bootstrap_plan_connects_feishu_to_wecode_codex_backend() {
     let cfg = default_config();
 
@@ -786,4 +875,23 @@ fn openclaw_text_routing_source() -> &'static str {
 	return !isNativeCommandSurface(params.surface);
 }
 "#
+}
+
+fn assert_launch_agent_prevents_sleep(home: &Path) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let plist = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join("ai.openclaw.wecode.plist");
+    let source = fs::read_to_string(&plist).expect("LaunchAgent plist");
+    assert!(
+        source.contains("<string>/usr/bin/caffeinate</string>"),
+        "LaunchAgent should run under caffeinate:\n{source}"
+    );
+    assert!(
+        source.contains("<string>-s</string>"),
+        "LaunchAgent should prevent system sleep on AC power:\n{source}"
+    );
 }

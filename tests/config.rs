@@ -1,4 +1,4 @@
-use wecode::{default_config, read_config_str};
+use wecode::{default_config, read_config_str, PreventSleepMode};
 
 #[test]
 fn parses_config_with_custom_command() {
@@ -35,6 +35,9 @@ fn parses_config_with_custom_command() {
     );
     assert_eq!(cfg.openclaw.workspace_dir, "~/.wecode/workspace");
     assert_eq!(cfg.openclaw.gateway_port, 19789);
+    assert_eq!(cfg.openclaw.timeout_seconds, 1200);
+    assert_eq!(cfg.openclaw.cli_no_output_timeout_ms, 900_000);
+    assert_eq!(cfg.openclaw.prevent_sleep, PreventSleepMode::Ac);
     assert_eq!(cfg.openclaw.node_bin_dir, None);
     assert_eq!(cfg.codex.sandbox, "workspace-write");
     assert_eq!(cfg.commands[0].name, "review");
@@ -56,9 +59,26 @@ fn default_config_is_personal_codex_weixin_bridge() {
     );
     assert_eq!(cfg.openclaw.workspace_dir, "~/.wecode/workspace");
     assert_eq!(cfg.openclaw.gateway_port, 19789);
+    assert_eq!(cfg.openclaw.timeout_seconds, 1200);
+    assert_eq!(cfg.openclaw.cli_no_output_timeout_ms, 900_000);
+    assert_eq!(cfg.openclaw.prevent_sleep, PreventSleepMode::Ac);
     assert_eq!(cfg.openclaw.node_bin_dir, None);
     assert_eq!(cfg.codex.sandbox, "workspace-write");
     assert_eq!(cfg.codex.models, vec!["default", "gpt-5.4"]);
     assert_eq!(cfg.commands[0].name, "ask");
     assert_eq!(cfg.commands[0].prefix, ":codex ");
+}
+
+#[test]
+fn parses_openclaw_prevent_sleep_mode() {
+    let cfg = read_config_str(
+        r#"{
+          "openclaw": {
+            "preventSleep": "off"
+          }
+        }"#,
+    )
+    .expect("config should parse");
+
+    assert_eq!(cfg.openclaw.prevent_sleep, PreventSleepMode::Off);
 }

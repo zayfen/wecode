@@ -23,6 +23,7 @@ GitHub 默认展示的文档就是本文件 `README.md`，因此这里使用中�
 - 聊天中管理 session：`:resume [session_id]` 绑定到最近或指定的本机 Codex session，`:fresh [prompt]` 硬新开 Codex thread。
 - 微信审批：配置了 `requireConfirm: true` 的命令会先生成审批 id，微信发送 `:approve <id>` 后才执行。
 - 私有 OpenClaw 运行时：默认安装到 `~/.wecode/openclaw-runtime`，不污染全局 OpenClaw 配置。
+- macOS AC 防睡眠：默认用 `caffeinate -s` 包装 OpenClaw Gateway LaunchAgent，避免外接电源下息屏后系统睡眠导致消息不处理。
 
 ## 架构
 
@@ -194,6 +195,9 @@ $XDG_CONFIG_HOME/wecode/config.json
     "configPath": "~/.wecode/openclaw-state/openclaw.json",
     "workspaceDir": "~/.wecode/workspace",
     "gatewayPort": 19789,
+    "timeoutSeconds": 1200,
+    "cliNoOutputTimeoutMs": 900000,
+    "preventSleep": "ac",
     "nodeBinDir": null
   },
   "codex": {
@@ -206,6 +210,12 @@ $XDG_CONFIG_HOME/wecode/config.json
 ```
 
 `openclaw.workspaceDir` 是 OpenClaw 自己的工作区，用来保存 OpenClaw agent 的 workspace 文件；不要把它设置成你的代码项目目录，否则 OpenClaw 可能会在项目里生成 `SOUL.md`、`IDENTITY.md`、`.openclaw/` 等文件。
+
+`openclaw.timeoutSeconds` 会写入 OpenClaw 的 `agents.defaults.timeoutSeconds`，控制一次 agent turn 的整体超时。`openclaw.cliNoOutputTimeoutMs` 会写入 `agents.defaults.cliBackends.wecode-codex.reliability.watchdog.fresh/resume.noOutputTimeoutMs`，控制 Codex CLI 子进程多长时间没有 stdout/stderr 输出后才被 OpenClaw watchdog 终止。默认值分别是 1200 秒和 900000 毫秒。
+
+`openclaw.preventSleep` 控制 wecode 是否改写 OpenClaw Gateway 的 macOS LaunchAgent。默认值 `"ac"` 会把 Gateway 启动命令包装成 `/usr/bin/caffeinate -s ...`，只在外接电源时阻止系统睡眠，不阻止显示器息屏；设置为 `"off"` 会移除 wecode 添加的 `caffeinate` 包装。修改这个配置后运行 `wecode configure-codex` 或重新 `bootstrap`，LaunchAgent 才会被更新。
+
+`wecode codex-backend --jsonl` 会实时转发 `codex exec --json` 的 stdout/stderr；OpenClaw 可以边收到 Codex JSONL 边更新通道回复，也能避免因为 Wecode 缓存输出导致的无输出超时。
 
 要切换 Codex 处理的项目，只设置 `codex.cwd`，或在聊天里发送 `:cd <项目目录>`：
 

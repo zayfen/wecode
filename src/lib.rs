@@ -16,13 +16,15 @@ pub use commands::{
 };
 pub use config::{
     codex_model_from_openclaw_model, default_config, read_config_str, CodexConfig, CustomCommand,
-    OpenclawConfig, WecodeConfig, WECODE_CLI_BACKEND_ID,
+    OpenclawConfig, PreventSleepMode, WecodeConfig, WECODE_CLI_BACKEND_ID,
 };
 pub use diagnostics::{diagnose_tools, parse_node_version, ToolCheck, ToolReport, ToolSnapshot};
 pub use openclaw::{
     bootstrap_plan, bootstrap_plan_with_backend_command, channel_install_steps, codex_config_plan,
     codex_config_plan_with_backend_command, feishu_install_steps, gateway_install_step,
-    openclaw_bin_dir, openclaw_bin_path, openclaw_install_step, openclaw_runtime_patch_step,
-    patch_openclaw_text_command_routing, weixin_install_step,
+    gateway_launch_agent_path, openclaw_bin_dir, openclaw_bin_path, openclaw_install_step,
+    openclaw_runtime_patch_step, patch_gateway_launch_agent_prevent_sleep,
+    patch_gateway_launch_agent_prevent_sleep_at, patch_openclaw_text_command_routing,
+    prevent_sleep_program_arguments, weixin_install_step,
 };
 pub use sessions::{list_all_codex_sessions, list_codex_sessions, CodexSessionSummary};

@@ -11,10 +11,10 @@ use wecode::{
     backend::{AssistantBackend, BackendRunRequest, CodexBackend},
     bootstrap_plan_with_backend_command, codex_config_plan_with_backend_command,
     codex_model_from_openclaw_model, default_config, diagnose_tools, list_all_codex_sessions,
-    openclaw_bin_path, parse_node_version, patch_openclaw_text_command_routing,
-    prepare_backend_input_with_trace, read_config_str, render_command_input, weixin_install_step,
-    BackendInput, CliCommand, CommandStep, PreparedBackendInput, ToolReport, ToolSnapshot,
-    WecodeConfig,
+    openclaw_bin_path, parse_node_version, patch_gateway_launch_agent_prevent_sleep,
+    patch_openclaw_text_command_routing, prepare_backend_input_with_trace, read_config_str,
+    render_command_input, weixin_install_step, BackendInput, CliCommand, CommandStep,
+    PreparedBackendInput, ToolReport, ToolSnapshot, WecodeConfig,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -76,6 +76,7 @@ pub fn run(command: CliCommand) -> Result<(), String> {
             ensure_private_openclaw_dirs(&config)?;
             let log_path = bootstrap_log_path(&config);
             run_steps_logged(&config, &steps, &log_path)?;
+            patch_gateway_launch_agent_prevent_sleep(&config)?;
             print_bootstrap_success();
             Ok(())
         }
@@ -98,7 +99,8 @@ pub fn run(command: CliCommand) -> Result<(), String> {
             run_steps(
                 &config,
                 &codex_config_plan_with_backend_command(&config, &backend_command),
-            )
+            )?;
+            patch_gateway_launch_agent_prevent_sleep(&config)
         }
         CliCommand::Codex {
             config_path,
@@ -798,6 +800,7 @@ fn run_codex_prompt(
                 &output_path,
                 resume_session_id,
                 model,
+                *jsonl,
                 flow_run_id,
             )?;
 
@@ -825,6 +828,7 @@ fn run_codex_prompt(
                     &output_path,
                     None,
                     model,
+                    *jsonl,
                     flow_run_id,
                 )?;
             }
@@ -986,8 +990,11 @@ fn run_codex_review(
     }
     let result = CodexBackendResult {
         success: output.status.success(),
+        status_code: output.status.code(),
         stdout: output.stdout,
         stderr: output.stderr,
+        stdout_emitted: false,
+        stderr_emitted: false,
     };
     emit_codex_backend_result(&result, jsonl)?;
     if !result.success {
@@ -1008,8 +1015,11 @@ fn run_codex_review(
 
 struct CodexBackendResult {
     success: bool,
+    status_code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_emitted: bool,
+    stderr_emitted: bool,
 }
 
 fn run_codex_interactive_attempt(
@@ -1035,6 +1045,7 @@ fn run_codex_backend_attempt(
     output_path: &Path,
     resume_session_id: Option<&str>,
     selected_model: Option<&str>,
+    stream_jsonl: bool,
     flow_run_id: Option<&str>,
 ) -> Result<CodexBackendResult, String> {
     let mut command = codex_exec_command(
@@ -1050,25 +1061,113 @@ fn run_codex_backend_attempt(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command
-        .output()
-        .map_err(|err| format!("failed to start codex: {err}"))?;
+    let result = if stream_jsonl {
+        run_streaming_backend_command(command)?
+    } else {
+        let output = command
+            .output()
+            .map_err(|err| format!("failed to start codex: {err}"))?;
+        CodexBackendResult {
+            success: output.status.success(),
+            status_code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            stdout_emitted: false,
+            stderr_emitted: false,
+        }
+    };
     if let Some(run_id) = flow_run_id {
         tracing::info!(
             run_id = %run_id,
             event = "codex_exec_result",
-            success = output.status.success(),
-            status_code = ?output.status.code(),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
+            success = result.success,
+            status_code = ?result.status_code,
+            stdout_bytes = result.stdout.len(),
+            stderr_bytes = result.stderr.len(),
+            stdout_emitted = result.stdout_emitted,
+            stderr_emitted = result.stderr_emitted,
             "prompt_flow"
         );
     }
+    Ok(result)
+}
+
+enum StreamTarget {
+    Stdout,
+    Stderr,
+}
+
+fn run_streaming_backend_command(mut command: Command) -> Result<CodexBackendResult, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to start codex: {err}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture Codex stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture Codex stderr".to_string())?;
+
+    let stdout_thread = thread::spawn(move || capture_and_forward(stdout, StreamTarget::Stdout));
+    let stderr_thread = thread::spawn(move || capture_and_forward(stderr, StreamTarget::Stderr));
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed to wait for codex: {err}"))?;
+    let stdout = join_output_thread(stdout_thread, "stdout")?;
+    let stderr = join_output_thread(stderr_thread, "stderr")?;
+
     Ok(CodexBackendResult {
-        success: output.status.success(),
-        stdout: output.stdout,
-        stderr: output.stderr,
+        success: status.success(),
+        status_code: status.code(),
+        stdout,
+        stderr,
+        stdout_emitted: true,
+        stderr_emitted: true,
     })
+}
+
+fn join_output_thread(
+    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    handle
+        .join()
+        .map_err(|_| format!("Codex {name} reader panicked"))?
+        .map_err(|err| format!("failed to read Codex {name}: {err}"))
+}
+
+fn capture_and_forward<R: Read>(mut reader: R, target: StreamTarget) -> io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut buf = [0_u8; 8192];
+    match target {
+        StreamTarget::Stdout => {
+            let mut writer = io::stdout().lock();
+            loop {
+                let len = reader.read(&mut buf)?;
+                if len == 0 {
+                    break;
+                }
+                writer.write_all(&buf[..len])?;
+                writer.flush()?;
+                captured.extend_from_slice(&buf[..len]);
+            }
+        }
+        StreamTarget::Stderr => {
+            let mut writer = io::stderr().lock();
+            loop {
+                let len = reader.read(&mut buf)?;
+                if len == 0 {
+                    break;
+                }
+                writer.write_all(&buf[..len])?;
+                writer.flush()?;
+                captured.extend_from_slice(&buf[..len]);
+            }
+        }
+    }
+    Ok(captured)
 }
 
 fn codex_exec_command(
@@ -1139,14 +1238,16 @@ fn print_codex_exec_command(
 }
 
 fn emit_codex_backend_result(result: &CodexBackendResult, jsonl: bool) -> Result<(), String> {
-    if jsonl {
+    if jsonl && !result.stdout_emitted {
         io::stdout()
             .write_all(&result.stdout)
             .map_err(|err| format!("failed to write Codex JSONL stdout: {err}"))?;
     }
-    io::stderr()
-        .write_all(&result.stderr)
-        .map_err(|err| format!("failed to write Codex stderr: {err}"))?;
+    if !result.stderr_emitted {
+        io::stderr()
+            .write_all(&result.stderr)
+            .map_err(|err| format!("failed to write Codex stderr: {err}"))?;
+    }
     Ok(())
 }
 

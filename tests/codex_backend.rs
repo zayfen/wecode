@@ -1,8 +1,11 @@
 use std::{
     env, fs,
-    io::Write,
+    io::{BufRead, BufReader, Read, Write},
     os::unix::fs::PermissionsExt,
     process::{Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 #[test]
@@ -77,6 +80,69 @@ esac
     let calls = fs::read_to_string(calls_path).expect("calls");
     assert!(calls.contains("exec resume --json"));
     assert!(calls.contains("exec --json"));
+}
+
+#[test]
+fn codex_backend_streams_jsonl_before_codex_exits() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+
+    fs::write(
+        &codex_path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {calls}
+echo '{{"thread_id":"stream-thread"}}'
+sleep 4
+echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"stream ok"}}]}}'
+"#,
+            calls = shell_quote(calls_path.to_str().expect("utf-8 path"))
+        ),
+    )
+    .expect("write fake codex");
+    let mut permissions = fs::metadata(&codex_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&codex_path, permissions).expect("chmod fake codex");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args(["codex-backend", "--jsonl", "hello"])
+        .env("PATH", path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wecode");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line);
+        let _ = tx.send((result, line));
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+    });
+
+    let (read_result, first_line) = match rx.recv_timeout(Duration::from_millis(2500)) {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = child.wait();
+            panic!("expected streamed JSONL before codex exited: {err}");
+        }
+    };
+    assert_eq!(read_result.expect("read stdout line"), first_line.len());
+    assert!(
+        first_line.contains(r#""thread_id":"stream-thread""#),
+        "first stdout line:\n{first_line}"
+    );
+
+    let status = child.wait().expect("wait wecode");
+    assert!(status.success(), "status: {:?}", status.code());
 }
 
 #[test]

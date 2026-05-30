@@ -7,6 +7,9 @@
     "configPath": "~/.wecode/openclaw-state/openclaw.json",
     "workspaceDir": "~/.wecode/workspace",
     "gatewayPort": 19789,
+    "timeoutSeconds": 1200,
+    "cliNoOutputTimeoutMs": 900000,
+    "preventSleep": "ac",
     "nodeBinDir": null
   },
   "codex": {
