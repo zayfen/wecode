@@ -59,10 +59,10 @@ fn parses_cli_commands() {
     );
 
     assert_eq!(
-        parse_cli_args(["wecode", "render", "/codex", "hello"]),
+        parse_cli_args(["wecode", "render", ":codex", "hello"]),
         Ok(CliCommand::Render {
             config_path: None,
-            input: "/codex hello".to_string(),
+            input: ":codex hello".to_string(),
         })
     );
 

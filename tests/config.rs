@@ -15,7 +15,7 @@ fn parses_config_with_custom_command() {
           "commands": [
             {
               "name": "review",
-              "prefix": "/review ",
+              "prefix": ":review ",
               "prompt": "Review this path: {{message}}",
               "requireConfirm": true
             }
@@ -38,7 +38,7 @@ fn parses_config_with_custom_command() {
     assert_eq!(cfg.openclaw.node_bin_dir, None);
     assert_eq!(cfg.codex.sandbox, "workspace-write");
     assert_eq!(cfg.commands[0].name, "review");
-    assert_eq!(cfg.commands[0].prefix, "/review ");
+    assert_eq!(cfg.commands[0].prefix, ":review ");
     assert!(cfg.commands[0].require_confirm);
 }
 
@@ -60,5 +60,5 @@ fn default_config_is_personal_codex_weixin_bridge() {
     assert_eq!(cfg.codex.sandbox, "workspace-write");
     assert_eq!(cfg.codex.models, vec!["default", "gpt-5.4"]);
     assert_eq!(cfg.commands[0].name, "ask");
-    assert_eq!(cfg.commands[0].prefix, "/codex ");
+    assert_eq!(cfg.commands[0].prefix, ":codex ");
 }

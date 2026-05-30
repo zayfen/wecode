@@ -28,17 +28,9 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
             ]
         )
     );
-    assert_eq!(
-        steps[1],
-        CommandStep::new(
-            "/usr/local/bin/wecode",
-            [
-                "patch-openclaw-runtime",
-                "--runtime-dir",
-                "~/.wecode/openclaw-runtime"
-            ]
-        )
-    );
+    assert!(!steps
+        .iter()
+        .any(|step| step.args.iter().any(|arg| arg == "patch-openclaw-runtime")));
     assert!(common::has_step(
         &steps,
         &CommandStep::new(
@@ -65,7 +57,7 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
                     openclaw_workspace.clone(),
                 ]
     }));
-    assert!(common::has_step(
+    assert!(!common::has_step(
         &steps,
         &CommandStep::new(
             "~/.wecode/openclaw-runtime/node_modules/.bin/openclaw",
@@ -495,7 +487,112 @@ chmod 755 "$prefix/node_modules/.bin/openclaw"
 }
 
 #[test]
-fn patch_openclaw_text_routing_disables_non_native_fallback() {
+fn bootstrap_checks_openclaw_state_dir_is_writable_before_running_steps() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let project_dir = temp.path().join("project");
+    let runtime_dir = temp.path().join("openclaw-runtime");
+    let state_dir = temp.path().join("openclaw-state");
+    let workspace_dir = temp.path().join("workspace");
+    let config_path = temp.path().join("wecode.json");
+    let marker_path = temp.path().join("npm-ran.txt");
+    fs::create_dir(&project_dir).expect("project dir");
+    fs::create_dir(&state_dir).expect("state dir");
+    let mut permissions = fs::metadata(&state_dir)
+        .expect("state metadata")
+        .permissions();
+    permissions.set_mode(0o555);
+    fs::set_permissions(&state_dir, permissions).expect("chmod state dir");
+
+    write_executable(
+        &temp.path().join("node"),
+        r#"#!/bin/sh
+echo v24.0.0
+"#,
+    );
+    write_executable(
+        &temp.path().join("codex"),
+        r#"#!/bin/sh
+echo codex 1.0.0
+"#,
+    );
+    write_executable(
+        &temp.path().join("npm"),
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 10.0.0
+  exit 0
+fi
+touch {}
+"#,
+            shell_quote(marker_path.to_str().expect("utf-8 marker path"))
+        ),
+    );
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{
+                "runtimeDir": "{}",
+                "stateDir": "{}",
+                "configPath": "{}",
+                "workspaceDir": "{}",
+                "nodeBinDir": "{}"
+              }},
+              "codex": {{"cwd": "{}"}},
+              "commands": []
+            }}"#,
+            runtime_dir.display(),
+            state_dir.display(),
+            state_dir.join("openclaw.json").display(),
+            workspace_dir.display(),
+            temp.path().display(),
+            project_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "bootstrap",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--weixin",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run bootstrap");
+
+    let mut restore_permissions = fs::metadata(&state_dir)
+        .expect("state metadata after bootstrap")
+        .permissions();
+    restore_permissions.set_mode(0o755);
+    fs::set_permissions(&state_dir, restore_permissions).expect("restore state dir");
+
+    assert!(!output.status.success(), "bootstrap should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("openclaw.stateDir"),
+        "stderr should mention stateDir permissions:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("bootstrap Wecode"),
+        "stderr should explain bootstrap failed before setup:\n{stderr}"
+    );
+    assert!(
+        !marker_path.exists(),
+        "bootstrap must not run setup commands when stateDir is not writable"
+    );
+}
+
+#[test]
+fn patch_openclaw_text_routing_disables_all_text_commands() {
     let temp = tempfile::tempdir().expect("temp dir");
     let dist = temp
         .path()
@@ -520,7 +617,77 @@ fn patch_openclaw_text_routing_disables_non_native_fallback() {
 
     let patched = fs::read_to_string(&routing_file).expect("patched routing");
     assert!(patched.contains(r#"return params.cfg.commands?.text !== false;"#));
+    assert!(!patched.contains(r#"params.commandSource === "native""#));
     assert!(!patched.contains("return !isNativeCommandSurface(params.surface);"));
+}
+
+#[test]
+fn patch_openclaw_text_routing_upgrades_previous_wecode_patch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dist = temp
+        .path()
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&dist).expect("dist dir");
+    let routing_file = dist.join("commands-text-routing-test.js");
+    fs::write(
+        &routing_file,
+        r#"function shouldHandleTextCommands(params) {
+	if (params.commandSource === "native") return true;
+	return params.cfg.commands?.text !== false;
+}
+"#,
+    )
+    .expect("routing file");
+
+    patch_openclaw_text_command_routing(temp.path()).expect("patch routing");
+
+    let patched = fs::read_to_string(&routing_file).expect("patched routing");
+    assert!(patched.contains(r#"return params.cfg.commands?.text !== false;"#));
+    assert!(!patched.contains(r#"params.commandSource === "native""#));
+}
+
+#[test]
+fn patch_openclaw_runtime_disables_builtin_compact_when_text_commands_disabled() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dist = temp
+        .path()
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&dist).expect("dist dir");
+    let routing_file = dist.join("commands-text-routing-test.js");
+    fs::write(&routing_file, openclaw_text_routing_source()).expect("routing file");
+    let handlers_file = dist.join("commands-handlers.runtime-test.js");
+    fs::write(
+        &handlers_file,
+        r#"const handleCompactCommand = async (params) => {
+	if (!(params.command.commandBodyNormalized === "/compact" || params.command.commandBodyNormalized.startsWith("/compact "))) return null;
+	if (!params.command.isAuthorizedSender) {
+		logVerbose(`Ignoring /compact from unauthorized sender: ${params.command.senderId || "<unknown>"}`);
+		return { shouldContinue: false };
+	}
+	return { shouldContinue: false, reply: { text: "compact" } };
+};
+"#,
+    )
+    .expect("handlers file");
+
+    patch_openclaw_text_command_routing(temp.path()).expect("patch runtime");
+    patch_openclaw_text_command_routing(temp.path()).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&handlers_file).expect("patched handlers");
+    let guard = "if (params.cfg.commands?.text === false) return null;";
+    assert!(
+        patched.contains(guard),
+        "compact handler should respect commands.text=false:\n{patched}"
+    );
+    assert_eq!(
+        patched.matches(guard).count(),
+        1,
+        "compact handler patch should be idempotent:\n{patched}"
+    );
 }
 
 #[test]
@@ -606,6 +773,10 @@ fn write_executable(path: &Path, contents: &str) {
     let mut permissions = fs::metadata(path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("chmod executable");
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn openclaw_text_routing_source() -> &'static str {

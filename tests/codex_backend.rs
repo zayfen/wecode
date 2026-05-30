@@ -1,10 +1,17 @@
-use std::{env, fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{
+    env, fs,
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    process::{Command, Stdio},
+};
 
 #[test]
 fn codex_backend_falls_back_to_fresh_thread_when_resume_rollout_is_missing() {
     let temp = tempfile::tempdir().expect("temp dir");
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
 
     fs::write(
         &codex_path,
@@ -30,6 +37,11 @@ esac
     let mut permissions = fs::metadata(&codex_path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&codex_path, permissions).expect("chmod fake codex");
+    fs::write(
+        &config_path,
+        format!(r#"{{"openclaw":{{"stateDir":"{}"}}}}"#, state_dir.display()),
+    )
+    .expect("write config");
 
     let path = format!(
         "{}:{}",
@@ -39,6 +51,8 @@ esac
     let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
         .args([
             "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
             "--jsonl",
             "--resume",
             "stale-thread",
@@ -98,7 +112,7 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
               "commands": [
                 {{
                   "name": "deploy",
-                  "prefix": "/deploy ",
+                  "prefix": ":deploy ",
                   "prompt": "Deploy {{{{message}}}}",
                   "requireConfirm": true
                 }}
@@ -120,7 +134,7 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/deploy",
+            ":deploy",
             "production",
         ])
         .env("PATH", &path)
@@ -134,7 +148,7 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
     );
     let request_stdout = String::from_utf8_lossy(&request.stdout);
     assert!(request_stdout.contains("requires approval"));
-    assert!(request_stdout.contains("/approve "));
+    assert!(request_stdout.contains(":approve "));
     assert!(!calls_path.exists(), "codex should not run before approval");
 
     let approvals_dir = state_dir.join("approvals");
@@ -159,7 +173,7 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
             "--jsonl",
             "--resume",
             "existing-thread",
-            "/approve",
+            ":approve",
             &approval_id,
         ])
         .env("PATH", path)
@@ -204,7 +218,7 @@ fn model_command_sets_model_for_next_codex_run() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/model",
+            ":model",
             "gpt-5.5",
         ])
         .env("PATH", &path)
@@ -219,7 +233,7 @@ fn model_command_sets_model_for_next_codex_run() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/codex",
+            ":codex",
             "hello",
         ])
         .env("PATH", path)
@@ -270,7 +284,7 @@ fn model_command_keeps_separate_model_state_per_project() {
                 "--jsonl",
                 "--cwd",
                 project.to_str().expect("utf-8 project"),
-                "/model",
+                ":model",
                 model,
             ])
             .env("PATH", &path)
@@ -292,7 +306,7 @@ fn model_command_keeps_separate_model_state_per_project() {
                 "--jsonl",
                 "--cwd",
                 project.to_str().expect("utf-8 project"),
-                "/codex",
+                ":codex",
                 "hello",
             ])
             .env("PATH", &path)
@@ -338,7 +352,7 @@ fn models_command_lists_configured_models_without_invoking_codex() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/models",
+            ":models",
         ])
         .env("PATH", path)
         .output()
@@ -385,7 +399,7 @@ fn openclaw_default_model_arg_still_allows_local_model_override() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/model",
+            ":model",
             "gpt-5.5",
         ])
         .env("PATH", &path)
@@ -405,7 +419,7 @@ fn openclaw_default_model_arg_still_allows_local_model_override() {
             "--jsonl",
             "--model",
             "wecode-codex/default",
-            "/codex",
+            ":codex",
             "hello",
         ])
         .env("PATH", path)
@@ -439,7 +453,7 @@ fn openclaw_model_arg_is_passed_to_codex_without_backend_prefix() {
             "--jsonl",
             "--model",
             "wecode-codex/gpt-5.4",
-            "/codex",
+            ":codex",
             "hello",
         ])
         .env("PATH", path)
@@ -482,7 +496,7 @@ fn project_model_state_takes_precedence_over_openclaw_model_arg() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/model",
+            ":model",
             "gpt-project",
         ])
         .env("PATH", &path)
@@ -498,7 +512,7 @@ fn project_model_state_takes_precedence_over_openclaw_model_arg() {
             "--jsonl",
             "--model",
             "wecode-codex/gpt-openclaw",
-            "/codex",
+            ":codex",
             "hello",
         ])
         .env("PATH", path)
@@ -523,6 +537,8 @@ fn backend_cwd_arg_makes_codex_run_inside_project_directory() {
     let project_dir = project_dir.canonicalize().expect("canonical project dir");
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
 
     fs::write(
         &codex_path,
@@ -540,6 +556,11 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
     let mut permissions = fs::metadata(&codex_path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&codex_path, permissions).expect("chmod fake codex");
+    fs::write(
+        &config_path,
+        format!(r#"{{"openclaw":{{"stateDir":"{}"}}}}"#, state_dir.display()),
+    )
+    .expect("write config");
 
     let path = format!(
         "{}:{}",
@@ -549,10 +570,12 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
     let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
         .args([
             "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
             "--jsonl",
             "--cwd",
             project_dir.to_str().expect("utf-8 project dir"),
-            "/codex",
+            ":codex",
             "hello",
         ])
         .env("PATH", path)
@@ -613,7 +636,7 @@ fn local_filesystem_commands_do_not_invoke_codex() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/pwd",
+            ":pwd",
         ])
         .env("PATH", &path)
         .output()
@@ -627,7 +650,7 @@ fn local_filesystem_commands_do_not_invoke_codex() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/ls",
+            ":ls",
             ".",
         ])
         .env("PATH", &path)
@@ -635,6 +658,22 @@ fn local_filesystem_commands_do_not_invoke_codex() {
         .expect("run ls");
     assert!(ls.status.success());
     let ls_stdout = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        !ls_stdout.trim_start().starts_with('{'),
+        "local ls should be plain text, stdout:\n{ls_stdout}"
+    );
+    assert!(
+        !ls_stdout.contains("\"type\":\"message\""),
+        "local ls should not expose JSON message wrappers, stdout:\n{ls_stdout}"
+    );
+    assert!(
+        ls_stdout.starts_with("```text\n"),
+        "local ls should be wrapped in a markdown code block, stdout:\n{ls_stdout}"
+    );
+    assert!(
+        ls_stdout.trim_end().ends_with("\n```"),
+        "local ls should close its markdown code block, stdout:\n{ls_stdout}"
+    );
     assert!(ls_stdout.contains(&readme_path.display().to_string()));
     assert!(ls_stdout.contains(&nested_dir.display().to_string()));
 
@@ -644,7 +683,7 @@ fn local_filesystem_commands_do_not_invoke_codex() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/cat",
+            ":cat",
             "README.md",
         ])
         .env("PATH", &path)
@@ -659,7 +698,7 @@ fn local_filesystem_commands_do_not_invoke_codex() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/shell",
+            ":shell",
             "pwd",
         ])
         .env("PATH", &path)
@@ -672,18 +711,62 @@ fn local_filesystem_commands_do_not_invoke_codex() {
     );
     let shell_stdout = String::from_utf8_lossy(&shell.stdout);
     assert!(
-        shell_stdout.contains("Exit code: 0"),
-        "stdout:\n{shell_stdout}"
+        !shell_stdout.trim_start().starts_with('{'),
+        "local shell should be plain text, stdout:\n{shell_stdout}"
     );
-    assert!(
-        shell_stdout.contains(&project_dir.display().to_string()),
-        "stdout:\n{shell_stdout}"
+    let canonical_project_dir = project_dir.canonicalize().expect("canonical project dir");
+    assert_eq!(
+        shell_stdout,
+        format!("```text\n{}\n```\n", canonical_project_dir.display())
     );
     assert!(!calls_path.exists(), "local commands must not invoke codex");
 }
 
 #[test]
-fn sessions_command_includes_initial_prompt_without_invoking_codex() {
+fn local_command_output_uses_longer_markdown_fence_when_needed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&project_dir).expect("project dir");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{"cwd": "{}"}}
+            }}"#,
+            state_dir.display(),
+            project_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":shell",
+            "printf 'before\n```\nafter\n'",
+        ])
+        .output()
+        .expect("run shell with markdown fence");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "````text\nbefore\n```\nafter\n````\n"
+    );
+}
+
+#[test]
+fn resume_command_binds_latest_codex_session_without_invoking_codex() {
     let temp = tempfile::tempdir().expect("temp dir");
     let project_dir = temp.path().join("project");
     fs::create_dir(&project_dir).expect("project dir");
@@ -693,8 +776,27 @@ fn sessions_command_includes_initial_prompt_without_invoking_codex() {
     let codex_home = temp.path().join("codex-home");
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
+    let sqlite_path = temp.path().join("sqlite3");
 
     write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &sqlite_path,
+        r#"#!/bin/sh
+cat <<'JSON'
+[{"id":"019e746e-aaaa-7bbb-8ccc-424fd4f025c7","title":"Conversation info (untrusted metadata):\n```json\n{\"message_id\":\"om_session\"}\n```\n\n[message_id: om_session]\nou_user: Codex title: review api | cli boundaries"},
+{"id":"019e746e-4c43-74c2-b47a-424fd4f025c7","title":"Codex title: export accounts"},
+{"id":"019e746e-bbbb-7ccc-8ddd-424fd4f025c7","title":"Codex title: other project"}]
+JSON
+"#,
+    )
+    .expect("write fake sqlite3");
+    let mut sqlite_permissions = fs::metadata(&sqlite_path)
+        .expect("sqlite metadata")
+        .permissions();
+    sqlite_permissions.set_mode(0o755);
+    fs::set_permissions(&sqlite_path, sqlite_permissions).expect("chmod fake sqlite3");
+    fs::create_dir_all(&codex_home).expect("codex home");
+    fs::write(codex_home.join("state_5.sqlite"), "").expect("fake codex state db");
     fs::create_dir_all(codex_home.join("sessions/2026/05/29")).expect("session dirs");
     fs::write(
         codex_home
@@ -707,6 +809,33 @@ fn sessions_command_includes_initial_prompt_without_invoking_codex() {
         ),
     )
     .expect("write session");
+    fs::write(
+        codex_home
+            .join("sessions/2026/05/29/rollout-019e746e-aaaa-7bbb-8ccc-424fd4f025c7.jsonl"),
+        format!(
+            r#"{{"timestamp":"2026-05-29T16:50:46.110Z","type":"session_meta","payload":{{"id":"019e746e-aaaa-7bbb-8ccc-424fd4f025c7","timestamp":"2026-05-29T16:50:46.110Z","cwd":"{}","originator":"codex-tui"}}}}
+{{"timestamp":"2026-05-29T16:50:47.110Z","type":"event_msg","payload":{{"type":"user_message","message":"Review api | cli boundaries"}}}}
+"#,
+            project_dir.display()
+        ),
+    )
+    .expect("write newer session");
+    let other_project_dir = temp.path().join("other-project");
+    fs::create_dir(&other_project_dir).expect("other project dir");
+    let other_project_dir = other_project_dir
+        .canonicalize()
+        .expect("canonical other project dir");
+    fs::write(
+        codex_home
+            .join("sessions/2026/05/29/rollout-019e746e-bbbb-7ccc-8ddd-424fd4f025c7.jsonl"),
+        format!(
+            r#"{{"timestamp":"2026-05-29T14:50:46.110Z","type":"session_meta","payload":{{"id":"019e746e-bbbb-7ccc-8ddd-424fd4f025c7","timestamp":"2026-05-29T14:50:46.110Z","cwd":"{}","originator":"codex-tui"}}}}
+{{"timestamp":"2026-05-29T14:50:47.110Z","type":"event_msg","payload":{{"type":"user_message","message":"Other project JSONL prompt"}}}}
+"#,
+            other_project_dir.display()
+        ),
+    )
+    .expect("write other project session");
     fs::write(
         &config_path,
         format!(
@@ -731,12 +860,12 @@ fn sessions_command_includes_initial_prompt_without_invoking_codex() {
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/sessions",
+            ":resume",
         ])
         .env("CODEX_HOME", &codex_home)
         .env("PATH", path)
         .output()
-        .expect("run sessions");
+        .expect("run resume");
 
     assert!(
         output.status.success(),
@@ -745,10 +874,26 @@ fn sessions_command_includes_initial_prompt_without_invoking_codex() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Prompt: Implement account export command"),
+        stdout.contains(r#""thread_id":"019e746e-aaaa-7bbb-8ccc-424fd4f025c7""#),
         "stdout:\n{stdout}"
     );
-    assert!(!calls_path.exists(), "sessions must not invoke codex");
+    assert!(
+        stdout.contains("Resumed Codex session"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Codex title: review api | cli boundaries"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&project_dir.display().to_string()),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("019e746e-4c43-74c2-b47a-424fd4f025c7"),
+        "resume should bind only the latest session, stdout:\n{stdout}"
+    );
+    assert!(!calls_path.exists(), "resume must not invoke codex");
 }
 
 #[test]
@@ -764,7 +909,7 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
         env::var("PATH").unwrap_or_default()
     );
     let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
-        .args(["codex-backend", "--jsonl", "/help"])
+        .args(["codex-backend", "--jsonl", ":help"])
         .env("PATH", path)
         .output()
         .expect("run help");
@@ -777,44 +922,47 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for expected in [
         "# Wecode 帮助",
-        "`/help` 和 `/commands` 由 Wecode 本地直接返回，不会请求 Codex。",
+        "`:help` 和 `:commands` 由 Wecode 本地直接返回，不会请求 Codex。",
         "## 普通消息",
         "## 本地命令（不调用 Codex）",
-        "- `/help` / `/commands` - 显示本帮助，不请求 Codex",
-        "- `/pwd` - 显示当前 Codex 项目目录",
-        "- `/ls [path]` - 列出目录，返回绝对路径",
-        "- `/cat <path>` - 读取项目内文本文件",
-        "- `/cd <path>` - 切换 Codex 项目目录，下一次任务会新开 session",
-        "- `/shell <command>` - 在当前 Codex 项目目录执行 shell 命令",
-        "- `/diff` - 显示当前项目 git diff",
-        "- `/status` - 显示后端、项目、session、审批、模型和 git 状态",
+        "- `:help` / `:commands` - 显示本帮助，不请求 Codex",
+        "- `:pwd` - 显示当前 Codex 项目目录",
+        "- `:ls [path]` - 列出目录，返回绝对路径",
+        "- `:cat <path>` - 读取项目内文本文件",
+        "- `:cd <path>` - 切换 Codex 项目目录，下一次任务会新开 session",
+        "- `:shell <command>` - 在当前 Codex 项目目录执行 shell 命令",
+        "- `:diff` - 显示当前项目 git diff",
+        "- `:status` - 显示后端、项目、session、审批、模型和 git 状态",
         "## Codex 命令（会调用 Codex）",
-        "- `/init [notes]` - 创建或更新 AGENTS.md",
-        "- `/review [instructions]` - 对未提交改动执行 Codex review",
-        "- `/new [prompt]` - 新开 Codex session",
-        "- `/compact [notes]` - 请求 Codex 压缩上下文",
-        "- `/plan [task]` - 让 Codex 先写计划",
-        "- `/goal [objective]` - 查询或更新当前 goal",
-        "- `/agent [task]` - 让 Codex 在适合时使用 subagent",
-        "- `/side [question]` - 请求旁路分析，不直接改文件",
-        "- `/report [notes]` - 查询任务进展",
+        "- `:init [notes]` - 转成 `/init ...` 后发送给 Codex 原生命令",
+        "- `:review [instructions]` - 对未提交改动执行 Codex review",
+        "- `:new [prompt]` - 转成 `/new ...` 后发送给 Codex 原生命令，不保证切换 Wecode 绑定的 session",
+        "- `:compact [notes]` - 转成 `/compact ...` 后发送给 Codex 原生命令",
+        "- `:plan [task]` - 转成 `/plan ...` 后发送给 Codex 原生命令",
+        "- `:goal [objective]` - 转成 `/goal ...` 后发送给 Codex 原生命令",
+        "- `:agent [task]` - 转成 `/agent ...` 后发送给 Codex 原生命令",
+        "- `:side [question]` - 转成 `/side ...` 后发送给 Codex 原生命令",
+        "- `:resume [session_id]` - 绑定到最近或指定的 Codex session，不请求 Codex",
+        "- `:report [notes]` - 查询任务进展",
         "## Session 命令",
-        "- `/resume` - 列出当前项目的 Codex sessions，并显示最初 prompt",
-        "- `/sessions` - 等同于 `/resume`",
-        "- `/resume <session_id>` - 把当前聊天绑定到指定 Codex session",
+        "- `:fresh [prompt]` - 硬新开 Codex thread；带 prompt 时立即执行，不带 prompt 时作用于下一条请求",
         "## 审批命令",
-        "- `/approve <id>` - 批准并执行待确认命令",
-        "- `/deny <id>` - 拒绝待确认命令",
+        "- `:approve <id>` - 批准并执行待确认命令",
+        "- `:deny <id>` - 拒绝待确认命令",
         "## 模型命令",
-        "- `/model default` - 清除项目模型覆盖",
+        "- `:model default` - 清除项目模型覆盖",
         "## 自定义命令",
-        "- `/codex <text>` - ask",
+        "- `:codex <text>` - ask",
     ] {
         assert!(
             stdout.contains(expected),
             "missing {expected:?} in:\n{stdout}"
         );
     }
+    assert!(
+        !stdout.contains(":sessions"),
+        "help should not list removed :sessions command:\n{stdout}"
+    );
     assert!(!calls_path.exists(), "help must not invoke codex");
 }
 
@@ -872,7 +1020,7 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
             "--config",
             config_path.to_str().expect("utf-8 config"),
             "--jsonl",
-            "/cd",
+            ":cd",
             new_project.to_str().expect("utf-8 new project"),
         ])
         .env("PATH", &path)
@@ -891,7 +1039,7 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
             old_project.to_str().expect("utf-8 old project"),
             "--resume",
             "old-thread",
-            "/codex",
+            ":codex",
             "hello",
         ])
         .env("PATH", path)
@@ -912,7 +1060,315 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
 }
 
 #[test]
-fn new_command_starts_fresh_thread_even_when_weixin_session_is_bound() {
+fn cd_from_decorated_openclaw_message_persists_project_directory() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let old_project = temp.path().join("old-project");
+    let new_project = temp.path().join("new-project");
+    fs::create_dir_all(&old_project).expect("old project");
+    fs::create_dir_all(&new_project).expect("new project");
+    let old_project = old_project.canonicalize().expect("canonical old project");
+    let new_project = new_project.canonicalize().expect("canonical new project");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+
+    write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{"cwd": "{}"}}
+            }}"#,
+            state_dir.display(),
+            old_project.display()
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let decorated = format!(
+        r#"Conversation info (untrusted metadata):
+```json
+{{"message_id":"om_x100b6e977ba6b4b0b34edb547991066"}}
+```
+
+[message_id: om_x100b6e977ba6b4b0b34edb547991066]
+ou_08e494561f9ff0e2bd8015472c28e6e5: :cd {}"#,
+        new_project.display()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+        ])
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn decorated cd");
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin")
+        .write_all(decorated.as_bytes())
+        .expect("write decorated cd");
+    let output = child.wait_with_output().expect("run decorated cd");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(state_dir.join("codex-cwd.txt")).expect("cwd override")
+            == new_project.display().to_string()
+    );
+    assert!(
+        state_dir.join("codex-fresh-next.txt").exists(),
+        "cd should force the next turn to start fresh"
+    );
+    assert!(!calls_path.exists(), "cd must not invoke codex");
+}
+
+#[test]
+fn codex_backend_writes_prompt_flow_log_for_decorated_multiline_prompt() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let project = temp.path().join("project");
+    fs::create_dir_all(&project).expect("project");
+    let project = project.canonicalize().expect("canonical project");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+
+    write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{"cwd": "{}"}}
+            }}"#,
+            state_dir.display(),
+            project.display()
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let decorated = r#"Conversation info (untrusted metadata):
+```json
+{"message_id":"om_prompt_flow"}
+```
+
+[message_id: om_prompt_flow]
+o9cq805CIQyEJ1pliCh0GGdeTy98@im.wechat: :compact keep decisions
+保留项目边界
+保留当前计划"#;
+    let expected_command_input = ":compact keep decisions\n保留项目边界\n保留当前计划";
+    let expected_final_prompt = "/compact keep decisions\n保留项目边界\n保留当前计划";
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "--resume",
+            "existing-thread",
+        ])
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn prompt flow run");
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin")
+        .write_all(decorated.as_bytes())
+        .expect("write decorated prompt");
+    let output = child.wait_with_output().expect("run prompt flow");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log_dir = state_dir.join("logs");
+    let mut prompt_flow_logs = fs::read_dir(&log_dir)
+        .expect("prompt flow log dir")
+        .map(|entry| entry.expect("log entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("prompt-flow.log"))
+        })
+        .collect::<Vec<_>>();
+    prompt_flow_logs.sort();
+    assert!(
+        !prompt_flow_logs.is_empty(),
+        "missing rotated prompt flow log in {}",
+        log_dir.display()
+    );
+    let log = prompt_flow_logs
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("prompt flow log"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !log.trim_start().starts_with('{'),
+        "log must not be JSONL:\n{log}"
+    );
+    assert!(
+        log.contains("event=\"backend_input_received\""),
+        "log:\n{log}"
+    );
+    assert!(log.contains("prompt_source=stdin"), "log:\n{log}");
+    assert!(log.contains("raw_prompt="), "log:\n{log}");
+    assert!(log.contains("om_prompt_flow"), "log:\n{log}");
+    assert!(
+        log.contains("event=\"backend_input_prepared\""),
+        "log:\n{log}"
+    );
+    assert!(log.contains("backend_input_kind=\"prompt\""), "log:\n{log}");
+    assert!(
+        log.contains(&format!("{expected_command_input:?}")),
+        "log:\n{log}"
+    );
+    assert!(
+        log.contains(&format!("{expected_final_prompt:?}")),
+        "log:\n{log}"
+    );
+    assert!(
+        log.contains("event=\"codex_prompt_dispatch\""),
+        "log:\n{log}"
+    );
+    assert!(
+        log.contains("requested_resume_session_id=Some(\"existing-thread\")"),
+        "log:\n{log}"
+    );
+    assert!(log.contains("event=\"codex_exec_command\""), "log:\n{log}");
+    assert!(log.contains(&project.display().to_string()), "log:\n{log}");
+    assert!(log.contains("\"existing-thread\""), "log:\n{log}");
+}
+
+#[test]
+fn cd_does_not_persist_partial_state_when_state_dir_cannot_store_fresh_marker() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let old_project = temp.path().join("old-project");
+    let new_project = temp.path().join("new-project");
+    fs::create_dir_all(&old_project).expect("old project");
+    fs::create_dir_all(&new_project).expect("new project");
+    let old_project = old_project.canonicalize().expect("canonical old project");
+    let new_project = new_project.canonicalize().expect("canonical new project");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    fs::create_dir_all(&state_dir).expect("state dir");
+    fs::create_dir(state_dir.join("codex-fresh-next.txt")).expect("fresh marker directory");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{"cwd": "{}"}}
+            }}"#,
+            state_dir.display(),
+            old_project.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":cd",
+            new_project.to_str().expect("utf-8 new project"),
+        ])
+        .output()
+        .expect("run cd");
+
+    assert!(!output.status.success(), "cd should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Cannot change Codex project directory"),
+        "stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("openclaw.stateDir"), "stderr:\n{stderr}");
+    assert!(
+        !state_dir.join("codex-cwd.txt").exists(),
+        "failed cd must not persist a new cwd override"
+    );
+}
+
+#[test]
+fn new_command_is_forwarded_to_codex_even_when_weixin_session_is_bound() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+
+    write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(r#"{{"openclaw":{{"stateDir":"{}"}}}}"#, state_dir.display()),
+    )
+    .expect("write config");
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "--resume",
+            "existing-thread",
+            ":new",
+            "start fresh",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run new command");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(
+        calls.contains("exec resume"),
+        "wecode should forward :new as /new to the current Codex invocation"
+    );
+    assert!(calls.contains("/new start fresh"));
+}
+
+#[test]
+fn fresh_command_runs_prompt_in_new_codex_thread() {
     let temp = tempfile::tempdir().expect("temp dir");
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
@@ -929,12 +1385,12 @@ fn new_command_starts_fresh_thread_even_when_weixin_session_is_bound() {
             "--jsonl",
             "--resume",
             "existing-thread",
-            "/new",
-            "start fresh",
+            ":fresh",
+            "start clean",
         ])
         .env("PATH", path)
         .output()
-        .expect("run new command");
+        .expect("run fresh command");
 
     assert!(
         output.status.success(),
@@ -944,9 +1400,72 @@ fn new_command_starts_fresh_thread_even_when_weixin_session_is_bound() {
     let calls = fs::read_to_string(calls_path).expect("calls");
     assert!(
         !calls.contains("exec resume"),
-        "new must not resume old thread"
+        ":fresh should force a new Codex thread"
     );
-    assert!(calls.contains("start fresh"));
+    assert!(calls.contains("start clean"));
+}
+
+#[test]
+fn fresh_prompt_consumes_pending_fresh_marker() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+
+    write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw": {{"stateDir": "{}"}}}}"#,
+            state_dir.display()
+        ),
+    )
+    .expect("write config");
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+
+    let mark = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":fresh",
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("mark fresh");
+    assert!(mark.status.success());
+
+    let run = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "--resume",
+            "existing-thread",
+            ":fresh",
+            "start clean",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run fresh prompt");
+    assert!(
+        run.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let marker = state_dir.join("codex-fresh-next.txt");
+    assert!(
+        !marker.exists(),
+        ":fresh prompt should consume the pending fresh marker"
+    );
 }
 
 fn write_fake_codex(codex_path: &std::path::Path, calls_path: &std::path::Path) {
