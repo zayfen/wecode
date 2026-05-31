@@ -522,7 +522,7 @@ fn cli_backend_config_json(config: &WecodeConfig, backend_command: &str) -> Stri
             },
             "resumeArgs": ["codex-backend", "--jsonl", "--cwd", project_cwd, "--resume", "{sessionId}"],
             "resumeOutput": "jsonl",
-            "serialize": true,
+            "serialize": false,
             "sessionIdFields": ["thread_id"]
         }
     })

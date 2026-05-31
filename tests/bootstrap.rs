@@ -72,7 +72,7 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
         .iter()
         .any(|arg| arg == "plugins.entries.codex.enabled")));
     let cli_backend_json = format!(
-        "{{\"wecode-codex\":{{\"args\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{}],\"command\":\"/usr/local/bin/wecode\",\"input\":\"stdin\",\"modelArg\":\"--model\",\"output\":\"jsonl\",\"reliability\":{{\"watchdog\":{{\"fresh\":{{\"noOutputTimeoutMs\":900000}},\"resume\":{{\"noOutputTimeoutMs\":900000}}}}}},\"resumeArgs\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{},\"--resume\",\"{{sessionId}}\"],\"resumeOutput\":\"jsonl\",\"serialize\":true,\"sessionIdFields\":[\"thread_id\"]}}}}",
+        "{{\"wecode-codex\":{{\"args\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{}],\"command\":\"/usr/local/bin/wecode\",\"input\":\"stdin\",\"modelArg\":\"--model\",\"output\":\"jsonl\",\"reliability\":{{\"watchdog\":{{\"fresh\":{{\"noOutputTimeoutMs\":900000}},\"resume\":{{\"noOutputTimeoutMs\":900000}}}}}},\"resumeArgs\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{},\"--resume\",\"{{sessionId}}\"],\"resumeOutput\":\"jsonl\",\"serialize\":false,\"sessionIdFields\":[\"thread_id\"]}}}}",
         serde_json::to_string(&project_dir).expect("project dir json"),
         serde_json::to_string(&project_dir).expect("project dir json")
     );

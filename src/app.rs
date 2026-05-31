@@ -20,7 +20,7 @@ use wecode::{
     native_approval::{self, NativeApprovalDecision},
     openclaw_bin_path, parse_node_version, patch_gateway_launch_agent_prevent_sleep,
     patch_openclaw_text_command_routing, prepare_backend_input_with_trace, read_config_str,
-    render_command_input, weixin_install_step, BackendInput, CliCommand, CommandStep,
+    render_command_input, run_lock, weixin_install_step, BackendInput, CliCommand, CommandStep,
     PreparedBackendInput, ToolReport, ToolSnapshot, WecodeConfig,
 };
 
@@ -1038,6 +1038,8 @@ fn run_backend_prompt(
             "prompt_flow"
         );
     }
+    let lock_key = codex_run_lock_key(config, effective_resume_session_id);
+    let _run_lock = run_lock::try_acquire_codex_run_lock(config, &lock_key)?;
     let result = run_codex_prompt(
         config,
         prompt,
@@ -1054,6 +1056,14 @@ fn run_backend_prompt(
     result
 }
 
+fn codex_run_lock_key(config: &WecodeConfig, resume_session_id: Option<&str>) -> String {
+    resume_session_id.map(str::to_string).unwrap_or_else(|| {
+        codex_target_cwd(config)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| config.codex.cwd.clone().unwrap_or_else(|| ".".to_string()))
+    })
+}
+
 fn run_fresh_thread_command(
     config: &WecodeConfig,
     prompt: Option<&str>,
@@ -1063,6 +1073,8 @@ fn run_fresh_thread_command(
 ) -> Result<(), String> {
     match prompt {
         Some(prompt) => {
+            let lock_key = codex_run_lock_key(config, None);
+            let _run_lock = run_lock::try_acquire_codex_run_lock(config, &lock_key)?;
             let result = run_codex_prompt(
                 config,
                 prompt,
@@ -1099,6 +1111,8 @@ fn run_codex_review(
     jsonl: bool,
     flow_run_id: Option<&str>,
 ) -> Result<(), String> {
+    let lock_key = codex_run_lock_key(config, None);
+    let _run_lock = run_lock::try_acquire_codex_run_lock(config, &lock_key)?;
     let output_path = codex_output_path();
     let mut command = Command::new("codex");
     command
