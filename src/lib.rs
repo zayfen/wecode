@@ -5,6 +5,7 @@ pub mod command_step;
 pub mod commands;
 pub mod config;
 pub mod diagnostics;
+pub mod native_approval;
 pub mod openclaw;
 pub mod paths;
 pub mod sessions;

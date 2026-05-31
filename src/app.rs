@@ -1410,14 +1410,14 @@ fn print_codex_exec_command(
         .unwrap_or_default();
     if let Some(session_id) = resume_session_id {
         eprintln!(
-            "$ codex exec resume --json -o {}{} {}",
+            "$ codex exec resume --yolo --json -o {}{} {}",
             output_path.display(),
             model,
             session_id
         );
     } else {
         eprintln!(
-            "$ codex exec --json -o {}{} -s {}",
+            "$ codex exec --yolo --json -o {}{} -s {}",
             output_path.display(),
             model,
             config.codex.sandbox

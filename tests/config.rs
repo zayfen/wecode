@@ -86,9 +86,17 @@ fn default_config_is_personal_codex_weixin_bridge() {
         cfg.codex.remote.fallback_proxy_command,
         "codex app-server --listen stdio://"
     );
+    assert_eq!(cfg.codex.remote.approval_timeout_seconds, 600);
     assert_eq!(cfg.codex.models, vec!["default", "gpt-5.4"]);
     assert_eq!(cfg.commands[0].name, "ask");
     assert_eq!(cfg.commands[0].prefix, ":codex ");
+}
+
+#[test]
+fn defaults_codex_remote_approval_timeout() {
+    let cfg = wecode::default_config();
+
+    assert_eq!(cfg.codex.remote.approval_timeout_seconds, 600);
 }
 
 #[test]
@@ -101,7 +109,8 @@ fn parses_codex_transport_modes_and_remote_commands() {
                 "autoStart": false,
                 "proxyCommand": "codex app-server proxy --sock /tmp/codex.sock",
                 "startCommand": "codex app-server daemon start",
-                "fallbackProxyCommand": "codex app-server --listen stdio://"
+                "fallbackProxyCommand": "codex app-server --listen stdio://",
+                "approvalTimeoutSeconds": 42
               }
           }
         }"#,
@@ -122,6 +131,23 @@ fn parses_codex_transport_modes_and_remote_commands() {
         cfg.codex.remote.fallback_proxy_command,
         "codex app-server --listen stdio://"
     );
+    assert_eq!(cfg.codex.remote.approval_timeout_seconds, 42);
+}
+
+#[test]
+fn parses_codex_remote_approval_timeout() {
+    let cfg = wecode::read_config_str(
+        r#"{
+          "codex": {
+            "remote": {
+              "approvalTimeoutSeconds": 42
+            }
+          }
+        }"#,
+    )
+    .expect("config");
+
+    assert_eq!(cfg.codex.remote.approval_timeout_seconds, 42);
 }
 
 #[test]

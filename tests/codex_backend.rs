@@ -83,6 +83,41 @@ esac
 }
 
 #[test]
+fn codex_backend_exec_fallback_uses_yolo() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    fs::write(&config_path, r#"{"codex":{"transport":"exec"}}"#).expect("write config");
+    write_fake_codex(&codex_path, &calls_path);
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "hello yolo",
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("run backend");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(calls.contains("exec --yolo --json"), "{calls}");
+}
+
+#[test]
 fn codex_backend_streams_jsonl_before_codex_exits() {
     let temp = tempfile::tempdir().expect("temp dir");
     let codex_path = temp.path().join("codex");
