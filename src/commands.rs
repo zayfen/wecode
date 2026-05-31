@@ -65,6 +65,8 @@ impl BackendInput {
 }
 
 pub fn render_command_input(config: &WecodeConfig, input: &str) -> Option<RenderedCommand> {
+    let extracted = backend_message_input(input);
+    let input = extracted.as_deref().unwrap_or(input);
     let trimmed = command_input_candidate(input).unwrap_or_else(|| input.trim());
     render_configured_command(config, trimmed).or_else(|| {
         colon_command_body(trimmed).and_then(|body| {
@@ -87,6 +89,8 @@ fn render_configured_command(config: &WecodeConfig, input: &str) -> Option<Rende
 }
 
 pub fn prepare_backend_prompt(config: &WecodeConfig, input: &str) -> Result<String, String> {
+    let extracted = backend_message_input(input);
+    let input = extracted.as_deref().unwrap_or(input);
     let command_input = command_input_candidate(input).unwrap_or(input);
     match render_command_input(config, command_input) {
         Some(rendered) if rendered.require_confirm => Err(format!(
@@ -106,6 +110,8 @@ pub fn prepare_backend_input_with_trace(
     config: &WecodeConfig,
     input: &str,
 ) -> Result<PreparedBackendInput, String> {
+    let message = backend_message_input(input);
+    let input = message.as_deref().unwrap_or(input);
     let command_input = command_input_candidate(input).unwrap_or(input);
     let input = match parse_control_command(command_input)? {
         Some(input) => input,
@@ -122,6 +128,300 @@ pub fn prepare_backend_input_with_trace(
         command_input: command_input.to_string(),
         input,
     })
+}
+
+fn backend_message_input(input: &str) -> Option<String> {
+    channel_message_input(input)
+}
+
+fn channel_message_input(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if let Some(message) = decorated_openclaw_message_input(trimmed)
+        .or_else(|| metadata_wrapped_message_input(trimmed))
+        .and_then(non_empty_string)
+    {
+        return Some(message.to_string());
+    }
+
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    channel_message_value(&value)
+}
+
+fn channel_message_value(value: &serde_json::Value) -> Option<String> {
+    openclaw_channel_context_message(value)
+        .or_else(|| feishu_event_message(value))
+        .or_else(|| weixin_protocol_message(value))
+}
+
+fn openclaw_channel_context_message(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let channel = [
+        "OriginatingChannel",
+        "Provider",
+        "Surface",
+        "channel",
+        "provider",
+    ]
+    .iter()
+    .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))?;
+
+    if !matches!(
+        channel,
+        "feishu" | "Feishu" | "openclaw-weixin" | "weixin" | "Weixin" | "wechat" | "WeChat"
+    ) {
+        return None;
+    }
+
+    [
+        "BodyForCommands",
+        "CommandBody",
+        "RawBody",
+        "BodyForAgent",
+        "Body",
+    ]
+    .iter()
+    .find_map(|key| non_empty_json_string(object.get(*key)?))
+    .map(str::to_string)
+}
+
+fn feishu_event_message(value: &serde_json::Value) -> Option<String> {
+    let event = if value.get("event").is_some() {
+        value.get("event")?
+    } else {
+        value
+    };
+    let event = event.as_object()?;
+    let message = event.get("message")?.as_object()?;
+    if !event.get("sender")?.is_object() {
+        return None;
+    }
+
+    let message_type = non_empty_json_string(message.get("message_type")?)?;
+    let content = non_empty_json_string(message.get("content")?)?;
+    feishu_message_content(content, message_type)
+}
+
+fn feishu_message_content(content: &str, message_type: &str) -> Option<String> {
+    match message_type {
+        "text" => serde_json::from_str::<serde_json::Value>(content)
+            .ok()
+            .and_then(|value| non_empty_json_string(value.get("text")?).map(str::to_string))
+            .or_else(|| non_empty_string(content).map(str::to_string)),
+        "post" => feishu_post_content(content),
+        "audio" => feishu_media_content(content, "<media:audio>"),
+        "image" => feishu_media_content(content, "<media:image>"),
+        "file" => feishu_media_content(content, "<media:document>"),
+        "video" | "media" => feishu_media_content(content, "<media:video>"),
+        "sticker" => feishu_media_content(content, "<media:sticker>"),
+        "share_chat" => feishu_share_chat_content(content),
+        "merge_forward" => Some("[Merged and Forwarded Message - loading...]".to_string()),
+        _ => non_empty_string(content).map(str::to_string),
+    }
+}
+
+fn feishu_media_content(content: &str, placeholder: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    if placeholder == "<media:audio>" {
+        if let Some(transcript) = value.get("speech_to_text").and_then(non_empty_json_string) {
+            return Some(transcript.to_string());
+        }
+    }
+
+    let file_name = value.get("file_name").and_then(non_empty_json_string);
+    Some(match file_name {
+        Some(file_name) => format!("{placeholder} ({file_name})"),
+        None => placeholder.to_string(),
+    })
+}
+
+fn feishu_share_chat_content(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    ["body", "summary", "share_chat_id"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(non_empty_json_string))
+        .map(|message| {
+            if value.get("share_chat_id").and_then(non_empty_json_string) == Some(message) {
+                format!("[Forwarded message: {message}]")
+            } else {
+                message.to_string()
+            }
+        })
+        .or_else(|| Some("[Forwarded message]".to_string()))
+}
+
+fn feishu_post_content(content: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let payload = feishu_post_payload(&value)?;
+    let title = payload
+        .get("title")
+        .and_then(non_empty_json_string)
+        .unwrap_or("");
+    let paragraphs = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|paragraph| {
+            let rendered = paragraph
+                .as_array()?
+                .iter()
+                .map(feishu_post_element_text)
+                .collect::<String>()
+                .trim()
+                .to_string();
+            non_empty_string(&rendered).map(str::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rendered = [title, paragraphs.as_str()]
+        .into_iter()
+        .filter_map(non_empty_string)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    non_empty_string(&rendered).map(str::to_string)
+}
+
+fn feishu_post_payload(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    if value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .is_some()
+    {
+        return Some(value);
+    }
+    if let Some(post) = value.get("post").and_then(feishu_post_locale_payload) {
+        return Some(post);
+    }
+    feishu_post_locale_payload(value)
+}
+
+fn feishu_post_locale_payload(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    if value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .is_some()
+    {
+        return Some(value);
+    }
+    value.as_object()?.values().find(|candidate| {
+        candidate
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+    })
+}
+
+fn feishu_post_element_text(element: &serde_json::Value) -> String {
+    if let Some(text) = element.as_str() {
+        return text.to_string();
+    }
+    let Some(object) = element.as_object() else {
+        return String::new();
+    };
+    match object.get("tag").and_then(serde_json::Value::as_str) {
+        Some("text" | "a" | "md" | "lark_md" | "code") => ["text", "content"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(non_empty_json_string))
+            .unwrap_or("")
+            .to_string(),
+        Some("at") => ["user_name", "name", "open_id", "user_id"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(non_empty_json_string))
+            .map(|name| format!("@{name}"))
+            .unwrap_or_default(),
+        Some("img") => "![image]".to_string(),
+        Some("media") => "[media]".to_string(),
+        Some("br") => "\n".to_string(),
+        _ => object
+            .get("text")
+            .and_then(non_empty_json_string)
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn weixin_protocol_message(value: &serde_json::Value) -> Option<String> {
+    if let Some(message) = weixin_message_body(value) {
+        return Some(message);
+    }
+
+    if let Some(messages) = value.get("msgs").and_then(serde_json::Value::as_array) {
+        return messages.iter().find_map(weixin_message_body);
+    }
+
+    value.get("msg").and_then(weixin_message_body)
+}
+
+fn weixin_message_body(value: &serde_json::Value) -> Option<String> {
+    let item_list = value.get("item_list")?.as_array()?;
+    weixin_body_from_item_list(item_list)
+}
+
+fn weixin_body_from_item_list(item_list: &[serde_json::Value]) -> Option<String> {
+    for item in item_list {
+        if let Some(text) = item
+            .get("text_item")
+            .and_then(|text_item| text_item.get("text"))
+            .and_then(non_empty_json_string)
+        {
+            let Some(ref_msg) = item.get("ref_msg") else {
+                return Some(text.to_string());
+            };
+            if ref_msg
+                .get("message_item")
+                .is_some_and(is_weixin_media_item)
+            {
+                return Some(text.to_string());
+            }
+
+            let mut parts = Vec::new();
+            if let Some(title) = ref_msg.get("title").and_then(non_empty_json_string) {
+                parts.push(title.to_string());
+            }
+            if let Some(ref_body) = ref_msg.get("message_item").and_then(|message_item| {
+                weixin_body_from_item_list(std::slice::from_ref(message_item))
+            }) {
+                parts.push(ref_body);
+            }
+            if parts.is_empty() {
+                return Some(text.to_string());
+            }
+            return Some(format!("[引用: {}]\n{text}", parts.join(" | ")));
+        }
+
+        if let Some(text) = item
+            .get("voice_item")
+            .and_then(|voice_item| voice_item.get("text"))
+            .and_then(non_empty_json_string)
+        {
+            return Some(text.to_string());
+        }
+    }
+
+    None
+}
+
+fn is_weixin_media_item(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(serde_json::Value::as_i64),
+        Some(2 | 3 | 4 | 5)
+    )
+}
+
+fn non_empty_json_string(value: &serde_json::Value) -> Option<&str> {
+    non_empty_string(value.as_str()?)
+}
+
+fn non_empty_string(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn parse_control_command(input: &str) -> Result<Option<BackendInput>, String> {
@@ -238,10 +538,12 @@ fn command_input_candidate(input: &str) -> Option<&str> {
     if colon_command_body(trimmed).is_some() {
         return Some(trimmed);
     }
-    decorated_openclaw_command_input(trimmed).or_else(|| metadata_wrapped_command_input(trimmed))
+    decorated_openclaw_message_input(trimmed)
+        .or_else(|| metadata_wrapped_message_input(trimmed))
+        .filter(|message| colon_command_body(message).is_some())
 }
 
-fn decorated_openclaw_command_input(input: &str) -> Option<&str> {
+fn decorated_openclaw_message_input(input: &str) -> Option<&str> {
     if !(input.contains("[message_id:") || input.contains("Conversation info (untrusted metadata)"))
     {
         return None;
@@ -258,11 +560,10 @@ fn decorated_openclaw_command_input(input: &str) -> Option<&str> {
     let sender_line_start = message_section.find(sender_line)?;
     let message_start =
         message_section_start + sender_line_start + sender_line.find(": ")? + ": ".len();
-    let message = input[message_start..].trim();
-    colon_command_body(message).map(|_| message)
+    Some(input[message_start..].trim())
 }
 
-fn metadata_wrapped_command_input(input: &str) -> Option<&str> {
+fn metadata_wrapped_message_input(input: &str) -> Option<&str> {
     let rest = input.strip_prefix("Conversation info (untrusted metadata):")?;
     let rest = rest.trim_start();
     if !rest.starts_with("```") {
@@ -271,8 +572,7 @@ fn metadata_wrapped_command_input(input: &str) -> Option<&str> {
     let body_start = rest.find('\n')? + 1;
     let body = &rest[body_start..];
     let closing_fence = body.find("\n```")?;
-    let message = body[closing_fence + "\n```".len()..].trim();
-    colon_command_body(message).map(|_| message)
+    Some(body[closing_fence + "\n```".len()..].trim())
 }
 
 fn colon_command_body(input: &str) -> Option<&str> {

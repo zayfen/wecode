@@ -95,7 +95,7 @@ fn codex_backend_streams_jsonl_before_codex_exits() {
             r#"#!/bin/sh
 printf '%s\n' "$*" >> {calls}
 echo '{{"thread_id":"stream-thread"}}'
-sleep 4
+sleep 10
 echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"stream ok"}}]}}'
 "#,
             calls = shell_quote(calls_path.to_str().expect("utf-8 path"))
@@ -136,9 +136,10 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
         let _ = reader.read_to_string(&mut rest);
     });
 
-    let (read_result, first_line) = match rx.recv_timeout(Duration::from_millis(2500)) {
+    let (read_result, first_line) = match rx.recv_timeout(Duration::from_millis(5000)) {
         Ok(value) => value,
         Err(err) => {
+            let _ = child.kill();
             let _ = child.wait();
             panic!("expected streamed JSONL before codex exited: {err}");
         }
@@ -149,8 +150,85 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
         "first stdout line:\n{first_line}"
     );
 
-    let status = child.wait().expect("wait wecode");
-    assert!(status.success(), "status: {:?}", status.code());
+    assert!(
+        child.try_wait().expect("check child status").is_none(),
+        "expected first JSONL line while codex was still running"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn codex_backend_exec_jsonl_emits_openclaw_item_text_from_output_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+
+    fs::write(
+        &codex_path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {calls}
+output_file=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    output_file="$arg"
+    break
+  fi
+  prev="$arg"
+done
+[ -n "$output_file" ] && printf '%s\n' "exec ok" > "$output_file"
+echo '{{"thread_id":"exec-thread"}}'
+echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"wrong stdout"}}]}}'
+"#,
+            calls = shell_quote(calls_path.to_str().expect("utf-8 path"))
+        ),
+    )
+    .expect("write fake codex");
+    fs::write(&config_path, r#"{"codex":{"transport":"exec"}}"#).expect("write config");
+    let mut permissions = fs::metadata(&codex_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&codex_path, permissions).expect("chmod fake codex");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "hello",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run wecode");
+
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""thread_id":"exec-thread""#), "{stdout}");
+    let message_line = stdout
+        .lines()
+        .find(|line| line.contains(r#""item""#))
+        .expect("OpenClaw item JSONL line");
+    let message: serde_json::Value =
+        serde_json::from_str(message_line).expect("OpenClaw JSONL parses");
+    assert_eq!(message["item"]["type"].as_str(), Some("message"));
+    assert_eq!(message["item"]["text"].as_str(), Some("exec ok"));
+    assert!(
+        !message_line.contains(r#""role":"assistant""#),
+        "OpenClaw visible text should not be emitted as Codex assistant JSON: {message_line}"
+    );
 }
 
 #[test]
@@ -219,7 +297,156 @@ fn codex_backend_remote_transport_runs_turn_over_app_server_proxy() {
 }
 
 #[test]
-fn codex_backend_remote_transport_unwraps_json_assistant_message_text() {
+fn codex_backend_remote_jsonl_uses_openclaw_item_text() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let proxy_path = temp.path().join("codex-remote-proxy");
+    let calls_path = temp.path().join("remote-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    write_fake_remote_proxy(&proxy_path, &calls_path, "remote-thread", "remote ok");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{
+                "transport": "remote-strict",
+                "remote": {{
+                  "autoStart": false,
+                  "proxyCommand": "{}"
+                }}
+              }}
+            }}"#,
+            state_dir.display(),
+            proxy_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "hello remote",
+        ])
+        .output()
+        .expect("run remote backend");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let message_line = stdout
+        .lines()
+        .find(|line| line.contains(r#""item""#))
+        .expect("OpenClaw item JSONL line");
+    let message: serde_json::Value =
+        serde_json::from_str(message_line).expect("OpenClaw JSONL parses");
+    assert_eq!(message["item"]["type"].as_str(), Some("message"));
+    assert_eq!(message["item"]["text"].as_str(), Some("remote ok"));
+    assert!(
+        !message_line.contains(r#""role":"assistant""#),
+        "OpenClaw visible text should not be emitted as Codex assistant JSON: {message_line}"
+    );
+}
+
+#[test]
+fn codex_backend_remote_transport_streams_completed_agent_messages_before_turn_finishes() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let proxy_path = temp.path().join("codex-remote-proxy");
+    let calls_path = temp.path().join("remote-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    write_fake_remote_proxy_with_delayed_final(
+        &proxy_path,
+        &calls_path,
+        "remote-progress-thread",
+        "阶段一完成",
+        "全部完成",
+    );
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{
+                "transport": "remote-strict",
+                "remote": {{
+                  "autoStart": false,
+                  "proxyCommand": "{}"
+                }}
+              }}
+            }}"#,
+            state_dir.display(),
+            proxy_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "hello remote progress",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn remote backend");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut first_line = String::new();
+        let mut second_line = String::new();
+        let first_result = reader.read_line(&mut first_line);
+        let second_result = reader.read_line(&mut second_line);
+        let _ = tx.send((first_result, first_line, second_result, second_line));
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+    });
+
+    let (first_result, first_line, second_result, second_line) =
+        match rx.recv_timeout(Duration::from_millis(5000)) {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("expected remote progress JSONL before turn finished: {err}");
+            }
+        };
+    assert_eq!(first_result.expect("read thread line"), first_line.len());
+    assert_eq!(
+        second_result.expect("read progress line"),
+        second_line.len()
+    );
+    assert!(
+        first_line.contains(r#""thread_id":"remote-progress-thread""#),
+        "first stdout line:\n{first_line}"
+    );
+    assert!(
+        second_line.contains("阶段一完成"),
+        "second stdout line:\n{second_line}"
+    );
+
+    assert!(
+        child.try_wait().expect("check child status").is_none(),
+        "expected progress JSONL while remote turn was still running"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn codex_backend_remote_transport_does_not_unwrap_legacy_json_assistant_message_text() {
     let temp = tempfile::tempdir().expect("temp dir");
     let proxy_path = temp.path().join("codex-remote-proxy");
     let calls_path = temp.path().join("remote-calls.txt");
@@ -276,20 +503,20 @@ fn codex_backend_remote_transport_unwraps_json_assistant_message_text() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let message_line = stdout
         .lines()
-        .find(|line| line.contains(r#""role":"assistant""#))
-        .expect("assistant JSONL line");
+        .find(|line| line.contains(r#""item""#))
+        .expect("OpenClaw item JSONL line");
     let message: serde_json::Value =
-        serde_json::from_str(message_line).expect("assistant JSONL parses");
+        serde_json::from_str(message_line).expect("OpenClaw JSONL parses");
     assert_eq!(
-        message["content"][0]["text"].as_str(),
-        Some("clean response")
+        message["item"]["text"].as_str(),
+        Some(wrapped_message.as_str())
     );
     assert!(
-        !message["content"][0]["text"]
+        message["item"]["text"]
             .as_str()
             .unwrap_or_default()
             .contains(r#""content""#),
-        "assistant text should not expose nested JSON response: {message_line}"
+        "remote agentMessage text should be forwarded as plain text, not parsed as a legacy assistant response: {message_line}"
     );
 }
 
@@ -1063,7 +1290,16 @@ fn local_filesystem_commands_do_not_invoke_codex() {
         .output()
         .expect("run pwd");
     assert!(pwd.status.success());
-    assert!(String::from_utf8_lossy(&pwd.stdout).contains(&project_dir.display().to_string()));
+    let pwd_stdout = String::from_utf8_lossy(&pwd.stdout);
+    assert!(
+        pwd_stdout.starts_with("```bash\n"),
+        "local pwd should be wrapped in a bash markdown code block, stdout:\n{pwd_stdout}"
+    );
+    assert!(
+        pwd_stdout.trim_end().ends_with("\n```"),
+        "local pwd should close its markdown code block, stdout:\n{pwd_stdout}"
+    );
+    assert!(pwd_stdout.contains(&project_dir.display().to_string()));
 
     let ls = Command::new(env!("CARGO_BIN_EXE_wecode"))
         .args([
@@ -1088,8 +1324,8 @@ fn local_filesystem_commands_do_not_invoke_codex() {
         "local ls should not expose JSON message wrappers, stdout:\n{ls_stdout}"
     );
     assert!(
-        ls_stdout.starts_with("```text\n"),
-        "local ls should be wrapped in a markdown code block, stdout:\n{ls_stdout}"
+        ls_stdout.starts_with("```bash\n"),
+        "local ls should be wrapped in a bash markdown code block, stdout:\n{ls_stdout}"
     );
     assert!(
         ls_stdout.trim_end().ends_with("\n```"),
@@ -1138,7 +1374,7 @@ fn local_filesystem_commands_do_not_invoke_codex() {
     let canonical_project_dir = project_dir.canonicalize().expect("canonical project dir");
     assert_eq!(
         shell_stdout,
-        format!("```text\n{}\n```\n", canonical_project_dir.display())
+        format!("```bash\n{}\n```\n", canonical_project_dir.display())
     );
     assert!(!calls_path.exists(), "local commands must not invoke codex");
 }
@@ -1182,7 +1418,7 @@ fn local_command_output_uses_longer_markdown_fence_when_needed() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "````text\nbefore\n```\nafter\n````\n"
+        "````bash\nbefore\n```\nafter\n````\n"
     );
 }
 
@@ -1353,6 +1589,10 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.starts_with("```"),
+        "help should be plain markdown, not wrapped in a code block:\n{stdout}"
+    );
     for expected in [
         "# Wecode 帮助",
         "`:help` 和 `:commands` 由 Wecode 本地直接返回，不会请求 Codex。",
@@ -1433,6 +1673,10 @@ fn metadata_wrapped_help_does_not_invoke_codex() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.starts_with("```"),
+        "metadata wrapped help should be plain markdown, not wrapped in a code block:\n{stdout}"
+    );
     assert!(stdout.contains("# Wecode 帮助"), "stdout:\n{stdout}");
     assert!(stdout.contains("不会请求 Codex"), "stdout:\n{stdout}");
     assert!(
@@ -1949,6 +2193,16 @@ fn write_fake_codex(codex_path: &std::path::Path, calls_path: &std::path::Path) 
         format!(
             r#"#!/bin/sh
 printf '%s\n' "$*" >> {calls}
+output_file=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    output_file="$arg"
+    break
+  fi
+  prev="$arg"
+done
+[ -n "$output_file" ] && printf '%s\n' "ok" > "$output_file"
 echo '{{"thread_id":"fake-thread"}}'
 echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"ok"}}]}}'
 "#,
@@ -2034,6 +2288,54 @@ done
 "#,
             calls = shell_quote(calls_path.to_str().expect("utf-8 calls path")),
             thread_id = shell_quote(thread_id),
+            final_text_json = shell_quote(&final_text_json)
+        ),
+    )
+    .expect("write fake remote proxy");
+    let mut permissions = fs::metadata(proxy_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(proxy_path, permissions).expect("chmod fake remote proxy");
+}
+
+fn write_fake_remote_proxy_with_delayed_final(
+    proxy_path: &std::path::Path,
+    calls_path: &std::path::Path,
+    thread_id: &str,
+    progress_text: &str,
+    final_text: &str,
+) {
+    let progress_text_json = serde_json::to_string(progress_text).expect("progress text json");
+    let final_text_json = serde_json::to_string(final_text).expect("final text json");
+    fs::write(
+        proxy_path,
+        format!(
+            r#"#!/bin/sh
+thread_id={thread_id}
+progress_text_json={progress_text_json}
+final_text_json={final_text_json}
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> {calls}
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"fake"}}}}\n' "$id"
+      ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"thread":{{"id":"%s"}},"cwd":"/tmp","model":"fake","modelProvider":"fake","approvalPolicy":"never","approvalsReviewer":"user","sandbox":{{"mode":"workspace-write"}}}}}}\n' "$id" "$thread_id"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"turn":{{"id":"turn-1","status":"inProgress","items":[]}}}}}}\n' "$id"
+      printf '{{"jsonrpc":"2.0","method":"item/completed","params":{{"threadId":"%s","turnId":"turn-1","item":{{"type":"agentMessage","id":"msg-progress","text":%s,"phase":"running","memoryCitation":null}}}}}}\n' "$thread_id" "$progress_text_json"
+      sleep 10
+      printf '{{"jsonrpc":"2.0","method":"item/completed","params":{{"threadId":"%s","turnId":"turn-1","item":{{"type":"agentMessage","id":"msg-final","text":%s,"phase":"final_answer","memoryCitation":null}}}}}}\n' "$thread_id" "$final_text_json"
+      printf '{{"jsonrpc":"2.0","method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"turn-1","status":"completed","items":[],"itemsView":"notLoaded"}}}}}}\n' "$thread_id"
+      ;;
+  esac
+done
+"#,
+            calls = shell_quote(calls_path.to_str().expect("utf-8 calls path")),
+            thread_id = shell_quote(thread_id),
+            progress_text_json = shell_quote(&progress_text_json),
             final_text_json = shell_quote(&final_text_json)
         ),
     )

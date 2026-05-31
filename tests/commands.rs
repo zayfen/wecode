@@ -208,6 +208,93 @@ fn backend_input_recognizes_metadata_wrapped_control_command() {
 }
 
 #[test]
+fn backend_input_does_not_treat_generic_json_string_as_channel_message() {
+    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let input = r#"":help""#;
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, input).expect("generic json string"),
+        BackendInput::Prompt(prompt) if prompt == r#"":help""#
+    ));
+}
+
+#[test]
+fn backend_input_does_not_guess_generic_json_object_message_fields() {
+    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let input = r#"{"message":":cd ~/Github/zcode"}"#;
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, input).expect("generic json object"),
+        BackendInput::Prompt(prompt) if prompt == r#"{"message":":cd ~/Github/zcode"}"#
+    ));
+}
+
+#[test]
+fn backend_input_extracts_feishu_text_event_message() {
+    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let input = r#"{
+      "schema": "2.0",
+      "header": { "event_type": "im.message.receive_v1" },
+      "event": {
+        "sender": { "sender_id": { "open_id": "ou_08e494561f9ff0e2bd8015472c28e6e5" } },
+        "message": {
+          "message_id": "om_x100b6e977ba6b4b0b34edb547991066",
+          "chat_id": "oc_xxx",
+          "chat_type": "p2p",
+          "message_type": "text",
+          "content": "{\"text\":\"请总结这个 repo\"}"
+        }
+      }
+    }"#;
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, input).expect("feishu event prompt"),
+        BackendInput::Prompt(prompt) if prompt == "请总结这个 repo"
+    ));
+}
+
+#[test]
+fn backend_input_extracts_weixin_getupdates_text_message() {
+    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let input = r#"{
+      "ret": 0,
+      "msgs": [
+        {
+          "message_id": 1780220368799,
+          "from_user_id": "o9cq805CIQyEJ1pliCh0GGdeTy98@im.wechat",
+          "to_user_id": "bot@im.wechat",
+          "message_type": 1,
+          "item_list": [
+            { "type": 1, "text_item": { "text": "帮我看 README" } }
+          ]
+        }
+      ]
+    }"#;
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, input).expect("weixin getupdates prompt"),
+        BackendInput::Prompt(prompt) if prompt == "帮我看 README"
+    ));
+}
+
+#[test]
+fn backend_input_extracts_decorated_openclaw_plain_message_for_codex() {
+    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let input = r#"Conversation info (untrusted metadata):
+```json
+{"message_id":"om_x100b6e977ba6b4b0b34edb547991066"}
+```
+
+[message_id: om_x100b6e977ba6b4b0b34edb547991066]
+ou_08e494561f9ff0e2bd8015472c28e6e5: 解释 src/commands.rs 的输入处理"#;
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, input).expect("decorated plain prompt"),
+        BackendInput::Prompt(prompt) if prompt == "解释 src/commands.rs 的输入处理"
+    ));
+}
+
+#[test]
 fn backend_input_recognizes_decorated_openclaw_control_command() {
     let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
     let input = r#"Conversation info (untrusted metadata):

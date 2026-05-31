@@ -20,9 +20,23 @@ pub struct CodexRemoteRunRequest<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexRemoteRunEvent {
+    AgentMessage {
+        thread_id: String,
+        text: String,
+        final_answer: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRemoteRunResult {
     pub thread_id: String,
     pub final_message: String,
+}
+
+struct RemoteAgentMessage {
+    text: String,
+    final_answer: bool,
 }
 
 struct JsonRpcClient {
@@ -63,6 +77,16 @@ pub fn start_codex_remote_daemon(config: &WecodeConfig) -> Result<(), String> {
 pub fn run_codex_remote_turn(
     request: &CodexRemoteRunRequest<'_>,
 ) -> Result<CodexRemoteRunResult, String> {
+    run_codex_remote_turn_with_events(request, |_| Ok(()))
+}
+
+pub fn run_codex_remote_turn_with_events<F>(
+    request: &CodexRemoteRunRequest<'_>,
+    mut event_handler: F,
+) -> Result<CodexRemoteRunResult, String>
+where
+    F: FnMut(CodexRemoteRunEvent) -> Result<(), String>,
+{
     let mut errors = Vec::new();
     if let Err(err) = start_codex_remote_daemon(request.config) {
         errors.push(format!("daemon start: {err}"));
@@ -73,7 +97,7 @@ pub fn run_codex_remote_turn(
         errors.push("no Codex remote proxy command configured".to_string());
     }
     for command in commands {
-        match run_codex_remote_turn_with_proxy_command(request, command) {
+        match run_codex_remote_turn_with_proxy_command(request, command, &mut event_handler) {
             Ok(result) => return Ok(result),
             Err(err) => errors.push(format!("proxy `{command}`: {err}")),
         }
@@ -88,6 +112,7 @@ pub fn run_codex_remote_turn(
 fn run_codex_remote_turn_with_proxy_command(
     request: &CodexRemoteRunRequest<'_>,
     proxy_command: &str,
+    event_handler: &mut impl FnMut(CodexRemoteRunEvent) -> Result<(), String>,
 ) -> Result<CodexRemoteRunResult, String> {
     let mut client = JsonRpcClient::spawn(proxy_command)?;
     client.request(
@@ -159,7 +184,13 @@ fn run_codex_remote_turn_with_proxy_command(
         } else if message.get("id").is_some() && message.get("method").is_some() {
             client.decline_server_request(&message)?;
         } else {
-            turn_state.observe_notification(&message);
+            if let Some(agent_message) = turn_state.observe_notification(&message) {
+                event_handler(CodexRemoteRunEvent::AgentMessage {
+                    thread_id: thread_id.clone(),
+                    text: agent_message.text,
+                    final_answer: agent_message.final_answer,
+                })?;
+            }
         }
     }
 }
@@ -178,30 +209,33 @@ fn remote_proxy_commands(config: &WecodeConfig) -> Vec<&str> {
 }
 
 impl RemoteTurnState {
-    fn observe_notification(&mut self, message: &Value) {
+    fn observe_notification(&mut self, message: &Value) -> Option<RemoteAgentMessage> {
         match message.get("method").and_then(Value::as_str) {
             Some("item/agentMessage/delta") => {
                 let Some(params) = message.get("params") else {
-                    return;
+                    return None;
                 };
                 let Some(item_id) = params.get("itemId").and_then(Value::as_str) else {
-                    return;
+                    return None;
                 };
                 let Some(delta) = params.get("delta").and_then(Value::as_str) else {
-                    return;
+                    return None;
                 };
                 self.message_deltas
                     .entry(item_id.to_string())
                     .or_default()
                     .push_str(delta);
+                None
             }
             Some("item/completed") | Some("item/started") => {
+                let completed =
+                    message.get("method").and_then(Value::as_str) == Some("item/completed");
                 let item = message
                     .get("params")
                     .and_then(|params| params.get("item"))
                     .unwrap_or(&Value::Null);
                 if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
-                    return;
+                    return None;
                 }
                 let item_id = item.get("id").and_then(Value::as_str);
                 let text = item
@@ -219,12 +253,18 @@ impl RemoteTurnState {
                     });
                 if let Some(text) = text {
                     self.last_agent_message = Some(text.clone());
-                    if item.get("phase").and_then(Value::as_str) == Some("final_answer") {
-                        self.last_final_message = Some(text);
+                    let final_answer =
+                        item.get("phase").and_then(Value::as_str) == Some("final_answer");
+                    if final_answer {
+                        self.last_final_message = Some(text.clone());
+                    }
+                    if completed {
+                        return Some(RemoteAgentMessage { text, final_answer });
                     }
                 }
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 

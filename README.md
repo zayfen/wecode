@@ -255,7 +255,7 @@ $XDG_CONFIG_HOME/wecode/config.json
 
 `codex.transport` 控制 wecode 如何调用 Codex。默认 `"remote"` 会先通过 `codex remote-control start --json` + `codex app-server proxy` 使用 managed remote；如果本机 Codex 不是 standalone 安装，或者 managed proxy 不可用，会改用 `codex.remote.fallbackProxyCommand`，默认是 `codex app-server --listen stdio://`。只有两条 remote 路径都失败时，`"remote"` 才自动回退 `codex exec`；`"remote-strict"` 不会回退 exec，但仍会尝试这个 stdio app-server 兼容路径；`"exec"` 会强制使用旧的 `codex exec --json` 路径。
 
-`wecode codex-backend --jsonl` 会输出 OpenClaw 可识别的 JSONL。remote 模式会把 app-server turn 结果转换成兼容 JSONL，并在 app-server 返回 assistant/message JSON 外壳时提取内部文本，避免微信侧看到二次包装的响应 JSON；exec fallback 模式会实时转发 `codex exec --json` 的 stdout/stderr，避免因为 Wecode 缓存输出导致 OpenClaw watchdog 超时。
+`wecode codex-backend --jsonl` 会输出 OpenClaw 可识别的 JSONL。remote 模式会把 app-server turn 结果转换成兼容 JSONL，并在 app-server 返回 assistant/message JSON 外壳时提取内部文本，避免微信侧看到二次包装的响应 JSON；当 Codex remote 在 turn 中途完成一段非 final agent message 时，`wecode` 会立即把这段阶段性回复写入 JSONL 并 flush，让微信侧先收到进展，而不是一直等最终答案。exec fallback 模式会实时转发 `codex exec --json` 的 stdout/stderr，避免因为 Wecode 缓存输出导致 OpenClaw watchdog 超时。
 
 要切换 Codex 处理的项目，只设置 `codex.cwd`，或在聊天里发送 `:cd <项目目录>`：
 

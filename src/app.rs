@@ -11,7 +11,10 @@ use wecode::{
     backend::{AssistantBackend, BackendRunRequest, CodexBackend},
     bootstrap_plan_with_backend_command, codex_config_plan_with_backend_command,
     codex_model_from_openclaw_model,
-    codex_remote::{run_codex_remote_turn, start_codex_remote_daemon, CodexRemoteRunRequest},
+    codex_remote::{
+        run_codex_remote_turn_with_events, start_codex_remote_daemon, CodexRemoteRunEvent,
+        CodexRemoteRunRequest,
+    },
     config::CodexTransport,
     default_config, diagnose_tools, list_all_codex_sessions, openclaw_bin_path, parse_node_version,
     patch_gateway_launch_agent_prevent_sleep, patch_openclaw_text_command_routing,
@@ -179,7 +182,7 @@ pub fn run(command: CliCommand) -> Result<(), String> {
                     jsonl,
                     Some(&flow_run_id),
                 ),
-                BackendInput::Help => emit_local_message(&weixin_help_message(&config), jsonl),
+                BackendInput::Help => emit_local_markdown(&weixin_help_message(&config), jsonl),
                 BackendInput::Status => emit_local_message(
                     &weixin_status_message(&config, resume_session_id, model.as_deref()),
                     jsonl,
@@ -807,10 +810,7 @@ fn run_codex_prompt(
                 flow_run_id,
             )? {
                 if !*jsonl {
-                    println!(
-                        "{}",
-                        optimized_assistant_response_text(&remote_result.final_message).trim()
-                    );
+                    println!("{}", remote_result.final_message.trim());
                 }
                 return Ok(());
             }
@@ -907,7 +907,23 @@ fn run_remote_backend_with_fallback(
         selected_model: effective_model.as_deref(),
         resume_session_id,
     };
-    match run_codex_remote_turn(&request) {
+    let mut thread_id_emitted = false;
+    match run_codex_remote_turn_with_events(&request, |event| match event {
+        CodexRemoteRunEvent::AgentMessage {
+            thread_id,
+            text,
+            final_answer,
+        } => {
+            if final_answer {
+                return Ok(());
+            }
+            if !thread_id_emitted {
+                emit_remote_thread_jsonl(&thread_id)?;
+                thread_id_emitted = true;
+            }
+            emit_remote_assistant_message_jsonl(&text)
+        }
+    }) {
         Ok(result) => {
             if let Some(run_id) = flow_run_id {
                 tracing::info!(
@@ -918,7 +934,7 @@ fn run_remote_backend_with_fallback(
                     "prompt_flow"
                 );
             }
-            emit_remote_backend_jsonl(&result)?;
+            emit_remote_backend_jsonl(&result, !thread_id_emitted)?;
             Ok(Some(result))
         }
         Err(err) if config.codex.transport == CodexTransport::Remote => {
@@ -939,61 +955,48 @@ fn run_remote_backend_with_fallback(
 
 fn emit_remote_backend_jsonl(
     result: &wecode::codex_remote::CodexRemoteRunResult,
+    emit_thread: bool,
 ) -> Result<(), String> {
-    let thread = serde_json::json!({ "thread_id": result.thread_id });
-    let text = optimized_assistant_response_text(&result.final_message);
-    let assistant_message = serde_json::json!({
-        "type": "message",
-        "role": "assistant",
-        "content": [
-            {
-                "type": "output_text",
-                "text": text
-            }
-        ]
-    });
-    println!("{thread}");
-    println!("{assistant_message}");
-    Ok(())
-}
-
-fn optimized_assistant_response_text(message: &str) -> String {
-    unwrap_assistant_message_json(message).unwrap_or_else(|| message.to_string())
-}
-
-fn unwrap_assistant_message_json(message: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(message.trim()).ok()?;
-    let object = value.as_object()?;
-    let is_message = object
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|kind| kind == "message");
-    let is_assistant = object
-        .get("role")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|role| role == "assistant");
-    if !is_message || !is_assistant {
-        return None;
+    if emit_thread {
+        emit_remote_thread_jsonl(&result.thread_id)?;
     }
+    emit_remote_assistant_message_jsonl(&result.final_message)
+}
 
-    match object.get("content")? {
-        serde_json::Value::String(text) => Some(text.clone()),
-        serde_json::Value::Array(items) => {
-            let mut text = String::new();
-            for item in items {
-                let Some(part) = item.get("text").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                text.push_str(part);
-            }
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
+fn emit_remote_thread_jsonl(thread_id: &str) -> Result<(), String> {
+    let thread = openclaw_thread_jsonl_value(thread_id);
+    emit_jsonl_value(&thread)
+}
+
+fn emit_remote_assistant_message_jsonl(text: &str) -> Result<(), String> {
+    let assistant_message = openclaw_assistant_message_jsonl_value(text);
+    emit_jsonl_value(&assistant_message)
+}
+
+fn openclaw_thread_jsonl_value(thread_id: &str) -> serde_json::Value {
+    serde_json::json!({ "thread_id": thread_id })
+}
+
+fn openclaw_assistant_message_jsonl_value(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "item": {
+            "type": "message",
+            "text": text
         }
-        _ => None,
-    }
+    })
+}
+
+fn emit_jsonl_value(value: &serde_json::Value) -> Result<(), String> {
+    let mut stdout = io::stdout().lock();
+    write_jsonl_value(&mut stdout, value)
+        .map_err(|err| format!("failed to write JSONL output: {err}"))?;
+    stdout
+        .flush()
+        .map_err(|err| format!("failed to flush JSONL output: {err}"))
+}
+
+fn write_jsonl_value<W: Write>(writer: &mut W, value: &serde_json::Value) -> io::Result<()> {
+    writeln!(writer, "{value}")
 }
 
 fn run_backend_prompt(
@@ -1204,7 +1207,7 @@ fn run_codex_backend_attempt(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let result = if stream_jsonl {
-        run_streaming_backend_command(command)?
+        run_streaming_backend_command(command, output_path)?
     } else {
         let output = command
             .output()
@@ -1234,12 +1237,10 @@ fn run_codex_backend_attempt(
     Ok(result)
 }
 
-enum StreamTarget {
-    Stdout,
-    Stderr,
-}
-
-fn run_streaming_backend_command(mut command: Command) -> Result<CodexBackendResult, String> {
+fn run_streaming_backend_command(
+    mut command: Command,
+    output_path: &Path,
+) -> Result<CodexBackendResult, String> {
     let mut child = command
         .spawn()
         .map_err(|err| format!("failed to start codex: {err}"))?;
@@ -1252,13 +1253,16 @@ fn run_streaming_backend_command(mut command: Command) -> Result<CodexBackendRes
         .take()
         .ok_or_else(|| "failed to capture Codex stderr".to_string())?;
 
-    let stdout_thread = thread::spawn(move || capture_and_forward(stdout, StreamTarget::Stdout));
-    let stderr_thread = thread::spawn(move || capture_and_forward(stderr, StreamTarget::Stderr));
+    let stdout_thread = thread::spawn(move || capture_codex_stdout_session_jsonl(stdout));
+    let stderr_thread = thread::spawn(move || capture_and_forward_stderr(stderr));
     let status = child
         .wait()
         .map_err(|err| format!("failed to wait for codex: {err}"))?;
     let stdout = join_output_thread(stdout_thread, "stdout")?;
     let stderr = join_output_thread(stderr_thread, "stderr")?;
+    if status.success() {
+        emit_codex_output_file_as_openclaw_jsonl(output_path)?;
+    }
 
     Ok(CodexBackendResult {
         success: status.success(),
@@ -1280,36 +1284,78 @@ fn join_output_thread(
         .map_err(|err| format!("failed to read Codex {name}: {err}"))
 }
 
-fn capture_and_forward<R: Read>(mut reader: R, target: StreamTarget) -> io::Result<Vec<u8>> {
+fn capture_and_forward_stderr<R: Read>(mut reader: R) -> io::Result<Vec<u8>> {
     let mut captured = Vec::new();
     let mut buf = [0_u8; 8192];
-    match target {
-        StreamTarget::Stdout => {
-            let mut writer = io::stdout().lock();
-            loop {
-                let len = reader.read(&mut buf)?;
-                if len == 0 {
-                    break;
-                }
-                writer.write_all(&buf[..len])?;
-                writer.flush()?;
-                captured.extend_from_slice(&buf[..len]);
-            }
+    let mut writer = io::stderr().lock();
+    loop {
+        let len = reader.read(&mut buf)?;
+        if len == 0 {
+            break;
         }
-        StreamTarget::Stderr => {
-            let mut writer = io::stderr().lock();
-            loop {
-                let len = reader.read(&mut buf)?;
-                if len == 0 {
-                    break;
-                }
-                writer.write_all(&buf[..len])?;
-                writer.flush()?;
-                captured.extend_from_slice(&buf[..len]);
-            }
-        }
+        writer.write_all(&buf[..len])?;
+        writer.flush()?;
+        captured.extend_from_slice(&buf[..len]);
     }
     Ok(captured)
+}
+
+fn capture_codex_stdout_session_jsonl<R: Read>(reader: R) -> io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut reader = BufReader::new(reader);
+    let mut writer = io::stdout().lock();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let len = reader.read_line(&mut line)?;
+        if len == 0 {
+            break;
+        }
+        captured.extend_from_slice(line.as_bytes());
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(value) = codex_stdout_jsonl_line_to_openclaw_value(trimmed) {
+            write_jsonl_value(&mut writer, &value)?;
+        }
+        writer.flush()?;
+    }
+
+    Ok(captured)
+}
+
+fn codex_stdout_jsonl_line_to_openclaw_value(line: &str) -> Option<serde_json::Value> {
+    let parsed = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if parsed
+        .get("item")
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        return Some(parsed);
+    }
+    if let Some(thread_id) = parsed
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(openclaw_thread_jsonl_value(thread_id));
+    }
+    None
+}
+
+fn emit_codex_output_file_as_openclaw_jsonl(output_path: &Path) -> Result<(), String> {
+    let Ok(final_message) = fs::read_to_string(output_path) else {
+        return Ok(());
+    };
+    let final_message = final_message.trim();
+    if final_message.is_empty() {
+        return Ok(());
+    }
+    emit_jsonl_value(&openclaw_assistant_message_jsonl_value(final_message))
 }
 
 fn codex_exec_command(
@@ -1394,7 +1440,12 @@ fn emit_codex_backend_result(result: &CodexBackendResult, jsonl: bool) -> Result
 }
 
 fn emit_local_message(message: &str, _jsonl: bool) -> Result<(), String> {
-    println!("{}", markdown_code_block(message));
+    println!("{}", markdown_code_block(message, "text"));
+    Ok(())
+}
+
+fn emit_local_bash_message(message: &str, _jsonl: bool) -> Result<(), String> {
+    println!("{}", markdown_code_block(message, "bash"));
     Ok(())
 }
 
@@ -1403,10 +1454,10 @@ fn emit_local_markdown(message: &str, _jsonl: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn markdown_code_block(message: &str) -> String {
+fn markdown_code_block(message: &str, language: &str) -> String {
     let fence_len = longest_backtick_run(message).saturating_add(1).max(3);
     let fence = "`".repeat(fence_len);
-    format!("{fence}text\n{message}\n{fence}")
+    format!("{fence}{language}\n{message}\n{fence}")
 }
 
 fn longest_backtick_run(input: &str) -> usize {
@@ -1443,7 +1494,7 @@ fn emit_diff(config: &WecodeConfig, jsonl: bool) -> Result<(), String> {
 }
 
 fn emit_pwd(config: &WecodeConfig, jsonl: bool) -> Result<(), String> {
-    emit_local_message(&codex_target_cwd(config)?.display().to_string(), jsonl)
+    emit_local_bash_message(&codex_target_cwd(config)?.display().to_string(), jsonl)
 }
 
 fn emit_ls(config: &WecodeConfig, path: &str, jsonl: bool) -> Result<(), String> {
@@ -1469,7 +1520,7 @@ fn emit_ls(config: &WecodeConfig, path: &str, jsonl: bool) -> Result<(), String>
         }
     }
 
-    emit_local_message(&lines.join("\n"), jsonl)
+    emit_local_bash_message(&lines.join("\n"), jsonl)
 }
 
 fn emit_cat(config: &WecodeConfig, path: &str, jsonl: bool) -> Result<(), String> {
@@ -1538,7 +1589,7 @@ fn emit_shell(config: &WecodeConfig, command: &str, jsonl: bool) -> Result<(), S
         .current_dir(&cwd)
         .output()
         .map_err(|err| format!("failed to run shell command: {err}"))?;
-    emit_local_message(&format_shell_output(command, &cwd, &output), jsonl)
+    emit_local_bash_message(&format_shell_output(command, &cwd, &output), jsonl)
 }
 
 fn emit_model_status(
@@ -1661,19 +1712,8 @@ fn emit_resume_binding(session: &wecode::CodexSessionSummary, jsonl: bool) -> Re
     let message = lines.join("\n");
 
     if jsonl {
-        let thread = serde_json::json!({ "thread_id": session.id });
-        let assistant_message = serde_json::json!({
-            "type": "message",
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "output_text",
-                    "text": message
-                }
-            ]
-        });
-        println!("{thread}");
-        println!("{assistant_message}");
+        emit_jsonl_value(&openclaw_thread_jsonl_value(&session.id))?;
+        emit_jsonl_value(&openclaw_assistant_message_jsonl_value(&message))?;
         Ok(())
     } else {
         emit_local_markdown(&message, jsonl)
