@@ -16,11 +16,12 @@ use wecode::{
         CodexRemoteRunRequest,
     },
     config::CodexTransport,
-    default_config, diagnose_tools, list_all_codex_sessions, openclaw_bin_path, parse_node_version,
-    patch_gateway_launch_agent_prevent_sleep, patch_openclaw_text_command_routing,
-    prepare_backend_input_with_trace, read_config_str, render_command_input, weixin_install_step,
-    BackendInput, CliCommand, CommandStep, PreparedBackendInput, ToolReport, ToolSnapshot,
-    WecodeConfig,
+    default_config, diagnose_tools, list_all_codex_sessions,
+    native_approval::{self, NativeApprovalDecision},
+    openclaw_bin_path, parse_node_version, patch_gateway_launch_agent_prevent_sleep,
+    patch_openclaw_text_command_routing, prepare_backend_input_with_trace, read_config_str,
+    render_command_input, weixin_install_step, BackendInput, CliCommand, CommandStep,
+    PreparedBackendInput, ToolReport, ToolSnapshot, WecodeConfig,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -212,7 +213,7 @@ pub fn run(command: CliCommand) -> Result<(), String> {
                 } => {
                     emit_approval_request(&config, &command_name, &prompt, resume_session_id, jsonl)
                 }
-                BackendInput::Approve { approval_id } => run_approved_prompt(
+                BackendInput::Approve { approval_id } => approve_approval(
                     &config,
                     &approval_id,
                     resume_session_id,
@@ -1089,7 +1090,11 @@ fn run_codex_review(
 ) -> Result<(), String> {
     let output_path = codex_output_path();
     let mut command = Command::new("codex");
-    command.arg("exec").arg("review").arg("--json");
+    command
+        .arg("exec")
+        .arg("review")
+        .arg("--yolo")
+        .arg("--json");
     command.arg("-o").arg(&output_path);
     command.arg("--uncommitted");
     if let Some(model) = effective_codex_model(config, selected_model)? {
@@ -1105,7 +1110,7 @@ fn run_codex_review(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     eprintln!(
-        "$ codex exec review --json -o {} --uncommitted",
+        "$ codex exec review --yolo --json -o {} --uncommitted",
         output_path.display()
     );
     if let Some(run_id) = flow_run_id {
@@ -1743,6 +1748,41 @@ fn emit_approval_request(
     )
 }
 
+fn approve_approval(
+    config: &WecodeConfig,
+    approval_id: &str,
+    resume_session_id: Option<String>,
+    selected_model: Option<String>,
+    jsonl: bool,
+    flow_run_id: Option<&str>,
+) -> Result<(), String> {
+    let custom_path = approval_path(config, approval_id);
+    if custom_path.exists() {
+        return run_approved_prompt(
+            config,
+            approval_id,
+            resume_session_id,
+            selected_model,
+            jsonl,
+            flow_run_id,
+        );
+    }
+
+    match native_approval::write_native_approval_decision(
+        config,
+        approval_id,
+        NativeApprovalDecision::Approve,
+    ) {
+        Ok(()) => emit_local_markdown(
+            &format!(
+                "Approved Codex approval {approval_id}. Codex will continue in the original turn."
+            ),
+            jsonl,
+        ),
+        Err(_) => emit_local_markdown(&format!("Approval {approval_id} was not found."), jsonl),
+    }
+}
+
 fn run_approved_prompt(
     config: &WecodeConfig,
     approval_id: &str,
@@ -1772,9 +1812,21 @@ fn deny_approval(config: &WecodeConfig, approval_id: &str, jsonl: bool) -> Resul
     if path.exists() {
         fs::remove_file(&path)
             .map_err(|err| format!("failed to delete approval {approval_id}: {err}"))?;
-        emit_local_message(&format!("Denied approval {approval_id}."), jsonl)
-    } else {
-        emit_local_message(&format!("Approval {approval_id} was not found."), jsonl)
+        return emit_local_message(&format!("Denied approval {approval_id}."), jsonl);
+    }
+
+    match native_approval::write_native_approval_decision(
+        config,
+        approval_id,
+        NativeApprovalDecision::Deny,
+    ) {
+        Ok(()) => emit_local_markdown(
+            &format!(
+                "Denied Codex approval {approval_id}. Codex will continue in the original turn."
+            ),
+            jsonl,
+        ),
+        Err(_) => emit_local_markdown(&format!("Approval {approval_id} was not found."), jsonl),
     }
 }
 

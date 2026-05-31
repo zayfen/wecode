@@ -78,8 +78,8 @@ esac
     );
 
     let calls = fs::read_to_string(calls_path).expect("calls");
-    assert!(calls.contains("exec resume --json"));
-    assert!(calls.contains("exec --json"));
+    assert!(calls.contains("exec resume --yolo --json"));
+    assert!(calls.contains("exec --yolo --json"));
 }
 
 #[test]
@@ -668,7 +668,7 @@ fn codex_backend_remote_transport_falls_back_to_exec_when_proxy_fails() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("falling back to codex exec"), "{stderr}");
     let calls = fs::read_to_string(calls_path).expect("codex calls");
-    assert!(calls.contains("exec --json"), "{calls}");
+    assert!(calls.contains("exec --yolo --json"), "{calls}");
 }
 
 #[test]
@@ -743,7 +743,7 @@ fn codex_backend_remote_transport_uses_stdio_app_server_when_managed_proxy_unava
     assert!(
         !fs::read_to_string(&codex_calls_path)
             .unwrap_or_default()
-            .contains("exec --json"),
+            .contains("exec --yolo --json"),
         "remote-strict compatibility fallback must not invoke codex exec"
     );
     let start_calls = fs::read_to_string(start_calls_path).expect("start calls");
@@ -870,9 +870,127 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
     );
     assert!(String::from_utf8_lossy(&approved.stdout).contains("approved-thread"));
     let calls = fs::read_to_string(calls_path).expect("calls");
-    assert!(calls.contains("exec resume --json"));
+    assert!(calls.contains("exec resume --yolo --json"));
     assert!(calls.contains("Deploy production"));
     assert!(!approval_file.exists(), "approval should be consumed");
+}
+
+#[test]
+fn codex_backend_approve_writes_native_approval_decision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":{}}},"codex":{{"transport":"remote-strict"}}}}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json")
+        ),
+    )
+    .expect("write config");
+    let native_dir = state_dir.join("approvals").join("native");
+    fs::create_dir_all(&native_dir).expect("native dir");
+    fs::write(
+        native_dir.join("appr-native.json"),
+        r#"{
+          "kind": "codex-native",
+          "approval_id": "appr-native",
+          "request_method": "item/commandExecution/requestApproval",
+          "jsonrpc_id": 99,
+          "thread_id": "thread-1",
+          "turn_id": "turn-1",
+          "command": "cargo test",
+          "cwd": "/tmp/project",
+          "summary": ["Command: cargo test"],
+          "prompt": "Codex requests permission.",
+          "request_params": {"command":"cargo test"},
+          "created_at_millis": 1,
+          "expires_at_millis": 9999999999999
+        }"#,
+    )
+    .expect("pending native");
+
+    let approved = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":approve",
+            "appr-native",
+        ])
+        .output()
+        .expect("approve");
+
+    assert!(
+        approved.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    let decision =
+        fs::read_to_string(native_dir.join("appr-native.decision.json")).expect("decision");
+    assert!(decision.contains(r#""decision": "approve""#), "{decision}");
+    assert!(
+        String::from_utf8_lossy(&approved.stdout).contains("Approved Codex approval appr-native")
+    );
+}
+
+#[test]
+fn codex_backend_deny_writes_native_approval_decision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":{}}},"codex":{{"transport":"remote-strict"}}}}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json")
+        ),
+    )
+    .expect("write config");
+    let native_dir = state_dir.join("approvals").join("native");
+    fs::create_dir_all(&native_dir).expect("native dir");
+    fs::write(
+        native_dir.join("appr-native.json"),
+        r#"{
+          "kind": "codex-native",
+          "approval_id": "appr-native",
+          "request_method": "item/fileChange/requestApproval",
+          "jsonrpc_id": 99,
+          "thread_id": "thread-1",
+          "turn_id": "turn-1",
+          "command": null,
+          "cwd": "/tmp/project",
+          "summary": ["File change requested"],
+          "prompt": "Codex requests permission.",
+          "request_params": {},
+          "created_at_millis": 1,
+          "expires_at_millis": 9999999999999
+        }"#,
+    )
+    .expect("pending native");
+
+    let denied = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":deny",
+            "appr-native",
+        ])
+        .output()
+        .expect("deny");
+
+    assert!(
+        denied.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    let decision =
+        fs::read_to_string(native_dir.join("appr-native.decision.json")).expect("decision");
+    assert!(decision.contains(r#""decision": "deny""#), "{decision}");
+    assert!(String::from_utf8_lossy(&denied.stdout).contains("Denied Codex approval appr-native"));
 }
 
 #[test]
