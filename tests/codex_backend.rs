@@ -219,6 +219,81 @@ fn codex_backend_remote_transport_runs_turn_over_app_server_proxy() {
 }
 
 #[test]
+fn codex_backend_remote_transport_unwraps_json_assistant_message_text() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let proxy_path = temp.path().join("codex-remote-proxy");
+    let calls_path = temp.path().join("remote-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    let wrapped_message = serde_json::json!({
+        "content": [
+            {
+                "text": "clean response",
+                "type": "outputtext"
+            }
+        ],
+        "role": "assistant",
+        "type": "message"
+    })
+    .to_string();
+    write_fake_remote_proxy(&proxy_path, &calls_path, "json-thread", &wrapped_message);
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{
+                "transport": "remote-strict",
+                "remote": {{
+                  "autoStart": false,
+                  "proxyCommand": "{}"
+                }}
+              }}
+            }}"#,
+            state_dir.display(),
+            proxy_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "hello json",
+        ])
+        .output()
+        .expect("run remote backend");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let message_line = stdout
+        .lines()
+        .find(|line| line.contains(r#""role":"assistant""#))
+        .expect("assistant JSONL line");
+    let message: serde_json::Value =
+        serde_json::from_str(message_line).expect("assistant JSONL parses");
+    assert_eq!(
+        message["content"][0]["text"].as_str(),
+        Some("clean response")
+    );
+    assert!(
+        !message["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(r#""content""#),
+        "assistant text should not expose nested JSON response: {message_line}"
+    );
+}
+
+#[test]
 fn codex_backend_remote_transport_resumes_existing_thread() {
     let temp = tempfile::tempdir().expect("temp dir");
     let proxy_path = temp.path().join("codex-remote-proxy");
@@ -1231,8 +1306,20 @@ JSON
         stdout.contains("Codex title: review api | cli boundaries"),
         "stdout:\n{stdout}"
     );
+    let project_dir_text = project_dir.display().to_string();
+    let compact_project_dir = env::var("HOME")
+        .ok()
+        .and_then(|home| {
+            project_dir_text
+                .strip_prefix(&format!("{home}/"))
+                .map(String::from)
+        })
+        .map(|path| format!("~/{path}"));
     assert!(
-        stdout.contains(&project_dir.display().to_string()),
+        stdout.contains(&project_dir_text)
+            || compact_project_dir
+                .as_deref()
+                .is_some_and(|path| stdout.contains(path)),
         "stdout:\n{stdout}"
     );
     assert!(
@@ -1877,12 +1964,13 @@ fn write_fake_remote_proxy(
     thread_id: &str,
     final_text: &str,
 ) {
+    let final_text_json = serde_json::to_string(final_text).expect("final text json");
     fs::write(
         proxy_path,
         format!(
             r#"#!/bin/sh
 thread_id={thread_id}
-final_text={final_text}
+final_text_json={final_text_json}
 while IFS= read -r line; do
   printf '%s\n' "$line" >> {calls}
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -1895,8 +1983,8 @@ while IFS= read -r line; do
       ;;
     *'"method":"turn/start"'*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"turn":{{"id":"turn-1","status":"inProgress","items":[]}}}}}}\n' "$id"
-      printf '{{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{{"threadId":"%s","turnId":"turn-1","itemId":"msg-1","delta":"%s"}}}}\n' "$thread_id" "$final_text"
-      printf '{{"jsonrpc":"2.0","method":"item/completed","params":{{"threadId":"%s","turnId":"turn-1","item":{{"type":"agentMessage","id":"msg-1","text":"%s","phase":"final_answer","memoryCitation":null}}}}}}\n' "$thread_id" "$final_text"
+      printf '{{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{{"threadId":"%s","turnId":"turn-1","itemId":"msg-1","delta":%s}}}}\n' "$thread_id" "$final_text_json"
+      printf '{{"jsonrpc":"2.0","method":"item/completed","params":{{"threadId":"%s","turnId":"turn-1","item":{{"type":"agentMessage","id":"msg-1","text":%s,"phase":"final_answer","memoryCitation":null}}}}}}\n' "$thread_id" "$final_text_json"
       printf '{{"jsonrpc":"2.0","method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"turn-1","status":"completed","items":[],"itemsView":"notLoaded"}}}}}}\n' "$thread_id"
       ;;
   esac
@@ -1904,7 +1992,7 @@ done
 "#,
             calls = shell_quote(calls_path.to_str().expect("utf-8 calls path")),
             thread_id = shell_quote(thread_id),
-            final_text = shell_quote(final_text)
+            final_text_json = shell_quote(&final_text_json)
         ),
     )
     .expect("write fake remote proxy");

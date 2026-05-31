@@ -1,8 +1,34 @@
 # wecode
 
-`wecode` 是一个个人用的 Rust CLI，用来把微信或飞书消息接入本机 Codex CLI。它不重新实现通信协议，也不替代 Codex，而是把现有工具组合成一个可维护的个人编程助手。
+`wecode` 是一个个人用的 Rust CLI，用来把微信或飞书消息接入本机 Codex CLI。它把你已经在本机使用的 Codex、项目目录、session、sandbox 和审批流程，延伸到手机聊天入口里，让代码任务可以从微信或飞书发起、续接和检查。
+
+它不重新实现通信协议，也不替代 Codex，而是把 OpenClaw 和 Codex CLI 组合成一个可维护、可审计、可本机运行的个人编程助手。
 
 GitHub 默认展示的文档就是本文件 `README.md`，因此这里使用中文作为主 README。
+
+## 一句话介绍
+
+`wecode` 让微信或飞书变成本机 Codex 的远程控制台：人在外面也能让电脑里的 Codex 在指定仓库里继续工作，同时保留本机执行、本机状态、本机审批和可回退的 CLI 路径。
+
+## 项目价值
+
+很多 AI 编程工作并不一定要坐在电脑前才能发起：想到一个改动、需要看一眼 diff、想让 Codex 继续排查失败测试、临时审批一个高风险命令，手机聊天入口已经足够。`wecode` 的价值是把这些碎片化时刻接到本机开发环境里，而不是再做一个脱离仓库上下文的聊天机器人。
+
+它的核心取向是“个人、本机、可控”：
+
+- **把手机变成开发入口**：微信或飞书负责输入和通知，Codex 仍在你的机器、你的仓库、你的配置里运行。
+- **保留真实项目上下文**：同一聊天会话续接同一个 Codex `thread_id`，避免每条消息都变成孤立任务。
+- **适合长任务和异步工作**：可以在路上发起实现、回到电脑前查看改动，也可以用 `:report`、`:diff`、`:review` 跟进进展。
+- **默认安全边界清晰**：默认 sandbox 是 `workspace-write`，自定义高风险命令可要求微信审批，本地状态目录可检查。
+- **工程上可维护**：OpenClaw 管通信，`wecode` 管本地配置和命令转换，Codex 管代码理解和执行；每层职责明确，出了问题容易定位。
+- **不绑定单一路径**：优先使用 Codex app-server remote API，managed remote 不可用时可走 stdio app-server，再必要时回退 `codex exec`。
+
+## 适合场景
+
+- 个人开发者希望在微信或飞书里调度本机 Codex，而不是维护一套公开 Bot 服务。
+- 已经习惯 Codex CLI，希望远程发起任务但仍复用本机 session、配置、sandbox 和仓库权限。
+- 经常需要在手机上查看项目状态、diff、模型配置、最近 session 或审批命令。
+- 需要一个可审计、可回退、容易调试的私人工具，而不是多租户平台或通用 SDK。
 
 ## 它解决什么问题
 
@@ -70,12 +96,12 @@ fallback: codex exec / codex exec resume / codex exec review
 
 ## 优势
 
-- 不锁死在一个聊天窗口：微信只是入口，真正上下文仍在 Codex 本机 session 中。
-- 可恢复：同一个聊天会话会继续同一个 Codex `thread_id`，不会每条消息都变成新任务。
-- 可审计：本地审批文件存放在 `openclaw.stateDir/approvals`，高风险命令不会静默执行。
-- 可控：默认 sandbox 是 `workspace-write`，不默认开启危险全权限。
-- 可迁移：OpenClaw、Codex、微信通道都是独立组件；默认优先使用 Codex app-server remote API，失败时可回退 `codex exec`。
-- 不污染全局环境：OpenClaw 默认安装在 `~/.wecode` 下，使用独立 profile 和端口。
+- **不是普通聊天 Bot**：微信或飞书只是入口，真正的上下文仍在 Codex 本机 session 和当前项目目录里。
+- **不是一次性 prompt 转发器**：OpenClaw 保存 Codex 返回的 `thread_id`，后续消息会自动续接同一条 Codex 会话。
+- **不是全权限远程执行器**：默认 sandbox 是 `workspace-write`，高风险自定义命令可以走微信审批。
+- **不是侵入式平台**：OpenClaw 默认安装在 `~/.wecode` 下，使用独立 profile、端口和状态目录，不污染全局 OpenClaw 配置。
+- **不是绑定单一实验接口**：默认优先使用 Codex app-server remote API，失败时可回退 `codex exec`，降低上游协议变化带来的风险。
+- **不是只能靠猜日志排障**：`wecode` 提供 `doctor`、`--dry-run`、prompt-flow 日志、Gateway smoke test 和覆盖主要行为的集成测试。
 
 ## 快速开始
 
@@ -229,7 +255,7 @@ $XDG_CONFIG_HOME/wecode/config.json
 
 `codex.transport` 控制 wecode 如何调用 Codex。默认 `"remote"` 会先通过 `codex remote-control start --json` + `codex app-server proxy` 使用 managed remote；如果本机 Codex 不是 standalone 安装，或者 managed proxy 不可用，会改用 `codex.remote.fallbackProxyCommand`，默认是 `codex app-server --listen stdio://`。只有两条 remote 路径都失败时，`"remote"` 才自动回退 `codex exec`；`"remote-strict"` 不会回退 exec，但仍会尝试这个 stdio app-server 兼容路径；`"exec"` 会强制使用旧的 `codex exec --json` 路径。
 
-`wecode codex-backend --jsonl` 会输出 OpenClaw 可识别的 JSONL。remote 模式会把 app-server turn 结果转换成兼容 JSONL；exec fallback 模式会实时转发 `codex exec --json` 的 stdout/stderr，避免因为 Wecode 缓存输出导致 OpenClaw watchdog 超时。
+`wecode codex-backend --jsonl` 会输出 OpenClaw 可识别的 JSONL。remote 模式会把 app-server turn 结果转换成兼容 JSONL，并在 app-server 返回 assistant/message JSON 外壳时提取内部文本，避免微信侧看到二次包装的响应 JSON；exec fallback 模式会实时转发 `codex exec --json` 的 stdout/stderr，避免因为 Wecode 缓存输出导致 OpenClaw watchdog 超时。
 
 要切换 Codex 处理的项目，只设置 `codex.cwd`，或在聊天里发送 `:cd <项目目录>`：
 

@@ -807,7 +807,10 @@ fn run_codex_prompt(
                 flow_run_id,
             )? {
                 if !*jsonl {
-                    println!("{}", remote_result.final_message.trim());
+                    println!(
+                        "{}",
+                        optimized_assistant_response_text(&remote_result.final_message).trim()
+                    );
                 }
                 return Ok(());
             }
@@ -938,19 +941,59 @@ fn emit_remote_backend_jsonl(
     result: &wecode::codex_remote::CodexRemoteRunResult,
 ) -> Result<(), String> {
     let thread = serde_json::json!({ "thread_id": result.thread_id });
+    let text = optimized_assistant_response_text(&result.final_message);
     let assistant_message = serde_json::json!({
         "type": "message",
         "role": "assistant",
         "content": [
             {
                 "type": "output_text",
-                "text": result.final_message
+                "text": text
             }
         ]
     });
     println!("{thread}");
     println!("{assistant_message}");
     Ok(())
+}
+
+fn optimized_assistant_response_text(message: &str) -> String {
+    unwrap_assistant_message_json(message).unwrap_or_else(|| message.to_string())
+}
+
+fn unwrap_assistant_message_json(message: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(message.trim()).ok()?;
+    let object = value.as_object()?;
+    let is_message = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == "message");
+    let is_assistant = object
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|role| role == "assistant");
+    if !is_message || !is_assistant {
+        return None;
+    }
+
+    match object.get("content")? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(items) => {
+            let mut text = String::new();
+            for item in items {
+                let Some(part) = item.get("text").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                text.push_str(part);
+            }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        _ => None,
+    }
 }
 
 fn run_backend_prompt(
