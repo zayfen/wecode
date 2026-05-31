@@ -188,6 +188,26 @@ fn backend_input_recognizes_control_commands() {
 }
 
 #[test]
+fn backend_input_recognizes_metadata_wrapped_control_command() {
+    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let input = r#"Conversation info (untrusted metadata):
+```json
+{
+  "chat_id": "o9cq805CIQyEJ1pliCh0GGdeTy98@im.wechat",
+  "message_id": "openclaw-weixin:1780220368799-642cfab6",
+  "timestamp": "Sun 2026-05-31 17:39:28 GMT+8"
+}
+```
+
+:help"#;
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, input).expect("metadata wrapped help"),
+        BackendInput::Help
+    ));
+}
+
+#[test]
 fn backend_input_recognizes_decorated_openclaw_control_command() {
     let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
     let input = r#"Conversation info (untrusted metadata):

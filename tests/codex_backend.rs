@@ -1400,6 +1400,48 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
 }
 
 #[test]
+fn metadata_wrapped_help_does_not_invoke_codex() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let input = r#"Conversation info (untrusted metadata):
+```json
+{
+  "chat_id": "o9cq805CIQyEJ1pliCh0GGdeTy98@im.wechat",
+  "message_id": "openclaw-weixin:1780220368799-642cfab6",
+  "timestamp": "Sun 2026-05-31 17:39:28 GMT+8"
+}
+```
+
+:help"#;
+
+    write_fake_codex(&codex_path, &calls_path);
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args(["codex-backend", "--jsonl", input])
+        .env("PATH", path)
+        .output()
+        .expect("run metadata wrapped help");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("# Wecode 帮助"), "stdout:\n{stdout}");
+    assert!(stdout.contains("不会请求 Codex"), "stdout:\n{stdout}");
+    assert!(
+        !calls_path.exists(),
+        "metadata wrapped help must not invoke codex"
+    );
+}
+
+#[test]
 fn cd_persists_project_directory_and_next_codex_run_starts_fresh_there() {
     let temp = tempfile::tempdir().expect("temp dir");
     let old_project = temp.path().join("old-project");

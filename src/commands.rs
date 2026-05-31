@@ -238,7 +238,7 @@ fn command_input_candidate(input: &str) -> Option<&str> {
     if colon_command_body(trimmed).is_some() {
         return Some(trimmed);
     }
-    decorated_openclaw_command_input(trimmed)
+    decorated_openclaw_command_input(trimmed).or_else(|| metadata_wrapped_command_input(trimmed))
 }
 
 fn decorated_openclaw_command_input(input: &str) -> Option<&str> {
@@ -259,6 +259,19 @@ fn decorated_openclaw_command_input(input: &str) -> Option<&str> {
     let message_start =
         message_section_start + sender_line_start + sender_line.find(": ")? + ": ".len();
     let message = input[message_start..].trim();
+    colon_command_body(message).map(|_| message)
+}
+
+fn metadata_wrapped_command_input(input: &str) -> Option<&str> {
+    let rest = input.strip_prefix("Conversation info (untrusted metadata):")?;
+    let rest = rest.trim_start();
+    if !rest.starts_with("```") {
+        return None;
+    }
+    let body_start = rest.find('\n')? + 1;
+    let body = &rest[body_start..];
+    let closing_fence = body.find("\n```")?;
+    let message = body[closing_fence + "\n```".len()..].trim();
     colon_command_body(message).map(|_| message)
 }
 
