@@ -1965,9 +1965,25 @@ fn weixin_status_message(
         .map(|path| path.display().to_string())
         .unwrap_or_else(|err| format!("unavailable ({err})"));
     let current_session = resume_session_id.unwrap_or_else(|| "(none)".to_string());
-    let pending = fs::read_dir(approvals_dir(config))
-        .map(|entries| entries.filter_map(Result::ok).count())
+    let custom_pending = fs::read_dir(approvals_dir(config))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_file())
+                .count()
+        })
         .unwrap_or(0);
+    let native_pending = fs::read_dir(native_approval::native_approvals_dir(config))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+                .filter(|path| !path.to_string_lossy().ends_with(".decision.json"))
+                .count()
+        })
+        .unwrap_or(0);
+    let pending = custom_pending + native_pending;
     let model = effective_codex_model(config, selected_model)
         .ok()
         .flatten()
