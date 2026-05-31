@@ -16,6 +16,7 @@
 - Not supported in this implementation: bridging `codex exec --json` fallback approvals. The exec transport does not expose the interactive app-server server-request JSON-RPC path currently used by Wecode.
 - Exec fallback must invoke `codex exec --yolo --json ...` and `codex exec resume --yolo --json ...` so fallback turns run with Codex's YOLO approval mode instead of hanging on an interactive approval request.
 - Existing custom command approvals (`requireConfirm: true`) must keep working. Native approvals must not start a second Codex run when approved.
+- `:yes <id>` and `:no <id>` are supported aliases for `:approve <id>` and `:deny <id>`.
 - Native approval files live under `openclaw.stateDir/approvals/native/` to avoid changing the old custom approval record format.
 - Native approval timeout defaults to 10 minutes and is capped below OpenClaw's CLI no-output watchdog so the backend auto-denies before OpenClaw kills the process.
 - Approval messages are plain Markdown text. Remote-turn approval prompts are emitted as OpenClaw JSONL assistant-message items so WeChat/Feishu can display them while the process keeps waiting.

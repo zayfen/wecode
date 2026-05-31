@@ -62,6 +62,7 @@ fn codex_backend_builds_codex_exec_command_spec() {
         spec.args,
         vec![
             "exec",
+            "--yolo",
             "--json",
             "-o",
             "/tmp/wecode-output.txt",
