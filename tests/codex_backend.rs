@@ -87,6 +87,7 @@ fn codex_backend_streams_jsonl_before_codex_exits() {
     let temp = tempfile::tempdir().expect("temp dir");
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
 
     fs::write(
         &codex_path,
@@ -101,6 +102,7 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
         ),
     )
     .expect("write fake codex");
+    fs::write(&config_path, r#"{"codex":{"transport":"exec"}}"#).expect("write config");
     let mut permissions = fs::metadata(&codex_path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&codex_path, permissions).expect("chmod fake codex");
@@ -111,7 +113,13 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
         env::var("PATH").unwrap_or_default()
     );
     let mut child = Command::new(env!("CARGO_BIN_EXE_wecode"))
-        .args(["codex-backend", "--jsonl", "hello"])
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "hello",
+        ])
         .env("PATH", path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -143,6 +151,278 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
 
     let status = child.wait().expect("wait wecode");
     assert!(status.success(), "status: {:?}", status.code());
+}
+
+#[test]
+fn codex_backend_remote_transport_runs_turn_over_app_server_proxy() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let proxy_path = temp.path().join("codex-remote-proxy");
+    let calls_path = temp.path().join("remote-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    let project_dir = temp.path().join("project");
+    fs::create_dir(&project_dir).expect("project dir");
+    write_fake_remote_proxy(&proxy_path, &calls_path, "remote-thread", "remote ok");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{
+                "cwd": "{}",
+                "transport": "remote-strict",
+                "remote": {{
+                  "autoStart": false,
+                  "proxyCommand": "{}"
+                }}
+              }}
+            }}"#,
+            state_dir.display(),
+            project_dir.display(),
+            proxy_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "hello remote",
+        ])
+        .output()
+        .expect("run remote backend");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""thread_id":"remote-thread""#),
+        "{stdout}"
+    );
+    assert!(stdout.contains("remote ok"), "{stdout}");
+    let calls = fs::read_to_string(calls_path).expect("remote calls");
+    assert!(calls.contains(r#""method":"initialize""#), "{calls}");
+    assert!(calls.contains(r#""method":"thread/start""#), "{calls}");
+    assert!(calls.contains(r#""method":"turn/start""#), "{calls}");
+    assert!(calls.contains("hello remote"), "{calls}");
+    assert!(
+        calls.contains(&project_dir.display().to_string()),
+        "{calls}"
+    );
+}
+
+#[test]
+fn codex_backend_remote_transport_resumes_existing_thread() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let proxy_path = temp.path().join("codex-remote-proxy");
+    let calls_path = temp.path().join("remote-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    write_fake_remote_proxy(&proxy_path, &calls_path, "existing-thread", "resumed ok");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{
+                "transport": "remote-strict",
+                "remote": {{
+                  "autoStart": false,
+                  "proxyCommand": "{}"
+                }}
+              }}
+            }}"#,
+            state_dir.display(),
+            proxy_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "--resume",
+            "existing-thread",
+            "continue remote",
+        ])
+        .output()
+        .expect("run remote resume");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""thread_id":"existing-thread""#),
+        "{stdout}"
+    );
+    assert!(stdout.contains("resumed ok"), "{stdout}");
+    let calls = fs::read_to_string(calls_path).expect("remote calls");
+    assert!(calls.contains(r#""method":"thread/resume""#), "{calls}");
+    assert!(!calls.contains(r#""method":"thread/start""#), "{calls}");
+    assert!(calls.contains("continue remote"), "{calls}");
+}
+
+#[test]
+fn codex_backend_remote_transport_falls_back_to_exec_when_proxy_fails() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+
+    write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{
+                "transport": "remote",
+                "remote": {{
+                  "autoStart": false,
+                  "proxyCommand": "{}"
+                }}
+              }}
+            }}"#,
+            state_dir.display(),
+            temp.path().join("missing-proxy").display()
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "fallback please",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run fallback backend");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""thread_id":"fake-thread""#), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("falling back to codex exec"), "{stderr}");
+    let calls = fs::read_to_string(calls_path).expect("codex calls");
+    assert!(calls.contains("exec --json"), "{calls}");
+}
+
+#[test]
+fn codex_backend_remote_transport_uses_stdio_app_server_when_managed_proxy_unavailable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = temp.path().join("codex");
+    let codex_calls_path = temp.path().join("codex-calls.txt");
+    let start_path = temp.path().join("remote-start");
+    let start_calls_path = temp.path().join("remote-start-calls.txt");
+    let stdio_app_server_path = temp.path().join("stdio-app-server");
+    let remote_calls_path = temp.path().join("remote-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+
+    write_fake_codex_with_stdio_app_server(&codex_path, &codex_calls_path, &stdio_app_server_path);
+    write_failing_remote_start(&start_path, &start_calls_path);
+    write_fake_remote_proxy(
+        &stdio_app_server_path,
+        &remote_calls_path,
+        "stdio-thread",
+        "stdio ok",
+    );
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw": {{"stateDir": "{}"}},
+              "codex": {{
+                "transport": "remote-strict",
+                "remote": {{
+                  "autoStart": true,
+                  "startCommand": "{}"
+                }}
+              }}
+            }}"#,
+            state_dir.display(),
+            start_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "hello stdio",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run remote fallback backend");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""thread_id":"stdio-thread""#), "{stdout}");
+    assert!(stdout.contains("stdio ok"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("falling back to codex exec"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !fs::read_to_string(&codex_calls_path)
+            .unwrap_or_default()
+            .contains("exec --json"),
+        "remote-strict compatibility fallback must not invoke codex exec"
+    );
+    let start_calls = fs::read_to_string(start_calls_path).expect("start calls");
+    assert!(start_calls.contains("start attempted"), "{start_calls}");
+    let codex_calls = fs::read_to_string(codex_calls_path).expect("codex calls");
+    assert!(codex_calls.contains("app-server proxy"), "{codex_calls}");
+    assert!(
+        codex_calls.contains("app-server --listen stdio://"),
+        "{codex_calls}"
+    );
+    let remote_calls = fs::read_to_string(remote_calls_path).expect("remote calls");
+    assert!(
+        remote_calls.contains(r#""method":"initialize""#),
+        "{remote_calls}"
+    );
+    assert!(remote_calls.contains("hello stdio"), "{remote_calls}");
 }
 
 #[test]
@@ -1550,6 +1830,105 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
     let mut permissions = fs::metadata(codex_path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(codex_path, permissions).expect("chmod fake codex");
+}
+
+fn write_fake_codex_with_stdio_app_server(
+    codex_path: &std::path::Path,
+    calls_path: &std::path::Path,
+    stdio_app_server_path: &std::path::Path,
+) {
+    fs::write(
+        codex_path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {calls}
+case "$*" in
+  "app-server --listen stdio://"*)
+    exec {stdio_app_server}
+    ;;
+  "app-server proxy"*)
+    echo 'managed proxy unavailable' >&2
+    exit 1
+    ;;
+  "exec "*)
+    echo '{{"thread_id":"unexpected-exec-thread"}}'
+    echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"unexpected exec"}}]}}'
+    exit 0
+    ;;
+  *)
+    echo "unexpected codex command: $*" >&2
+    exit 1
+    ;;
+esac
+"#,
+            calls = shell_quote(calls_path.to_str().expect("utf-8 path")),
+            stdio_app_server = shell_quote(stdio_app_server_path.to_str().expect("utf-8 path"))
+        ),
+    )
+    .expect("write fake codex");
+    let mut permissions = fs::metadata(codex_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(codex_path, permissions).expect("chmod fake codex");
+}
+
+fn write_fake_remote_proxy(
+    proxy_path: &std::path::Path,
+    calls_path: &std::path::Path,
+    thread_id: &str,
+    final_text: &str,
+) {
+    fs::write(
+        proxy_path,
+        format!(
+            r#"#!/bin/sh
+thread_id={thread_id}
+final_text={final_text}
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> {calls}
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"fake"}}}}\n' "$id"
+      ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"thread":{{"id":"%s"}},"cwd":"/tmp","model":"fake","modelProvider":"fake","approvalPolicy":"never","approvalsReviewer":"user","sandbox":{{"mode":"workspace-write"}}}}}}\n' "$id" "$thread_id"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"turn":{{"id":"turn-1","status":"inProgress","items":[]}}}}}}\n' "$id"
+      printf '{{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{{"threadId":"%s","turnId":"turn-1","itemId":"msg-1","delta":"%s"}}}}\n' "$thread_id" "$final_text"
+      printf '{{"jsonrpc":"2.0","method":"item/completed","params":{{"threadId":"%s","turnId":"turn-1","item":{{"type":"agentMessage","id":"msg-1","text":"%s","phase":"final_answer","memoryCitation":null}}}}}}\n' "$thread_id" "$final_text"
+      printf '{{"jsonrpc":"2.0","method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"turn-1","status":"completed","items":[],"itemsView":"notLoaded"}}}}}}\n' "$thread_id"
+      ;;
+  esac
+done
+"#,
+            calls = shell_quote(calls_path.to_str().expect("utf-8 calls path")),
+            thread_id = shell_quote(thread_id),
+            final_text = shell_quote(final_text)
+        ),
+    )
+    .expect("write fake remote proxy");
+    let mut permissions = fs::metadata(proxy_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(proxy_path, permissions).expect("chmod fake remote proxy");
+}
+
+fn write_failing_remote_start(start_path: &std::path::Path, calls_path: &std::path::Path) {
+    fs::write(
+        start_path,
+        format!(
+            r#"#!/bin/sh
+echo 'start attempted' >> {calls}
+echo 'Error: managed standalone Codex install not found at ~/.codex/packages/standalone/current/codex' >&2
+exit 1
+"#,
+            calls = shell_quote(calls_path.to_str().expect("utf-8 calls path")),
+        ),
+    )
+    .expect("write fake remote start");
+    let mut permissions = fs::metadata(start_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(start_path, permissions).expect("chmod fake remote start");
 }
 
 fn shell_quote(value: &str) -> String {

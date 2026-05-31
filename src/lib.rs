@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod cli;
+pub mod codex_remote;
 pub mod command_step;
 pub mod commands;
 pub mod config;
@@ -15,8 +16,9 @@ pub use commands::{
     render_command_input, BackendInput, PreparedBackendInput, RenderedCommand,
 };
 pub use config::{
-    codex_model_from_openclaw_model, default_config, read_config_str, CodexConfig, CustomCommand,
-    OpenclawConfig, PreventSleepMode, WecodeConfig, WECODE_CLI_BACKEND_ID,
+    codex_model_from_openclaw_model, default_config, read_config_str, CodexConfig,
+    CodexRemoteConfig, CodexTransport, CustomCommand, OpenclawConfig, PreventSleepMode,
+    WecodeConfig, WECODE_CLI_BACKEND_ID,
 };
 pub use diagnostics::{diagnose_tools, parse_node_version, ToolCheck, ToolReport, ToolSnapshot};
 pub use openclaw::{

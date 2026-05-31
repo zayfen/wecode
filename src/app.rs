@@ -10,11 +10,14 @@ use std::{
 use wecode::{
     backend::{AssistantBackend, BackendRunRequest, CodexBackend},
     bootstrap_plan_with_backend_command, codex_config_plan_with_backend_command,
-    codex_model_from_openclaw_model, default_config, diagnose_tools, list_all_codex_sessions,
-    openclaw_bin_path, parse_node_version, patch_gateway_launch_agent_prevent_sleep,
-    patch_openclaw_text_command_routing, prepare_backend_input_with_trace, read_config_str,
-    render_command_input, weixin_install_step, BackendInput, CliCommand, CommandStep,
-    PreparedBackendInput, ToolReport, ToolSnapshot, WecodeConfig,
+    codex_model_from_openclaw_model,
+    codex_remote::{run_codex_remote_turn, start_codex_remote_daemon, CodexRemoteRunRequest},
+    config::CodexTransport,
+    default_config, diagnose_tools, list_all_codex_sessions, openclaw_bin_path, parse_node_version,
+    patch_gateway_launch_agent_prevent_sleep, patch_openclaw_text_command_routing,
+    prepare_backend_input_with_trace, read_config_str, render_command_input, weixin_install_step,
+    BackendInput, CliCommand, CommandStep, PreparedBackendInput, ToolReport, ToolSnapshot,
+    WecodeConfig,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -77,6 +80,7 @@ pub fn run(command: CliCommand) -> Result<(), String> {
             let log_path = bootstrap_log_path(&config);
             run_steps_logged(&config, &steps, &log_path)?;
             patch_gateway_launch_agent_prevent_sleep(&config)?;
+            maybe_start_codex_remote_daemon(&config, None)?;
             print_bootstrap_success();
             Ok(())
         }
@@ -100,7 +104,8 @@ pub fn run(command: CliCommand) -> Result<(), String> {
                 &config,
                 &codex_config_plan_with_backend_command(&config, &backend_command),
             )?;
-            patch_gateway_launch_agent_prevent_sleep(&config)
+            patch_gateway_launch_agent_prevent_sleep(&config)?;
+            maybe_start_codex_remote_daemon(&config, None)
         }
         CliCommand::Codex {
             config_path,
@@ -793,6 +798,20 @@ fn run_codex_prompt(
             output_path
         }
         CodexRunMode::Backend { jsonl, .. } => {
+            if let Some(remote_result) = run_remote_backend_with_fallback(
+                config,
+                prompt,
+                resume_session_id,
+                model,
+                *jsonl,
+                flow_run_id,
+            )? {
+                if !*jsonl {
+                    println!("{}", remote_result.final_message.trim());
+                }
+                return Ok(());
+            }
+
             let mut output_path = codex_output_path();
             let mut result = run_codex_backend_attempt(
                 config,
@@ -851,6 +870,86 @@ fn run_codex_prompt(
         println!("{}", final_message.trim());
     }
     let _ = fs::remove_file(output_path);
+    Ok(())
+}
+
+fn run_remote_backend_with_fallback(
+    config: &WecodeConfig,
+    prompt: &str,
+    resume_session_id: Option<&str>,
+    selected_model: Option<&str>,
+    jsonl: bool,
+    flow_run_id: Option<&str>,
+) -> Result<Option<wecode::codex_remote::CodexRemoteRunResult>, String> {
+    if !jsonl || config.codex.transport == CodexTransport::Exec {
+        return Ok(None);
+    }
+
+    let effective_model = effective_codex_model(config, selected_model)?;
+    if let Some(run_id) = flow_run_id {
+        tracing::info!(
+            run_id = %run_id,
+            event = "codex_remote_dispatch",
+            prompt = ?prompt,
+            resume_session_id = ?resume_session_id,
+            selected_model = ?selected_model,
+            effective_model = ?effective_model.as_deref(),
+            "prompt_flow"
+        );
+    }
+
+    let request = CodexRemoteRunRequest {
+        config,
+        prompt,
+        selected_model: effective_model.as_deref(),
+        resume_session_id,
+    };
+    match run_codex_remote_turn(&request) {
+        Ok(result) => {
+            if let Some(run_id) = flow_run_id {
+                tracing::info!(
+                    run_id = %run_id,
+                    event = "codex_remote_turn_completed",
+                    thread_id = ?result.thread_id.as_str(),
+                    final_message_bytes = result.final_message.len(),
+                    "prompt_flow"
+                );
+            }
+            emit_remote_backend_jsonl(&result)?;
+            Ok(Some(result))
+        }
+        Err(err) if config.codex.transport == CodexTransport::Remote => {
+            if let Some(run_id) = flow_run_id {
+                tracing::info!(
+                    run_id = %run_id,
+                    event = "codex_remote_fallback_to_exec",
+                    error = ?err.as_str(),
+                    "prompt_flow"
+                );
+            }
+            eprintln!("codex remote failed: {err}; falling back to codex exec");
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn emit_remote_backend_jsonl(
+    result: &wecode::codex_remote::CodexRemoteRunResult,
+) -> Result<(), String> {
+    let thread = serde_json::json!({ "thread_id": result.thread_id });
+    let assistant_message = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": result.final_message
+            }
+        ]
+    });
+    println!("{thread}");
+    println!("{assistant_message}");
     Ok(())
 }
 
@@ -1713,6 +1812,7 @@ fn weixin_status_message(
         .ok()
         .flatten()
         .unwrap_or_else(|| "(Codex default)".to_string());
+    let transport = codex_transport_label(config.codex.transport);
     let git_status = run_git(config, &["status", "--short"])
         .map(|status| {
             if status.trim().is_empty() {
@@ -1723,15 +1823,24 @@ fn weixin_status_message(
         })
         .unwrap_or_else(|err| format!("unavailable ({err})"));
     format!(
-        "Wecode status:\nmodel: {}\nbackend model: {}\nsandbox: {}\ncwd: {}\ncurrent session: {}\npending approvals: {}\ngit: {}",
+        "Wecode status:\nmodel: {}\nbackend model: {}\ntransport: {}\nsandbox: {}\ncwd: {}\ncurrent session: {}\npending approvals: {}\ngit: {}",
         config.openclaw.model,
         model,
+        transport,
         config.codex.sandbox,
         target_cwd,
         current_session,
         pending,
         git_status
     )
+}
+
+fn codex_transport_label(transport: CodexTransport) -> &'static str {
+    match transport {
+        CodexTransport::Exec => "exec",
+        CodexTransport::Remote => "remote",
+        CodexTransport::RemoteStrict => "remote-strict",
+    }
 }
 
 fn codex_sessions_root() -> PathBuf {
@@ -2135,6 +2244,34 @@ fn print_steps(config: &WecodeConfig, steps: &[CommandStep]) {
             "{}",
             step_with_path_prepend(step, path_prepend).display_shell()
         );
+    }
+}
+
+fn maybe_start_codex_remote_daemon(
+    config: &WecodeConfig,
+    flow_run_id: Option<&str>,
+) -> Result<(), String> {
+    if config.codex.transport == CodexTransport::Exec || !config.codex.remote.auto_start {
+        return Ok(());
+    }
+    if let Some(run_id) = flow_run_id {
+        tracing::info!(
+            run_id = %run_id,
+            event = "codex_remote_daemon_start",
+            command = ?config.codex.remote.start_command.as_str(),
+            "prompt_flow"
+        );
+    }
+    match start_codex_remote_daemon(config) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if config.codex.transport == CodexTransport::Remote
+                || !config.codex.remote.fallback_proxy_command.trim().is_empty() =>
+        {
+            eprintln!("warning: {err}; will try Codex app-server fallback on demand");
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
 }
 

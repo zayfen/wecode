@@ -14,6 +14,13 @@
   },
   "codex": {
     "sandbox": "workspace-write",
+    "transport": "remote",
+    "remote": {
+      "autoStart": true,
+      "proxyCommand": "codex app-server proxy",
+      "startCommand": "codex remote-control start --json",
+      "fallbackProxyCommand": "codex app-server --listen stdio://"
+    },
     "cwd": ".",
     "model": null,
     "models": ["default", "gpt-5.4"]

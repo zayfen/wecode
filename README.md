@@ -43,7 +43,12 @@ OpenClaw agent runtime
 wecode codex-backend --jsonl --cwd <project_dir> [--model wecode-codex/<model>] [--resume <thread_id>]
   |
   v
-codex exec / codex exec resume / codex exec review
+Codex app-server remote API
+  |-- managed: codex remote-control daemon + codex app-server proxy
+  |-- compatible: codex app-server --listen stdio://
+  |
+  v
+fallback: codex exec / codex exec resume / codex exec review
   |
   v
 当前项目目录
@@ -52,7 +57,7 @@ codex exec / codex exec resume / codex exec review
 职责边界：
 
 - OpenClaw 管理微信/飞书登录、消息投递、Gateway、会话和 CLI session binding。
-- `wecode` 管理本地安装计划、配置、诊断、命令模板、审批队列、Codex session 扫描和 Codex CLI 调用。
+- `wecode` 管理本地安装计划、配置、诊断、命令模板、审批队列、Codex remote/exec 调用和 Codex session 扫描。
 - Codex CLI 管理模型调用、工具执行、代码修改、上下文和本机 session 文件。
 
 代码模块边界：
@@ -69,7 +74,7 @@ codex exec / codex exec resume / codex exec review
 - 可恢复：同一个聊天会话会继续同一个 Codex `thread_id`，不会每条消息都变成新任务。
 - 可审计：本地审批文件存放在 `openclaw.stateDir/approvals`，高风险命令不会静默执行。
 - 可控：默认 sandbox 是 `workspace-write`，不默认开启危险全权限。
-- 可迁移：OpenClaw、Codex、微信通道都是独立组件，后续可以把 `codex exec` 换成 `codex app-server` 或 remote-control。
+- 可迁移：OpenClaw、Codex、微信通道都是独立组件；默认优先使用 Codex app-server remote API，失败时可回退 `codex exec`。
 - 不污染全局环境：OpenClaw 默认安装在 `~/.wecode` 下，使用独立 profile 和端口。
 
 ## 快速开始
@@ -111,7 +116,7 @@ wecode codex-backend --jsonl --cwd /Users/riven/Github/wecode --model wecode-cod
 :model gpt-5.4
 ```
 
-`:model <model>` 会把模型保存到当前项目自己的状态文件中，不同项目互不影响。后续 `wecode` 调用 Codex 时会使用 Codex CLI 原生参数 `codex exec -m <model> -C <project_dir>`，同时把 Codex 子进程的工作目录切到该项目，确保 `workspace-write` 沙箱能写当前项目。
+`:model <model>` 会把模型保存到当前项目自己的状态文件中，不同项目互不影响。后续 `wecode` 调用 Codex 时会优先通过 Codex app-server remote API 设置模型和工作目录；如果 remote 不可用，会回退到 Codex CLI 原生参数 `codex exec -m <model> -C <project_dir>`。
 
 ## 常用本地命令
 
@@ -202,6 +207,13 @@ $XDG_CONFIG_HOME/wecode/config.json
   },
   "codex": {
     "sandbox": "workspace-write",
+    "transport": "remote",
+    "remote": {
+      "autoStart": true,
+      "proxyCommand": "codex app-server proxy",
+      "startCommand": "codex remote-control start --json",
+      "fallbackProxyCommand": "codex app-server --listen stdio://"
+    },
     "cwd": ".",
     "model": null,
     "models": ["default", "gpt-5.4"]
@@ -215,7 +227,9 @@ $XDG_CONFIG_HOME/wecode/config.json
 
 `openclaw.preventSleep` 控制 wecode 是否改写 OpenClaw Gateway 的 macOS LaunchAgent。默认值 `"ac"` 会把 Gateway 启动命令包装成 `/usr/bin/caffeinate -s ...`，只在外接电源时阻止系统睡眠，不阻止显示器息屏；设置为 `"off"` 会移除 wecode 添加的 `caffeinate` 包装。修改这个配置后运行 `wecode configure-codex` 或重新 `bootstrap`，LaunchAgent 才会被更新。
 
-`wecode codex-backend --jsonl` 会实时转发 `codex exec --json` 的 stdout/stderr；OpenClaw 可以边收到 Codex JSONL 边更新通道回复，也能避免因为 Wecode 缓存输出导致的无输出超时。
+`codex.transport` 控制 wecode 如何调用 Codex。默认 `"remote"` 会先通过 `codex remote-control start --json` + `codex app-server proxy` 使用 managed remote；如果本机 Codex 不是 standalone 安装，或者 managed proxy 不可用，会改用 `codex.remote.fallbackProxyCommand`，默认是 `codex app-server --listen stdio://`。只有两条 remote 路径都失败时，`"remote"` 才自动回退 `codex exec`；`"remote-strict"` 不会回退 exec，但仍会尝试这个 stdio app-server 兼容路径；`"exec"` 会强制使用旧的 `codex exec --json` 路径。
+
+`wecode codex-backend --jsonl` 会输出 OpenClaw 可识别的 JSONL。remote 模式会把 app-server turn 结果转换成兼容 JSONL；exec fallback 模式会实时转发 `codex exec --json` 的 stdout/stderr，避免因为 Wecode 缓存输出导致 OpenClaw watchdog 超时。
 
 要切换 Codex 处理的项目，只设置 `codex.cwd`，或在聊天里发送 `:cd <项目目录>`：
 
@@ -233,7 +247,7 @@ $XDG_CONFIG_HOME/wecode/config.json
 }
 ```
 
-这样 OpenClaw 的工作区保持固定，`wecode` 会把 `codex.cwd` 作为 `--cwd` 传给后端，并在调用 Codex 时使用 `codex exec -C <project_dir>`。`:resume` 不带参数时扫描 `~/.codex/sessions/**/rollout-*.jsonl`，选择最近的 Codex session 并返回 `thread_id`；带参数时直接绑定指定 session id。
+这样 OpenClaw 的工作区保持固定，`wecode` 会把 `codex.cwd` 作为 `--cwd` 传给后端，并在调用 Codex 时把它作为 remote thread/turn 的 `cwd`；exec fallback 时使用 `codex exec -C <project_dir>`。`:resume` 不带参数时扫描 `~/.codex/sessions/**/rollout-*.jsonl`，选择最近的 Codex session 并返回 `thread_id`；带参数时直接绑定指定 session id。
 
 `codex.models` 会生成 OpenClaw 的 `agents.defaults.models` 白名单。想在微信中使用更多 Codex 模型时，把模型名追加到这里，然后重新执行：
 
@@ -294,6 +308,9 @@ Deny: :deny appr-...
 - `backend_input_received`：OpenClaw 传给 Wecode 的原始输入。
 - `backend_input_prepared`：从飞书/微信包装消息中提取后的命令输入，以及 Wecode 识别出的本地命令或最终 prompt。
 - `codex_prompt_dispatch`：准备发送给 Codex 的 prompt、model、resume/fresh 决策。
+- `codex_remote_dispatch`：准备通过 Codex app-server remote API 启动或续接 thread。
+- `codex_remote_turn_completed`：remote turn 完成后的 thread id 和最终消息大小。
+- `codex_remote_fallback_to_exec`：remote 不可用并回退到 `codex exec` 的原因。
 - `codex_exec_command`：实际执行的 `codex exec` 参数和 working root。
 - `codex_exec_result`：Codex 进程退出状态和输出大小。
 
@@ -330,10 +347,9 @@ resumeVerified: true
 
 ## 当前限制
 
-- 当前后端基于 `codex exec`，不是 Codex TUI。
-- Codex 原生工具审批弹窗暂时不能直接变成微信按钮。
-- 现在的微信审批是 `wecode` 自己的确认队列，适合保护自定义高风险命令。
-- 后续更完整的方案是接入 `codex app-server` 或 `codex --remote <ADDR>`，让微信加入实时 Codex 会话并承接原生审批事件。
+- 当前后端优先使用 Codex app-server remote API，不启动 Codex TUI；standalone Codex 可走 managed remote，非 standalone Codex 会走 `codex app-server --listen stdio://` 兼容路径。`codex --remote <ADDR>` 仍是 TUI 连接 remote app-server 的入口。
+- remote API 仍是 Codex 实验接口；默认 `"remote"` 会自动回退 `codex exec`，需要强校验时使用 `"remote-strict"`。
+- Codex 原生工具审批请求在 remote v1 中会被协议级拒绝，避免后端进程悬挂；现在的微信审批仍是 `wecode` 自己的确认队列，适合保护自定义高风险命令。
 
 ## 项目结构
 
@@ -341,6 +357,7 @@ resumeVerified: true
 src/lib.rs                         模块出口和公共 API
 src/main.rs                        CLI 入口
 src/app.rs                         应用流程、Codex 调用、本地命令、审批队列
+src/codex_remote.rs                Codex app-server remote JSON-RPC 适配
 scripts/openclaw-agent-smoke.mjs   Gateway session 续接 smoke test
 examples/wecode.config.json        示例配置
 tests/bootstrap.rs                 OpenClaw setup plan 和私有 Gateway 配置
@@ -356,7 +373,8 @@ tests/resume_sessions.rs           Codex session 扫描和项目过滤
 
 这个版本优先选择可复现、可测试、可渐进升级的实现：
 
-- 用 `codex exec` 保持后端简单。
+- 保留 `codex exec` fallback 来对冲实验协议变化。
+- 优先走 Codex app-server remote API，让 wecode 能直接启动/续接 thread；managed remote 不可用时使用 stdio app-server，避免要求所有用户安装 standalone Codex。
 - 用 JSONL 与 OpenClaw 对接，方便 OpenClaw 提取 `thread_id`。
 - 用本机 Codex session 文件实现 `:resume` 最近 session 绑定。
 - 用 `openclaw.stateDir` 保存 `model` override 和待审批请求。

@@ -1,4 +1,4 @@
-use wecode::{default_config, read_config_str, PreventSleepMode};
+use wecode::{default_config, read_config_str, CodexTransport, PreventSleepMode};
 
 #[test]
 fn parses_config_with_custom_command() {
@@ -40,6 +40,17 @@ fn parses_config_with_custom_command() {
     assert_eq!(cfg.openclaw.prevent_sleep, PreventSleepMode::Ac);
     assert_eq!(cfg.openclaw.node_bin_dir, None);
     assert_eq!(cfg.codex.sandbox, "workspace-write");
+    assert_eq!(cfg.codex.transport, CodexTransport::Remote);
+    assert!(cfg.codex.remote.auto_start);
+    assert_eq!(cfg.codex.remote.proxy_command, "codex app-server proxy");
+    assert_eq!(
+        cfg.codex.remote.start_command,
+        "codex remote-control start --json"
+    );
+    assert_eq!(
+        cfg.codex.remote.fallback_proxy_command,
+        "codex app-server --listen stdio://"
+    );
     assert_eq!(cfg.commands[0].name, "review");
     assert_eq!(cfg.commands[0].prefix, ":review ");
     assert!(cfg.commands[0].require_confirm);
@@ -64,9 +75,53 @@ fn default_config_is_personal_codex_weixin_bridge() {
     assert_eq!(cfg.openclaw.prevent_sleep, PreventSleepMode::Ac);
     assert_eq!(cfg.openclaw.node_bin_dir, None);
     assert_eq!(cfg.codex.sandbox, "workspace-write");
+    assert_eq!(cfg.codex.transport, CodexTransport::Remote);
+    assert!(cfg.codex.remote.auto_start);
+    assert_eq!(cfg.codex.remote.proxy_command, "codex app-server proxy");
+    assert_eq!(
+        cfg.codex.remote.start_command,
+        "codex remote-control start --json"
+    );
+    assert_eq!(
+        cfg.codex.remote.fallback_proxy_command,
+        "codex app-server --listen stdio://"
+    );
     assert_eq!(cfg.codex.models, vec!["default", "gpt-5.4"]);
     assert_eq!(cfg.commands[0].name, "ask");
     assert_eq!(cfg.commands[0].prefix, ":codex ");
+}
+
+#[test]
+fn parses_codex_transport_modes_and_remote_commands() {
+    let cfg = read_config_str(
+        r#"{
+          "codex": {
+            "transport": "remote-strict",
+              "remote": {
+                "autoStart": false,
+                "proxyCommand": "codex app-server proxy --sock /tmp/codex.sock",
+                "startCommand": "codex app-server daemon start",
+                "fallbackProxyCommand": "codex app-server --listen stdio://"
+              }
+          }
+        }"#,
+    )
+    .expect("config should parse");
+
+    assert_eq!(cfg.codex.transport, CodexTransport::RemoteStrict);
+    assert!(!cfg.codex.remote.auto_start);
+    assert_eq!(
+        cfg.codex.remote.proxy_command,
+        "codex app-server proxy --sock /tmp/codex.sock"
+    );
+    assert_eq!(
+        cfg.codex.remote.start_command,
+        "codex app-server daemon start"
+    );
+    assert_eq!(
+        cfg.codex.remote.fallback_proxy_command,
+        "codex app-server --listen stdio://"
+    );
 }
 
 #[test]

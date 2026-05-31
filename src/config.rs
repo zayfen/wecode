@@ -59,12 +59,45 @@ pub enum PreventSleepMode {
 pub struct CodexConfig {
     #[serde(default = "default_codex_sandbox")]
     pub sandbox: String,
+    #[serde(default = "default_codex_transport")]
+    pub transport: CodexTransport,
+    #[serde(default)]
+    pub remote: CodexRemoteConfig,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default = "default_codex_models")]
     pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexTransport {
+    Exec,
+    Remote,
+    RemoteStrict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexRemoteConfig {
+    #[serde(default = "default_codex_remote_auto_start", rename = "autoStart")]
+    pub auto_start: bool,
+    #[serde(
+        default = "default_codex_remote_proxy_command",
+        rename = "proxyCommand"
+    )]
+    pub proxy_command: String,
+    #[serde(
+        default = "default_codex_remote_start_command",
+        rename = "startCommand"
+    )]
+    pub start_command: String,
+    #[serde(
+        default = "default_codex_remote_fallback_proxy_command",
+        rename = "fallbackProxyCommand"
+    )]
+    pub fallback_proxy_command: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,9 +144,22 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             sandbox: default_codex_sandbox(),
+            transport: default_codex_transport(),
+            remote: CodexRemoteConfig::default(),
             cwd: None,
             model: None,
             models: default_codex_models(),
+        }
+    }
+}
+
+impl Default for CodexRemoteConfig {
+    fn default() -> Self {
+        Self {
+            auto_start: default_codex_remote_auto_start(),
+            proxy_command: default_codex_remote_proxy_command(),
+            start_command: default_codex_remote_start_command(),
+            fallback_proxy_command: default_codex_remote_fallback_proxy_command(),
         }
     }
 }
@@ -160,6 +206,26 @@ fn default_openclaw_prevent_sleep() -> PreventSleepMode {
 
 fn default_codex_sandbox() -> String {
     "workspace-write".to_string()
+}
+
+fn default_codex_transport() -> CodexTransport {
+    CodexTransport::Remote
+}
+
+fn default_codex_remote_auto_start() -> bool {
+    true
+}
+
+fn default_codex_remote_proxy_command() -> String {
+    "codex app-server proxy".to_string()
+}
+
+fn default_codex_remote_start_command() -> String {
+    "codex remote-control start --json".to_string()
+}
+
+fn default_codex_remote_fallback_proxy_command() -> String {
+    "codex app-server --listen stdio://".to_string()
 }
 
 fn default_codex_models() -> Vec<String> {
