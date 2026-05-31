@@ -517,9 +517,17 @@ fn parse_control_command(input: &str) -> Result<Option<BackendInput>, String> {
         return parse_approval_id(rest, ":approve")
             .map(|approval_id| Some(BackendInput::Approve { approval_id }));
     }
+    if let Some(rest) = trimmed.strip_prefix(":yes ") {
+        return parse_approval_id(rest, ":yes")
+            .map(|approval_id| Some(BackendInput::Approve { approval_id }));
+    }
 
     if let Some(rest) = trimmed.strip_prefix(":deny ") {
         return parse_approval_id(rest, ":deny")
+            .map(|approval_id| Some(BackendInput::Deny { approval_id }));
+    }
+    if let Some(rest) = trimmed.strip_prefix(":no ") {
+        return parse_approval_id(rest, ":no")
             .map(|approval_id| Some(BackendInput::Deny { approval_id }));
     }
 

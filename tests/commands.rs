@@ -158,7 +158,15 @@ fn backend_input_recognizes_control_commands() {
         BackendInput::Approve { approval_id } if approval_id == "abc123"
     ));
     assert!(matches!(
+        prepare_backend_input(&cfg, ":yes abc123").expect("yes"),
+        BackendInput::Approve { approval_id } if approval_id == "abc123"
+    ));
+    assert!(matches!(
         prepare_backend_input(&cfg, ":deny abc123").expect("deny"),
+        BackendInput::Deny { approval_id } if approval_id == "abc123"
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":no abc123").expect("no"),
         BackendInput::Deny { approval_id } if approval_id == "abc123"
     ));
     assert!(matches!(

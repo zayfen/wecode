@@ -924,6 +924,17 @@ fn run_remote_backend_with_fallback(
             }
             emit_remote_assistant_message_jsonl(&text)
         }
+        CodexRemoteRunEvent::NativeApprovalRequested {
+            thread_id,
+            approval_id: _,
+            prompt,
+        } => {
+            if !thread_id_emitted {
+                emit_remote_thread_jsonl(&thread_id)?;
+                thread_id_emitted = true;
+            }
+            emit_remote_assistant_message_jsonl(&prompt)
+        }
     }) {
         Ok(result) => {
             if let Some(run_id) = flow_run_id {
@@ -1742,7 +1753,7 @@ fn emit_approval_request(
     write_pending_approval(config, &approval_id, &approval)?;
     emit_local_message(
         &format!(
-            "Command `{command_name}` requires approval.\nApprove: :approve {approval_id}\nDeny: :deny {approval_id}"
+            "Command `{command_name}` requires approval.\nApprove: :approve {approval_id} or :yes {approval_id}\nDeny: :deny {approval_id} or :no {approval_id}"
         ),
         jsonl,
     )
@@ -1891,8 +1902,8 @@ fn weixin_help_message(config: &WecodeConfig) -> String {
         "".to_string(),
         "## 审批命令".to_string(),
         "".to_string(),
-        "- `:approve <id>` - 批准并执行待确认命令".to_string(),
-        "- `:deny <id>` - 拒绝待确认命令".to_string(),
+        "- `:approve <id>` / `:yes <id>` - 批准并执行待确认命令".to_string(),
+        "- `:deny <id>` / `:no <id>` - 拒绝待确认命令".to_string(),
         "".to_string(),
         "## 模型命令".to_string(),
         "".to_string(),

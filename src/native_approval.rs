@@ -344,8 +344,10 @@ fn format_native_approval_prompt(
             lines.push(item.clone());
         }
     }
-    lines.push(format!("Approve: :approve {approval_id}"));
-    lines.push(format!("Deny: :deny {approval_id}"));
+    lines.push(format!(
+        "Approve: :approve {approval_id} or :yes {approval_id}"
+    ));
+    lines.push(format!("Deny: :deny {approval_id} or :no {approval_id}"));
     lines.join("\n")
 }
 
