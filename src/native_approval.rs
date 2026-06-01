@@ -175,7 +175,20 @@ pub fn wait_for_native_approval_decision(
     config: &WecodeConfig,
     record: &NativeApprovalRecord,
 ) -> Result<NativeApprovalDecision, String> {
+    wait_for_native_approval_decision_with_progress(config, record, || Ok(()))
+}
+
+pub fn wait_for_native_approval_decision_with_progress<F>(
+    config: &WecodeConfig,
+    record: &NativeApprovalRecord,
+    mut on_waiting: F,
+) -> Result<NativeApprovalDecision, String>
+where
+    F: FnMut() -> Result<(), String>,
+{
     let deadline = Instant::now() + effective_approval_timeout(config);
+    let progress_interval = approval_wait_progress_interval(config);
+    let mut next_progress = Instant::now() + progress_interval;
     let decision_path = native_decision_path(config, &record.approval_id);
     loop {
         if let Ok(input) = fs::read_to_string(&decision_path) {
@@ -192,6 +205,13 @@ pub fn wait_for_native_approval_decision(
         if Instant::now() >= deadline {
             cleanup_native_approval(config, &record.approval_id);
             return Ok(NativeApprovalDecision::Deny);
+        }
+        if Instant::now() >= next_progress {
+            if let Err(err) = on_waiting() {
+                cleanup_native_approval(config, &record.approval_id);
+                return Err(err);
+            }
+            next_progress = Instant::now() + progress_interval;
         }
         thread::sleep(Duration::from_millis(500));
     }
@@ -429,6 +449,12 @@ fn effective_approval_timeout(config: &WecodeConfig) -> Duration {
     } else {
         requested
     }
+}
+
+fn approval_wait_progress_interval(config: &WecodeConfig) -> Duration {
+    let timeout = effective_approval_timeout(config);
+    let millis = (timeout.as_millis() / 10).clamp(1_000, 60_000) as u64;
+    Duration::from_millis(millis)
 }
 
 fn compact_text(value: &str, max_chars: usize) -> String {

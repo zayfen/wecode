@@ -15,6 +15,8 @@ use crate::{
 };
 
 const CAFFEINATE_PATH: &str = "/usr/bin/caffeinate";
+pub const WECODE_WEIXIN_PLUGIN_NPM_SPEC: &str = "@tencent-weixin/openclaw-weixin@2.4.4";
+const WECODE_WEIXIN_CHANNEL_ID: &str = "openclaw-weixin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
@@ -98,7 +100,7 @@ pub fn openclaw_runtime_patch_step(config: &WecodeConfig, backend_command: &str)
 
 pub fn channel_install_steps(config: &WecodeConfig, channel: BootstrapChannel) -> Vec<CommandStep> {
     match channel {
-        BootstrapChannel::Weixin => vec![weixin_install_step(config)],
+        BootstrapChannel::Weixin => weixin_install_steps(config),
         BootstrapChannel::Feishu => feishu_install_steps(config),
     }
 }
@@ -189,20 +191,37 @@ fn strip_wecode_caffeinate_wrapper(args: &[String]) -> Vec<String> {
     }
 }
 
+pub fn weixin_install_steps(config: &WecodeConfig) -> Vec<CommandStep> {
+    let openclaw = openclaw_bin_path(config);
+    vec![
+        openclaw_step(
+            config,
+            &openclaw,
+            vec![
+                "plugins".to_string(),
+                "install".to_string(),
+                WECODE_WEIXIN_PLUGIN_NPM_SPEC.to_string(),
+                "--force".to_string(),
+            ],
+        ),
+        openclaw_step(
+            config,
+            &openclaw,
+            vec![
+                "channels".to_string(),
+                "login".to_string(),
+                "--channel".to_string(),
+                WECODE_WEIXIN_CHANNEL_ID.to_string(),
+            ],
+        ),
+    ]
+}
+
 pub fn weixin_install_step(config: &WecodeConfig) -> CommandStep {
-    let mut step = CommandStep::new(
-        "npx",
-        [
-            "-y",
-            "@tencent-weixin/openclaw-weixin-cli@latest",
-            "install",
-        ],
-    );
-    for path in openclaw_node_path_prepend(config) {
-        step = step.with_path_prepend(path);
-    }
-    step.with_path_prepend(openclaw_bin_dir(config))
-        .with_envs(openclaw_env(config))
+    weixin_install_steps(config)
+        .into_iter()
+        .next()
+        .expect("weixin install steps must include plugin install")
 }
 
 fn read_launch_agent_program_arguments(path: &Path) -> Result<Vec<String>, String> {
@@ -341,8 +360,94 @@ pub fn patch_openclaw_text_command_routing(runtime_dir: &Path) -> Result<(), Str
 
 pub fn patch_openclaw_runtime(runtime_dir: &Path, state_dir: &Path) -> Result<(), String> {
     patch_openclaw_text_command_routing(runtime_dir)?;
+    patch_cli_stdout_progress(runtime_dir)?;
     patch_weixin_runtime(state_dir)?;
     patch_feishu_runtime(state_dir)?;
+    Ok(())
+}
+
+fn patch_cli_stdout_progress(runtime_dir: &Path) -> Result<(), String> {
+    let dist_dir = runtime_dir
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    let candidates = openclaw_dist_candidates(&dist_dir, |name| {
+        name.starts_with("execute.runtime-") && name.ends_with(".js")
+    })?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    for path in candidates {
+        patch_cli_stdout_progress_file(&path)?;
+    }
+    Ok(())
+}
+
+fn patch_cli_stdout_progress_file(path: &Path) -> Result<(), String> {
+    const AGENT_EVENTS_IMPORT: &str =
+        r#"import { i as emitAgentEvent } from "./agent-events-BuYtWSh4.js";"#;
+    const DIAGNOSTIC_IMPORT: &str =
+        r#"import { a as emitTrustedDiagnosticEvent } from "./diagnostic-events-CNGydBWO.js";"#;
+    const ORIGINAL_STDOUT: &str = r#"onStdout: (chunk) => {
+						stdoutTail = appendCliOutputTail(stdoutTail, chunk);
+						if (!stdoutParseExceeded) {
+							const nextStdoutParse = appendCliOutputParseBuffer(stdoutParseBuffer, chunk);
+							stdoutParseBuffer = nextStdoutParse.buffer;
+							stdoutParseExceeded = nextStdoutParse.exceeded;
+						}
+						streamingParser?.push(chunk);
+					},"#;
+    const PATCHED_STDOUT: &str = r#"onStdout: (chunk) => {
+						emitTrustedDiagnosticEvent({
+							type: "run.progress",
+							runId: params.runId,
+							sessionId: params.sessionId,
+							...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+							reason: "cli:stdout"
+						});
+						stdoutTail = appendCliOutputTail(stdoutTail, chunk);
+						if (!stdoutParseExceeded) {
+							const nextStdoutParse = appendCliOutputParseBuffer(stdoutParseBuffer, chunk);
+							stdoutParseBuffer = nextStdoutParse.buffer;
+							stdoutParseExceeded = nextStdoutParse.exceeded;
+						}
+						streamingParser?.push(chunk);
+					},"#;
+
+    let source = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let mut patched = source.clone();
+    if !patched.contains(DIAGNOSTIC_IMPORT) {
+        if patched.contains(AGENT_EVENTS_IMPORT) {
+            patched = patched.replace(
+                AGENT_EVENTS_IMPORT,
+                &format!("{AGENT_EVENTS_IMPORT}\n{DIAGNOSTIC_IMPORT}"),
+            );
+        } else {
+            return Err(format!(
+                "unsupported OpenClaw CLI runtime format; agent event import not found in {}",
+                path.display()
+            ));
+        }
+    }
+    if !patched.contains(r#"reason: "cli:stdout""#) {
+        let original_stdout_spaces = ORIGINAL_STDOUT.replace('\t', "    ");
+        let patched_stdout_spaces = PATCHED_STDOUT.replace('\t', "    ");
+        if patched.contains(ORIGINAL_STDOUT) {
+            patched = patched.replace(ORIGINAL_STDOUT, PATCHED_STDOUT);
+        } else if patched.contains(&original_stdout_spaces) {
+            patched = patched.replace(&original_stdout_spaces, &patched_stdout_spaces);
+        } else {
+            return Err(format!(
+                "unsupported OpenClaw CLI runtime format; stdout handler not found in {}",
+                path.display()
+            ));
+        }
+    }
+    if patched != source {
+        fs::write(path, patched)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -435,6 +540,14 @@ fn patch_weixin_runtime(state_dir: &Path) -> Result<(), String> {
         patch_weixin_process_message(path)?;
     }
 
+    let files = files_named_under(state_dir, "monitor.js")?;
+    for path in files
+        .iter()
+        .filter(|path| path.to_string_lossy().contains("openclaw-weixin"))
+    {
+        patch_weixin_monitor(path)?;
+    }
+
     let files = files_named_under(state_dir, "lane-key.js")?;
     for path in files
         .iter()
@@ -448,20 +561,372 @@ fn patch_weixin_runtime(state_dir: &Path) -> Result<(), String> {
 fn patch_weixin_process_message(path: &Path) -> Result<(), String> {
     let source = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    if source.contains("disableBlockStreaming: false") {
-        return Ok(());
-    }
-    if !source.contains("disableBlockStreaming: true") {
+    let mut patched = source.clone();
+    if patched.contains("disableBlockStreaming: true") {
+        patched = patched.replace(
+            "disableBlockStreaming: true",
+            "disableBlockStreaming: false",
+        );
+    } else if !patched.contains("disableBlockStreaming: false") {
         return Err(format!(
             "unsupported Weixin process-message format; disableBlockStreaming flag not found in {}",
             path.display()
         ));
     }
-    let patched = source.replace(
-        "disableBlockStreaming: true",
-        "disableBlockStreaming: false",
-    );
-    fs::write(path, patched).map_err(|err| format!("failed to write {}: {err}", path.display()))
+    patched = patch_weixin_native_approval_control(&patched, path)?;
+    patched = patch_weixin_approval_partial_sender(&patched, path)?;
+    if patched != source {
+        fs::write(path, patched)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn patch_weixin_native_approval_control(source: &str, path: &Path) -> Result<String, String> {
+    let mut patched = source.to_string();
+    const PATH_IMPORT: &str = r#"import path from "node:path";"#;
+    const FS_IMPORT: &str = r#"import fs from "node:fs";"#;
+    if !patched.contains(FS_IMPORT) {
+        if patched.contains(PATH_IMPORT) {
+            patched = patched.replace(PATH_IMPORT, &format!("{FS_IMPORT}\n{PATH_IMPORT}"));
+        } else {
+            return Err(format!(
+                "unsupported Weixin process-message format; path import not found in {}",
+                path.display()
+            ));
+        }
+    }
+
+    if !patched.contains("function parseWecodeApprovalControlText") {
+        const HELPER_ANCHOR: &str =
+            r#"/** Extract text body from item_list (for slash command detection). */"#;
+        const HELPER: &str = r#"function parseWecodeApprovalControlText(text) {
+    const match = String(text ?? "").trim().match(/^(?::?(yes|approve|no|deny))(?:\s+([\w-]+))?$/i);
+    if (!match) return null;
+    const action = match[1].toLowerCase();
+    return {
+        decision: action === "yes" || action === "approve" ? "approve" : "deny",
+        approvalId: match[2],
+    };
+}
+function resolveWecodeOpenClawStateDir() {
+    const configured = process.env.OPENCLAW_STATE_DIR?.trim();
+    const stateDir = configured && configured.length > 0 ? configured : "~/.wecode/openclaw-state";
+    if (stateDir === "~") return process.env.HOME || ".";
+    if (stateDir.startsWith("~/")) return path.join(process.env.HOME || ".", stateDir.slice(2));
+    return path.resolve(stateDir);
+}
+function wecodeNativeApprovalsDir() {
+    return path.join(resolveWecodeOpenClawStateDir(), "approvals", "native");
+}
+function readWecodeNativeApproval(approvalId) {
+    const approvalPath = path.join(wecodeNativeApprovalsDir(), `${approvalId}.json`);
+    try {
+        const record = JSON.parse(fs.readFileSync(approvalPath, "utf8"));
+        const expiresAt = Number(record?.expires_at_millis ?? 0);
+        if (expiresAt > 0 && expiresAt < Date.now()) return null;
+        return { approvalId, approvalPath, record };
+    }
+    catch (err) {
+        if (err?.code !== "ENOENT") {
+            logger.warn(`wecode approval control read failed approvalId=${approvalId} err=${String(err)}`);
+        }
+        return null;
+    }
+}
+function listWecodePendingNativeApprovalIds() {
+    const dir = wecodeNativeApprovalsDir();
+    try {
+        return fs.readdirSync(dir, { withFileTypes: true })
+            .filter((entry) => entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".decision.json"))
+            .map((entry) => entry.name.slice(0, -".json".length))
+            .filter((approvalId) => Boolean(readWecodeNativeApproval(approvalId)))
+            .sort();
+    }
+    catch (err) {
+        if (err?.code !== "ENOENT") {
+            logger.warn(`wecode approval control list failed dir=${dir} err=${String(err)}`);
+        }
+        return [];
+    }
+}
+function resolveWecodeNativeApprovalId(requestedApprovalId) {
+    const approvalId = requestedApprovalId?.trim();
+    if (approvalId) {
+        return readWecodeNativeApproval(approvalId)
+            ? { status: "ok", approvalId }
+            : { status: "not_found", approvalId };
+    }
+    const ids = listWecodePendingNativeApprovalIds();
+    if (ids.length === 1) return { status: "ok", approvalId: ids[0] };
+    if (ids.length === 0) return { status: "none" };
+    return { status: "multiple", ids };
+}
+async function sendWecodeApprovalControlMessage(params, text) {
+    try {
+        await sendMessageWeixin({
+            to: params.to,
+            text,
+            opts: {
+                baseUrl: params.baseUrl,
+                token: params.token,
+                contextToken: params.contextToken,
+                runId: params.runId,
+            },
+        });
+    }
+    catch (err) {
+        logger.error(`wecode approval control ack failed err=${String(err)}`);
+    }
+}
+async function handleWecodeNativeApprovalControl(params) {
+    const approval = parseWecodeApprovalControlText(params.text);
+    if (!approval) return false;
+    const resolved = resolveWecodeNativeApprovalId(approval.approvalId);
+    if (resolved.status === "none") return false;
+    if (resolved.status === "not_found") {
+        await sendWecodeApprovalControlMessage(params, `Approval ${resolved.approvalId} was not found.`);
+        return true;
+    }
+    if (resolved.status === "multiple") {
+        await sendWecodeApprovalControlMessage(params, `Multiple pending approvals: ${resolved.ids.join(", ")}. Reply :yes <id> or :no <id>.`);
+        return true;
+    }
+    const approvalId = resolved.approvalId;
+    const decisionPath = path.join(wecodeNativeApprovalsDir(), `${approvalId}.decision.json`);
+    try {
+        fs.mkdirSync(wecodeNativeApprovalsDir(), { recursive: true });
+        fs.writeFileSync(decisionPath, JSON.stringify({
+            approval_id: approvalId,
+            decision: approval.decision,
+            decided_at_millis: Date.now(),
+        }, null, 2));
+        logger.info(`wecode approval control wrote decision approvalId=${approvalId} decision=${approval.decision}`);
+    }
+    catch (err) {
+        logger.error(`wecode approval control write failed approvalId=${approvalId} err=${String(err)}`);
+        await sendWecodeApprovalControlMessage(params, `Failed to update Codex approval ${approvalId}: ${String(err)}`);
+        return true;
+    }
+    const action = approval.decision === "approve" ? "Approved" : "Denied";
+    await sendWecodeApprovalControlMessage(params, `${action} Codex approval ${approvalId}. Codex will continue in the original turn.`);
+    return true;
+}
+
+"#;
+        if patched.contains(HELPER_ANCHOR) {
+            patched = patched.replace(HELPER_ANCHOR, &format!("{HELPER}{HELPER_ANCHOR}"));
+        } else if patched.contains("function extractTextBody") {
+            patched = patched.replace(
+                "function extractTextBody",
+                &format!("{HELPER}function extractTextBody"),
+            );
+        } else {
+            return Err(format!(
+                "unsupported Weixin process-message format; text body helper anchor not found in {}",
+                path.display()
+            ));
+        }
+    }
+
+    const CONTEXT_TOKEN_BLOCK: &str = r#"    const contextToken = getContextTokenFromMsgContext(ctx);
+    if (contextToken) {
+        setContextToken(deps.accountId, full.from_user_id ?? "", contextToken);
+    }"#;
+    const CONTEXT_TOKEN_BLOCK_WITH_APPROVAL: &str = r#"    const contextToken = getContextTokenFromMsgContext(ctx);
+    if (contextToken) {
+        setContextToken(deps.accountId, full.from_user_id ?? "", contextToken);
+    }
+    if (await handleWecodeNativeApprovalControl({
+        text: finalized.Body ?? textBody,
+        to: ctx.To,
+        contextToken,
+        baseUrl: deps.baseUrl,
+        token: deps.token,
+        runId: randomUUID(),
+    })) {
+        return;
+    }"#;
+    if !patched.contains("if (await handleWecodeNativeApprovalControl({") {
+        if patched.contains(CONTEXT_TOKEN_BLOCK) {
+            patched = patched.replace(CONTEXT_TOKEN_BLOCK, CONTEXT_TOKEN_BLOCK_WITH_APPROVAL);
+        } else {
+            return Err(format!(
+                "unsupported Weixin process-message format; context token block not found in {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(patched)
+}
+
+fn patch_weixin_approval_partial_sender(source: &str, path: &Path) -> Result<String, String> {
+    if source.contains("sendWecodeApprovalPromptFromReplyPayload") {
+        return Ok(source.to_string());
+    }
+    const ORIGINAL: &str = r#"...(replyProgressSender?.replyOptions ?? {}),
+                    disableBlockStreaming: false,"#;
+    const OLD_PATCHED: &str = r#"...(replyProgressSender?.replyOptions ?? {}),
+                    onPartialReply: (() => {
+                        const sentApprovalIds = new Set();
+                        return async (payload) => {
+                            const text = String(payload?.text ?? "");
+                            if (!text.includes("Codex requests permission") || !text.includes("Approval: appr-")) return;
+                            const match = text.match(/Approval:\s*(appr-[\w-]+)/);
+                            const approvalId = match?.[1];
+                            if (!approvalId || sentApprovalIds.has(approvalId)) return;
+                            sentApprovalIds.add(approvalId);
+                            await sendMessageWeixin({
+                                to: ctx.To,
+                                text,
+                                opts: { baseUrl: deps.baseUrl, token: deps.token, contextToken, runId },
+                            });
+                        };
+                    })(),
+                    disableBlockStreaming: false,"#;
+    const PATCHED: &str = r#"...(replyProgressSender?.replyOptions ?? {}),
+                    ...(() => {
+                        const wecodeBaseReplyOptions = {
+                            ...replyOptions,
+                            ...(replyProgressSender?.replyOptions ?? {}),
+                        };
+                        const wecodeSentApprovalIds = new Set();
+                        const sendWecodeApprovalPromptFromReplyPayload = async (payload) => {
+                            const text = String(payload?.text ?? "");
+                            if (!text.includes("Codex requests permission") || !text.includes("Approval: appr-")) return;
+                            const match = text.match(/Approval:\s*(appr-[\w-]+)/);
+                            const approvalId = match?.[1];
+                            if (!approvalId || wecodeSentApprovalIds.has(approvalId)) return;
+                            wecodeSentApprovalIds.add(approvalId);
+                            logger.info(`wecode approval prompt detected approvalId=${approvalId} textLen=${text.length}`);
+                            try {
+                                await sendMessageWeixin({
+                                    to: ctx.To,
+                                    text,
+                                    opts: { baseUrl: deps.baseUrl, token: deps.token, contextToken, runId },
+                                });
+                                logger.info(`wecode approval prompt sent approvalId=${approvalId}`);
+                            }
+                            catch (err) {
+                                wecodeSentApprovalIds.delete(approvalId);
+                                logger.error(`wecode approval prompt send failed approvalId=${approvalId} err=${String(err)}`);
+                            }
+                        };
+                        const callWecodePreviousReplyOption = async (name, payload, context) => {
+                            const previous = wecodeBaseReplyOptions?.[name];
+                            if (typeof previous !== "function") return;
+                            try {
+                                await previous(payload, context);
+                            }
+                            catch (err) {
+                                logger.warn(`wecode approval prompt previous ${name} failed err=${String(err)}`);
+                            }
+                        };
+                        return {
+                            onPartialReply: async (payload) => {
+                                await callWecodePreviousReplyOption("onPartialReply", payload);
+                                await sendWecodeApprovalPromptFromReplyPayload(payload);
+                            },
+                            onBlockReplyQueued: async (payload, context) => {
+                                await callWecodePreviousReplyOption("onBlockReplyQueued", payload, context);
+                                await sendWecodeApprovalPromptFromReplyPayload(payload);
+                            },
+                        };
+                    })(),
+                    disableBlockStreaming: false,"#;
+    if source.contains(ORIGINAL) {
+        return Ok(source.replace(ORIGINAL, PATCHED));
+    }
+    if source.contains(OLD_PATCHED) {
+        return Ok(source.replace(OLD_PATCHED, PATCHED));
+    }
+    Err(format!(
+        "unsupported Weixin process-message format; replyOptions block not found in {}",
+        path.display()
+    ))
+}
+
+fn patch_weixin_monitor(path: &Path) -> Result<(), String> {
+    const PROCESS_IMPORT: &str =
+        r#"import { processOneMessage } from "../messaging/process-message.js";"#;
+    const PATCHED_IMPORTS: &str = r#"import { getWeixinLaneKey } from "../messaging/lane-key.js";
+import { processOneMessage } from "../messaging/process-message.js";
+import { createLaneScheduler } from "./lane-scheduler.js";"#;
+    const CONFIG_MANAGER: &str =
+        r#"    const configManager = new WeixinConfigManager({ baseUrl, token }, log);"#;
+    const PATCHED_CONFIG_MANAGER: &str = r#"    const configManager = new WeixinConfigManager({ baseUrl, token }, log);
+    const wecodeLaneScheduler = createLaneScheduler();"#;
+    const ORIGINAL_PROCESS: &str = r#"                const fromUserId = full.from_user_id ?? "";
+                const cachedConfig = await configManager.getForUser(fromUserId, full.context_token);
+                await processOneMessage(full, {
+                    accountId,
+                    config,
+                    channelRuntime,
+                    baseUrl,
+                    cdnBaseUrl,
+                    token,
+                    typingTicket: cachedConfig.typingTicket,
+                    log: opts.runtime?.log ?? (() => { }),
+                    errLog,
+                });"#;
+    const PATCHED_PROCESS: &str = r#"                const laneKey = getWeixinLaneKey({ accountId, msg: full });
+                void wecodeLaneScheduler.enqueue(laneKey, async () => {
+                    const fromUserId = full.from_user_id ?? "";
+                    const cachedConfig = await configManager.getForUser(fromUserId, full.context_token);
+                    await processOneMessage(full, {
+                        accountId,
+                        config,
+                        channelRuntime,
+                        baseUrl,
+                        cdnBaseUrl,
+                        token,
+                        typingTicket: cachedConfig.typingTicket,
+                        log: opts.runtime?.log ?? (() => { }),
+                        errLog,
+                    });
+                }).catch((err) => {
+                    errLog(`weixin processOneMessage error lane=${laneKey}: ${String(err)}`);
+                    aLog.error(`processOneMessage lane=${laneKey} error: ${String(err)}, stack=${err?.stack ?? ""}`);
+                });"#;
+
+    let source = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let mut patched = source.clone();
+    if !patched.contains(r#"import { createLaneScheduler } from "./lane-scheduler.js";"#) {
+        if patched.contains(PROCESS_IMPORT) {
+            patched = patched.replace(PROCESS_IMPORT, PATCHED_IMPORTS);
+        } else {
+            return Err(format!(
+                "unsupported Weixin monitor format; processOneMessage import not found in {}",
+                path.display()
+            ));
+        }
+    }
+    if !patched.contains("const wecodeLaneScheduler = createLaneScheduler();") {
+        if patched.contains(CONFIG_MANAGER) {
+            patched = patched.replace(CONFIG_MANAGER, PATCHED_CONFIG_MANAGER);
+        } else {
+            return Err(format!(
+                "unsupported Weixin monitor format; config manager initialization not found in {}",
+                path.display()
+            ));
+        }
+    }
+    if !patched.contains("wecodeLaneScheduler.enqueue") {
+        if patched.contains(ORIGINAL_PROCESS) {
+            patched = patched.replace(ORIGINAL_PROCESS, PATCHED_PROCESS);
+        } else {
+            return Err(format!(
+                "unsupported Weixin monitor format; processOneMessage call not found in {}",
+                path.display()
+            ));
+        }
+    }
+    if patched != source {
+        fs::write(path, patched)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn patch_weixin_lane_key(path: &Path) -> Result<(), String> {

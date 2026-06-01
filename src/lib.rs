@@ -30,5 +30,6 @@ pub use openclaw::{
     openclaw_runtime_patch_step, patch_gateway_launch_agent_prevent_sleep,
     patch_gateway_launch_agent_prevent_sleep_at, patch_openclaw_runtime,
     patch_openclaw_text_command_routing, prevent_sleep_program_arguments, weixin_install_step,
+    weixin_install_steps, WECODE_WEIXIN_PLUGIN_NPM_SPEC,
 };
 pub use sessions::{list_all_codex_sessions, list_codex_sessions, CodexSessionSummary};

@@ -11,7 +11,7 @@ use crate::{
     config::{codex_model_from_openclaw_model, WecodeConfig},
     native_approval::{
         self, approval_response_for_decision, create_native_approval_record,
-        wait_for_native_approval_decision,
+        wait_for_native_approval_decision_with_progress,
     },
     paths::expand_tilde,
 };
@@ -34,6 +34,10 @@ pub enum CodexRemoteRunEvent {
         thread_id: String,
         approval_id: String,
         prompt: String,
+    },
+    NativeApprovalStillPending {
+        thread_id: String,
+        approval_id: String,
     },
 }
 
@@ -232,15 +236,22 @@ fn handle_native_approval_request(
         return client.decline_server_request(message);
     }
     let record = create_native_approval_record(config, message)?;
+    let thread_id = record
+        .thread_id
+        .clone()
+        .unwrap_or_else(|| fallback_thread_id.to_string());
+    let approval_id = record.approval_id.clone();
     event_handler(CodexRemoteRunEvent::NativeApprovalRequested {
-        thread_id: record
-            .thread_id
-            .clone()
-            .unwrap_or_else(|| fallback_thread_id.to_string()),
-        approval_id: record.approval_id.clone(),
+        thread_id: thread_id.clone(),
+        approval_id: approval_id.clone(),
         prompt: record.prompt.clone(),
     })?;
-    let decision = wait_for_native_approval_decision(config, &record)?;
+    let decision = wait_for_native_approval_decision_with_progress(config, &record, || {
+        event_handler(CodexRemoteRunEvent::NativeApprovalStillPending {
+            thread_id: thread_id.clone(),
+            approval_id: approval_id.clone(),
+        })
+    })?;
     let result =
         approval_response_for_decision(&record.request_method, &record.request_params, decision);
     client.respond_to_server_request(message, result)
@@ -540,7 +551,7 @@ fn shell_command(command: &str) -> Command {
         shell
     } else {
         let mut shell = Command::new("sh");
-        shell.arg("-lc").arg(command);
+        shell.arg("-c").arg(command);
         shell
     }
 }

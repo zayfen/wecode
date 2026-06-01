@@ -120,24 +120,41 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
             ]
         )
     ));
-    let weixin_install = steps
-        .iter()
-        .find(|step| step.program == "npx")
-        .expect("npx installer step");
-    assert_eq!(
-        weixin_install.args,
-        vec![
-            "-y",
-            "@tencent-weixin/openclaw-weixin-cli@latest",
-            "install"
-        ]
+    assert!(
+        common::has_openclaw_args(
+            &steps,
+            &[
+                "plugins",
+                "install",
+                "@tencent-weixin/openclaw-weixin@2.4.4",
+                "--force"
+            ]
+        ),
+        "weixin plugin must be pinned because runtime patches depend on plugin internals"
+    );
+    assert!(common::has_openclaw_args(
+        &steps,
+        &["channels", "login", "--channel", "openclaw-weixin"]
+    ));
+    assert!(
+        !steps.iter().any(|step| step.args.iter().any(|arg| {
+            arg == "@tencent-weixin/openclaw-weixin@latest"
+                || arg == "@tencent-weixin/openclaw-weixin-cli@latest"
+        })),
+        "weixin install plan must not rely on floating latest versions"
     );
     assert_eq!(
-        weixin_install.path_prepend,
-        vec!["~/.wecode/openclaw-runtime/node_modules/.bin"]
-    );
-    assert_eq!(
-        weixin_install.env,
+        steps
+            .iter()
+            .find(|step| step.args
+                == [
+                    "plugins",
+                    "install",
+                    "@tencent-weixin/openclaw-weixin@2.4.4",
+                    "--force",
+                ])
+            .expect("weixin plugin install step")
+            .env,
         vec![
             ("OPENCLAW_PROFILE".to_string(), "wecode".to_string()),
             (
@@ -210,12 +227,6 @@ if [ "$1" = "--version" ]; then
   echo 10.0.0
   exit 0
 fi
-echo "Weixin QR code stdout"
-echo "openclaw-weixin internal stdout"
-echo "OpenClaw mixed-case stdout"
-echo "Local login saved auth for openclaw-weixin/default"
-echo "Config: $OPENCLAW_CONFIG_PATH"
-echo "Weixin login stderr" >&2
 "#,
     );
     write_executable(
@@ -242,6 +253,20 @@ cat > "$prefix/node_modules/.bin/openclaw" <<'EOF'
 #!/bin/sh
 if [ "$1" = "--version" ]; then
   echo "OpenClaw 2026.5.27"
+  exit 0
+fi
+if [ "$1" = "plugins" ] && [ "$2" = "install" ] && [ "$3" = "@tencent-weixin/openclaw-weixin@2.4.4" ]; then
+  echo "OpenClaw noisy weixin plugin stdout"
+  echo "OpenClaw noisy weixin plugin stderr" >&2
+  exit 0
+fi
+if [ "$1" = "channels" ] && [ "$2" = "login" ] && [ "$3" = "--channel" ] && [ "$4" = "openclaw-weixin" ]; then
+  echo "Weixin QR code stdout"
+  echo "openclaw-weixin internal stdout"
+  echo "OpenClaw mixed-case stdout"
+  echo "Local login saved auth for openclaw-weixin/default"
+  echo "Config: $OPENCLAW_CONFIG_PATH"
+  echo "Weixin login stderr" >&2
   exit 0
 fi
 if [ "$1" = "gateway" ] && [ "$2" = "install" ]; then
@@ -381,6 +406,14 @@ echo "OpenClaw noisy npm stderr" >&2
     let log = fs::read_to_string(state_dir.join("bootstrap.log")).expect("bootstrap log");
     assert!(log.contains("OpenClaw noisy npm stdout"), "log:\n{log}");
     assert!(log.contains("OpenClaw noisy npm stderr"), "log:\n{log}");
+    assert!(
+        log.contains("OpenClaw noisy weixin plugin stdout"),
+        "log:\n{log}"
+    );
+    assert!(
+        log.contains("OpenClaw noisy weixin plugin stderr"),
+        "log:\n{log}"
+    );
     assert!(log.contains("OpenClaw noisy gateway stdout"), "log:\n{log}");
     assert!(log.contains("OpenClaw noisy gateway stderr"), "log:\n{log}");
     assert!(!log.contains("Weixin QR code stdout"), "log:\n{log}");
@@ -803,7 +836,23 @@ fn patch_openclaw_runtime_enables_weixin_block_streaming_for_approval_prompts() 
     let process_file = weixin_messaging.join("process-message.js");
     fs::write(
         &process_file,
-        r#"await deps.channelRuntime.reply.dispatchReplyFromConfig({
+        r#"import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { sendMessageWeixin } from "./send.js";
+/** Extract text body from item_list (for slash command detection). */
+function extractTextBody(itemList) {
+    return itemList?.[0]?.text_item?.text ?? "";
+}
+export async function processOneMessage(full, deps) {
+    const textBody = extractTextBody(full.item_list);
+    const ctx = weixinMessageToMsgContext(full, deps.accountId, {});
+    const finalized = deps.channelRuntime.reply.finalizeInboundContext(ctx);
+    const contextToken = getContextTokenFromMsgContext(ctx);
+    if (contextToken) {
+        setContextToken(deps.accountId, full.from_user_id ?? "", contextToken);
+    }
+    const runId = randomUUID();
+    await deps.channelRuntime.reply.dispatchReplyFromConfig({
                 ctx: finalized,
                 cfg: deps.config,
                 dispatcher,
@@ -813,6 +862,7 @@ fn patch_openclaw_runtime_enables_weixin_block_streaming_for_approval_prompts() 
                     disableBlockStreaming: true,
                 },
             });
+}
 "#,
     )
     .expect("process message file");
@@ -825,7 +875,266 @@ fn patch_openclaw_runtime_enables_weixin_block_streaming_for_approval_prompts() 
         patched.contains("disableBlockStreaming: false"),
         "weixin block streaming must be enabled so approval prompts are delivered before the Codex turn finishes:\n{patched}"
     );
+    assert!(
+        patched.contains("onPartialReply:")
+            && patched.contains("onBlockReplyQueued:")
+            && patched.contains("sendWecodeApprovalPromptFromReplyPayload")
+            && patched.contains("Codex requests permission")
+            && patched.contains("Approval: appr-")
+            && patched.contains("sendMessageWeixin"),
+        "weixin approval partials must be sent as ordinary Weixin text messages:\n{patched}"
+    );
     assert!(!patched.contains("disableBlockStreaming: true"));
+}
+
+#[test]
+fn patch_openclaw_runtime_handles_weixin_approval_replies_before_agent_queue() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_messaging = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("messaging");
+    fs::create_dir_all(&weixin_messaging).expect("weixin messaging dir");
+    let process_file = weixin_messaging.join("process-message.js");
+    fs::write(
+        &process_file,
+        r#"import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { sendMessageWeixin } from "./send.js";
+function extractTextBody(itemList) {
+    return itemList?.[0]?.text_item?.text ?? "";
+}
+export async function processOneMessage(full, deps) {
+    const textBody = extractTextBody(full.item_list);
+    const ctx = weixinMessageToMsgContext(full, deps.accountId, {});
+    const finalized = deps.channelRuntime.reply.finalizeInboundContext(ctx);
+    const contextToken = getContextTokenFromMsgContext(ctx);
+    if (contextToken) {
+        setContextToken(deps.accountId, full.from_user_id ?? "", contextToken);
+    }
+    const runId = randomUUID();
+    await deps.channelRuntime.reply.withReplyDispatcher({
+        dispatcher,
+        run: () => deps.channelRuntime.reply.dispatchReplyFromConfig({
+            ctx: finalized,
+            cfg: deps.config,
+            dispatcher,
+            replyOptions: {
+                    ...replyOptions,
+                    ...(replyProgressSender?.replyOptions ?? {}),
+                    disableBlockStreaming: true,
+            },
+        }),
+    });
+}
+"#,
+    )
+    .expect("process message file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&process_file).expect("patched process message");
+    assert!(
+        patched.contains(r#"import fs from "node:fs";"#),
+        "weixin approval control must be able to write decision files:\n{patched}"
+    );
+    assert!(
+        patched.contains("handleWecodeNativeApprovalControl")
+            && patched.contains("parseWecodeApprovalControlText")
+            && patched.contains(r#""approvals", "native""#),
+        "weixin approval control helper should be installed:\n{patched}"
+    );
+    assert!(
+        patched.contains("`${approvalId}.decision.json`")
+            && patched.contains(r#"decision: approval.decision"#)
+            && patched.contains(r#"await sendMessageWeixin({"#),
+        "weixin approval replies should write Codex native approval decisions and acknowledge in chat:\n{patched}"
+    );
+    let approval_index = patched
+        .find("if (await handleWecodeNativeApprovalControl({")
+        .expect("approval control branch");
+    let run_id_index = patched.find("const runId = randomUUID();").expect("run id");
+    let dispatch_index = patched
+        .find("dispatchReplyFromConfig")
+        .expect("agent dispatch");
+    assert!(
+        approval_index < run_id_index && approval_index < dispatch_index,
+        "weixin approval reply must return before entering the agent queue:\n{patched}"
+    );
+    assert_eq!(
+        patched
+            .matches("if (await handleWecodeNativeApprovalControl({")
+            .count(),
+        1,
+        "approval control branch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_marks_cli_stdout_as_progress() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let execute_file = runtime_dist.join("execute.runtime-test.js");
+    fs::write(
+        &execute_file,
+        r#"import { i as emitAgentEvent } from "./agent-events-BuYtWSh4.js";
+const managedRun = await supervisor.spawn({
+                    onStdout: (chunk) => {
+                        stdoutTail = appendCliOutputTail(stdoutTail, chunk);
+                        if (!stdoutParseExceeded) {
+                            const nextStdoutParse = appendCliOutputParseBuffer(stdoutParseBuffer, chunk);
+                            stdoutParseBuffer = nextStdoutParse.buffer;
+                            stdoutParseExceeded = nextStdoutParse.exceeded;
+                        }
+                        streamingParser?.push(chunk);
+                    },
+});
+"#,
+    )
+    .expect("execute runtime file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &temp.path().join("state"))
+        .expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &temp.path().join("state"))
+        .expect("patch runtime again");
+
+    let patched = fs::read_to_string(&execute_file).expect("patched execute runtime");
+    assert!(
+        patched.contains(
+            r#"import { a as emitTrustedDiagnosticEvent } from "./diagnostic-events-CNGydBWO.js";"#
+        ),
+        "CLI runtime should import OpenClaw diagnostic progress emitter:\n{patched}"
+    );
+    assert!(
+        patched.contains(r#"type: "run.progress""#) && patched.contains(r#"reason: "cli:stdout""#),
+        "CLI stdout must refresh OpenClaw diagnostic progress:\n{patched}"
+    );
+    assert_eq!(
+        patched.matches(r#"reason: "cli:stdout""#).count(),
+        1,
+        "stdout progress patch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_keeps_weixin_monitor_polling_during_long_turns() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_monitor = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("monitor");
+    fs::create_dir_all(&weixin_monitor).expect("weixin monitor dir");
+    let monitor_file = weixin_monitor.join("monitor.js");
+    fs::write(
+        &monitor_file,
+        r#"import { getUpdates } from "../api/api.js";
+import { processOneMessage } from "../messaging/process-message.js";
+export async function monitorWeixinProvider(opts) {
+    const { baseUrl, cdnBaseUrl, token, accountId, config, channelRuntime } = opts;
+    const log = opts.runtime?.log ?? (() => { });
+    const aLog = logger.withAccount(accountId);
+    const configManager = new WeixinConfigManager({ baseUrl, token }, log);
+    for (const full of list) {
+                const now = Date.now();
+                setStatus?.({ accountId, lastEventAt: now, lastInboundAt: now });
+                // allowFrom filtering is delegated to processOneMessage via the framework
+                // authorization pipeline (resolveSenderCommandAuthorizationWithRuntime).
+                const fromUserId = full.from_user_id ?? "";
+                const cachedConfig = await configManager.getForUser(fromUserId, full.context_token);
+                await processOneMessage(full, {
+                    accountId,
+                    config,
+                    channelRuntime,
+                    baseUrl,
+                    cdnBaseUrl,
+                    token,
+                    typingTicket: cachedConfig.typingTicket,
+                    log: opts.runtime?.log ?? (() => { }),
+                    errLog,
+                });
+    }
+}
+"#,
+    )
+    .expect("monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched monitor");
+    assert!(
+        patched.contains(r#"import { getWeixinLaneKey } from "../messaging/lane-key.js";"#)
+            && patched.contains(r#"import { createLaneScheduler } from "./lane-scheduler.js";"#),
+        "weixin monitor should import lane routing helpers:\n{patched}"
+    );
+    assert!(
+        patched.contains("const wecodeLaneScheduler = createLaneScheduler();")
+            && patched.contains("void wecodeLaneScheduler.enqueue(laneKey, async () =>")
+            && patched.contains("const laneKey = getWeixinLaneKey({ accountId, msg: full });"),
+        "weixin monitor should enqueue inbound work without blocking long-polling:\n{patched}"
+    );
+    assert!(
+        !patched.contains(
+            r#"                await processOneMessage(full, {
+                    accountId,"#
+        ),
+        "weixin monitor must not await long-running message handling in the poll loop:\n{patched}"
+    );
+    assert_eq!(
+        patched.matches("wecodeLaneScheduler.enqueue").count(),
+        1,
+        "weixin monitor polling patch should be idempotent:\n{patched}"
+    );
 }
 
 #[test]
@@ -1076,17 +1385,7 @@ fn bootstrap_plan_prepends_configured_node_bin_dir_to_node_based_steps() {
         .iter()
         .all(|step| step.path_prepend == vec!["~/node24/bin"]));
 
-    let weixin_install = steps
-        .iter()
-        .find(|step| step.program == "npx")
-        .expect("npx installer step");
-    assert_eq!(
-        weixin_install.path_prepend,
-        vec![
-            "~/node24/bin",
-            "~/.wecode/openclaw-runtime/node_modules/.bin"
-        ]
-    );
+    assert!(!steps.iter().any(|step| step.program == "npx"));
 }
 
 fn write_executable(path: &Path, contents: &str) {

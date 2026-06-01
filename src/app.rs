@@ -20,8 +20,8 @@ use wecode::{
     native_approval::{self, NativeApprovalDecision},
     openclaw_bin_path, parse_node_version, patch_gateway_launch_agent_prevent_sleep,
     patch_openclaw_runtime, prepare_backend_input_with_trace, read_config_str,
-    render_command_input, run_lock, weixin_install_step, BackendInput, CliCommand, CommandStep,
-    PreparedBackendInput, ToolReport, ToolSnapshot, WecodeConfig,
+    render_command_input, run_lock, weixin_install_steps, BackendInput, CliCommand, CommandStep,
+    PreparedBackendInput, ToolReport, ToolSnapshot, WecodeConfig, WECODE_WEIXIN_PLUGIN_NPM_SPEC,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -103,7 +103,7 @@ pub fn run(command: CliCommand) -> Result<(), String> {
             let (config, source) = load_config(None)?;
             eprintln!("using config: {source}");
             ensure_private_openclaw_dirs(&config)?;
-            run_steps(&config, &[weixin_install_step(&config)])
+            run_steps(&config, &weixin_install_steps(&config))
         }
         CliCommand::ConfigureCodex { config_path } => {
             let (config, source) = load_config(config_path)?;
@@ -531,12 +531,18 @@ fn is_feishu_plugin_install_step(step: &CommandStep) -> bool {
     step.args == ["plugins", "install", "@openclaw/feishu", "--force"]
 }
 
-fn is_weixin_install_step(step: &CommandStep) -> bool {
-    step.program == "npx"
-        && step
-            .args
-            .iter()
-            .any(|arg| arg.contains("openclaw-weixin-cli"))
+fn is_weixin_plugin_install_step(step: &CommandStep) -> bool {
+    step.args
+        == [
+            "plugins",
+            "install",
+            WECODE_WEIXIN_PLUGIN_NPM_SPEC,
+            "--force",
+        ]
+}
+
+fn is_weixin_login_step(step: &CommandStep) -> bool {
+    step.args == ["channels", "login", "--channel", "openclaw-weixin"]
 }
 
 fn is_feishu_login_step(step: &CommandStep) -> bool {
@@ -544,11 +550,11 @@ fn is_feishu_login_step(step: &CommandStep) -> bool {
 }
 
 fn is_visible_bootstrap_step(step: &CommandStep) -> bool {
-    is_weixin_install_step(step) || is_feishu_login_step(step)
+    is_weixin_login_step(step) || is_feishu_login_step(step)
 }
 
 fn visible_bootstrap_spinner_label(step: &CommandStep) -> Option<&'static str> {
-    if is_weixin_install_step(step) {
+    if is_weixin_login_step(step) {
         Some("Wecode 启动中 · 安装微信")
     } else {
         None
@@ -558,6 +564,8 @@ fn visible_bootstrap_spinner_label(step: &CommandStep) -> Option<&'static str> {
 fn logged_bootstrap_spinner_label(step: &CommandStep) -> Option<&'static str> {
     if is_openclaw_install_step(step) {
         Some("Wecode 启动中")
+    } else if is_weixin_plugin_install_step(step) {
+        Some("Wecode 启动中 · 安装微信")
     } else if is_feishu_plugin_install_step(step) {
         Some("Wecode 启动中 · 安装飞书")
     } else {
@@ -972,6 +980,26 @@ fn run_remote_backend_with_fallback(
             }
             Ok(())
         }
+        CodexRemoteRunEvent::NativeApprovalStillPending {
+            thread_id,
+            approval_id,
+        } => {
+            if !thread_id_emitted {
+                emit_remote_thread_jsonl(&thread_id)?;
+                thread_id_emitted = true;
+            }
+            emit_remote_approval_waiting_jsonl(&approval_id)?;
+            if let Some(run_id) = flow_run_id {
+                tracing::info!(
+                    run_id = %run_id,
+                    event = "codex_remote_native_approval_wait_keepalive",
+                    thread_id = ?thread_id.as_str(),
+                    approval_id = ?approval_id.as_str(),
+                    "prompt_flow"
+                );
+            }
+            Ok(())
+        }
     }) {
         Ok(result) => {
             if let Some(run_id) = flow_run_id {
@@ -1025,6 +1053,13 @@ fn emit_remote_assistant_message_jsonl(text: &str) -> Result<(), String> {
 fn emit_remote_assistant_delta_jsonl(delta: &str) -> Result<(), String> {
     let assistant_delta = openclaw_assistant_delta_jsonl_value(delta);
     emit_jsonl_value(&assistant_delta)
+}
+
+fn emit_remote_approval_waiting_jsonl(approval_id: &str) -> Result<(), String> {
+    emit_jsonl_value(&serde_json::json!({
+        "wecode_event": "approval_waiting",
+        "approval_id": approval_id
+    }))
 }
 
 fn openclaw_thread_jsonl_value(thread_id: &str) -> serde_json::Value {

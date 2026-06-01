@@ -954,6 +954,96 @@ fn codex_backend_remote_approval_streams_claude_delta_before_decision() {
 }
 
 #[test]
+fn codex_backend_remote_approval_emits_keepalive_while_waiting() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let proxy_path = temp.path().join("codex-remote-proxy");
+    let calls_path = temp.path().join("remote-calls.txt");
+    let state_dir = temp.path().join("state");
+    write_fake_remote_proxy_with_command_approval(&proxy_path, &calls_path, "approval-thread");
+    let config_path = temp.path().join("wecode.json");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw":{{"stateDir":{},"cliNoOutputTimeoutMs":900000}},
+              "codex":{{
+                "transport":"remote-strict",
+                "remote":{{
+                  "autoStart":false,
+                  "proxyCommand":{},
+                  "fallbackProxyCommand":"",
+                  "approvalTimeoutSeconds":30
+                }}
+              }}
+            }}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json"),
+            serde_json::to_string(&proxy_path.display().to_string()).expect("proxy json")
+        ),
+    )
+    .expect("write config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "please ask approval",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn backend");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut lines = Vec::new();
+        for _ in 0..3 {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => lines.push(line),
+                Err(err) => {
+                    let _ = tx.send(Err(err.to_string()));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Ok(lines));
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+    });
+
+    let _approval_file = wait_for_first_native_approval_file(&state_dir);
+    let lines = match rx.recv_timeout(Duration::from_millis(7000)) {
+        Ok(Ok(lines)) => lines,
+        Ok(Err(err)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("failed reading backend stdout: {err}");
+        }
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("expected approval keepalive JSONL before approval decision: {err}");
+        }
+    };
+
+    assert_eq!(lines.len(), 3, "stdout lines:\n{}", lines.join(""));
+    assert!(
+        lines[2].contains(r#""wecode_event":"approval_waiting""#),
+        "third stdout line should be an ignored keepalive event:\n{}",
+        lines[2]
+    );
+    assert!(
+        child.try_wait().expect("check child status").is_none(),
+        "approval keepalive should be emitted while the original turn is still waiting"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn codex_backend_remote_approval_times_out_with_decline() {
     let temp = tempfile::tempdir().expect("tempdir");
     let proxy_path = temp.path().join("codex-remote-proxy");

@@ -119,7 +119,7 @@ cargo run -- bootstrap --weixin
 cargo run -- bootstrap --feishu
 ```
 
-`bootstrap` 一定会安装私有 OpenClaw。这个命令会执行 OpenClaw 安装、Gateway 配置、Codex CLI 后端配置、通信通道安装/登录和 Gateway 安装。通道登录过程中可能会出现二维码或登录提示，需要按目标通道完成确认。
+`bootstrap` 一定会安装私有 OpenClaw。这个命令会执行 OpenClaw 安装、Gateway 配置、Codex CLI 后端配置、通信通道安装/登录和 Gateway 安装。微信通道会安装固定版本的 `@tencent-weixin/openclaw-weixin@2.4.4`，避免插件升级导致运行时补丁失效。通道登录过程中可能会出现二维码或登录提示，需要按目标通道完成确认。
 
 聊天里的 `wecode` 命令统一使用 `:` 前缀，例如 `:help`、`:status`、`:compact`。这样可以避开 OpenClaw 自己的 slash 命令路由，不需要补丁 OpenClaw，也不需要关闭 `commands.text`。当命令需要交给 Codex 原生处理时，`wecode` 只把开头的 `:` 转成 `/`，例如 `:compact keep decisions` 会作为 `/compact keep decisions` 发给 Codex。
 
@@ -379,7 +379,7 @@ resumeVerified: true
 - remote API 仍是 Codex 实验接口；默认 `"remote"` 会自动回退 `codex exec`，需要强校验时使用 `"remote-strict"`。
 - remote 模式会把 Codex app-server 原生审批请求转成微信/飞书可见的 `appr-...` 审批提示。只有一个待审批项时，回复 `yes` / `:yes` 批准，回复 `no` / `:no` 拒绝；多个待审批项时使用 `:yes appr-...` / `:no appr-...` 指定 id。这个能力只覆盖 remote/app-server transport；`codex exec` fallback 使用 `--yolo`，不做交互式审批桥接。
 - 如果你已经运行过旧版 `wecode configure-codex`，升级后重新运行一次 `wecode configure-codex`，让 OpenClaw backend 配置更新为 `serialize: false` 和 `jsonlDialect: "claude-stream-json"`。Wecode 会用自己的运行锁串行化 Codex turn，并允许审批回复在等待审批时进入；`jsonlDialect` 用来让审批提示在原 Codex turn 等待期间实时发送到微信/飞书。
-- 如果你使用旧版 bootstrap 出来的微信或飞书配置，升级后重新运行 `wecode bootstrap --weixin` 或 `wecode bootstrap --feishu`。新版会 patch OpenClaw 渠道运行时，让审批回复走控制旁路；微信还会启用 block streaming，避免权限提示被缓冲到 Codex turn 结束后才发送。飞书新版也会写入 `streaming: true`、`renderMode: "card"` 和 `blockStreaming: true`。
+- 如果你使用旧版 bootstrap 出来的微信或飞书配置，升级后重新运行 `wecode bootstrap --weixin` 或 `wecode bootstrap --feishu`。新版会 patch OpenClaw 渠道运行时，让审批回复走控制旁路；微信还会固定安装 `@tencent-weixin/openclaw-weixin@2.4.4`、启用 block streaming，并把 Codex 审批 partial 转成普通微信文本消息，避免权限提示被缓冲到 Codex turn 结束后才发送。飞书新版也会写入 `streaming: true`、`renderMode: "card"` 和 `blockStreaming: true`。
 
 ## 项目结构
 
