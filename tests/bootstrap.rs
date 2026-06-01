@@ -1325,6 +1325,110 @@ async function handleFeishuMessage(params) {
 }
 
 #[test]
+fn patch_openclaw_runtime_sends_feishu_approval_prompts_as_plain_messages() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let feishu_dist = state_dir
+        .join("npm")
+        .join("projects")
+        .join("feishu-project")
+        .join("node_modules")
+        .join("@openclaw")
+        .join("feishu")
+        .join("dist");
+    fs::create_dir_all(&feishu_dist).expect("feishu dist dir");
+    let monitor_file = feishu_dist.join("monitor.account-test.js");
+    fs::write(
+        &monitor_file,
+        r#"function getFeishuSequentialKey(params) {
+	const { accountId, event, botOpenId, botName } = params;
+	const baseKey = `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}`;
+	const text = parseFeishuMessageEvent(event, botOpenId, botName).content.trim();
+	if (isAbortRequestText(text)) return `${baseKey}:control`;
+	if (isBtwRequestText(text)) return `${baseKey}:btw`;
+	return baseKey;
+}
+function createFeishuReplyDispatcher(params) {
+	const { cfg, accountId, chatId } = params;
+	const account = { config: { blockStreaming: true } };
+	const prefixContext = {};
+	const replyOptions = {};
+	const streamingEnabled = true;
+	return {
+		replyOptions: {
+			...replyOptions,
+			onModelSelected: prefixContext.onModelSelected,
+			disableBlockStreaming: typeof account.config?.blockStreaming === "boolean" ? !account.config.blockStreaming : true,
+			onPartialReply: streamingEnabled ? (payload) => {
+				if (!payload.text) return;
+				const cleaned = stripReasoningTagsFromText(payload.text, {
+					mode: "strict",
+					trim: "both"
+				});
+				if (!cleaned) return;
+				queueStreamingUpdate(cleaned, {
+					dedupeWithLastPartial: true,
+					mode: "snapshot"
+				});
+			} : void 0,
+			onReasoningStream: undefined
+		}
+	};
+}
+async function handleFeishuMessage(params) {
+	const { cfg, accountId } = params;
+	const account = { accountId };
+	const ctx = { content: "yes", chatId: "oc_test" };
+	const dmIngress = { senderAccess: { effectiveAllowFrom: [] } };
+	const groupConfig = undefined;
+	const configAllowFrom = [];
+	const isGroup = false;
+	const commandAllowFrom = isGroup ? groupConfig?.allowFrom ?? configAllowFrom : dmIngress?.senderAccess.effectiveAllowFrom ?? configAllowFrom;
+	const feishuFrom = `feishu:${ctx.senderOpenId}`;
+	await dispatchToAgent({ commandAllowFrom, feishuFrom });
+}
+"#,
+    )
+    .expect("feishu monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
+    assert!(
+        patched.contains("sendWecodeApprovalPromptFromReplyPayload")
+            && patched.contains("Codex requests permission")
+            && patched.contains("Approval: appr-")
+            && patched.contains("sendMessageFeishu({"),
+        "feishu approval prompts should also be sent as ordinary text messages:\n{patched}"
+    );
+    assert!(
+        patched.contains("onPartialReply: async (payload) => {")
+            && patched.contains("onBlockReplyQueued: async (payload, context) => {"),
+        "feishu approval prompt sender should hook partial and block replies:\n{patched}"
+    );
+    assert_eq!(
+        patched
+            .matches("sendWecodeApprovalPromptFromReplyPayload")
+            .count(),
+        3,
+        "approval prompt sender should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
 fn prevent_sleep_wraps_gateway_launch_agent_arguments_on_ac_power() {
     let original = vec![
         "/Users/riven/.wecode/openclaw-state/service-env/ai.openclaw.wecode-env-wrapper.sh"

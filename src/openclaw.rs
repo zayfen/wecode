@@ -1011,6 +1011,7 @@ fn patch_feishu_monitor_account(path: &Path) -> Result<(), String> {
         ));
     };
     let patched = patch_feishu_native_approval_control(&patched, path)?;
+    let patched = patch_feishu_approval_partial_sender(&patched, path)?;
     if patched != source {
         fs::write(path, patched)
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
@@ -1179,6 +1180,100 @@ async function handleWecodeNativeApprovalControl(params) {
         );
     }
     Ok(patched)
+}
+
+fn patch_feishu_approval_partial_sender(source: &str, path: &Path) -> Result<String, String> {
+    if source.contains("sendWecodeApprovalPromptFromReplyPayload") {
+        return Ok(source.to_string());
+    }
+    if !source.contains("function createFeishuReplyDispatcher") {
+        return Ok(source.to_string());
+    }
+    const ORIGINAL: &str = r#"			onPartialReply: streamingEnabled ? (payload) => {
+				if (!payload.text) return;
+				const cleaned = stripReasoningTagsFromText(payload.text, {
+					mode: "strict",
+					trim: "both"
+				});
+				if (!cleaned) return;
+				queueStreamingUpdate(cleaned, {
+					dedupeWithLastPartial: true,
+					mode: "snapshot"
+				});
+			} : void 0,"#;
+    const PATCHED: &str = r#"			...(() => {
+				const wecodeFeishuBaseReplyOptions = {
+					...replyOptions,
+				};
+				const wecodeFeishuSentApprovalIds = new Set();
+				const sendWecodeApprovalPromptFromReplyPayload = async (payload) => {
+					const text = String(payload?.text ?? "");
+					if (!text.includes("Codex requests permission") || !text.includes("Approval: appr-")) return;
+					const match = text.match(/Approval:\s*(appr-[\w-]+)/);
+					const approvalId = match?.[1];
+					if (!approvalId || wecodeFeishuSentApprovalIds.has(approvalId)) return;
+					wecodeFeishuSentApprovalIds.add(approvalId);
+					params.runtime.log?.(`wecode feishu approval prompt detected approvalId=${approvalId} textLen=${text.length}`);
+					try {
+						await sendMessageFeishu({
+							cfg,
+							to: chatId,
+							text,
+							replyToMessageId: sendReplyToMessageId,
+							replyInThread: effectiveReplyInThread,
+							allowTopLevelReplyFallback,
+							accountId,
+						});
+						params.runtime.log?.(`wecode feishu approval prompt sent approvalId=${approvalId}`);
+					}
+					catch (err) {
+						wecodeFeishuSentApprovalIds.delete(approvalId);
+						params.runtime.error?.(`wecode feishu approval prompt send failed approvalId=${approvalId} err=${String(err)}`);
+					}
+				};
+				const callWecodeFeishuPreviousReplyOption = async (name, payload, context) => {
+					const previous = wecodeFeishuBaseReplyOptions?.[name];
+					if (typeof previous !== "function") return;
+					try {
+						await previous(payload, context);
+					}
+					catch (err) {
+						params.runtime.log?.(`wecode feishu approval prompt previous ${name} failed err=${String(err)}`);
+					}
+				};
+				return {
+					onPartialReply: async (payload) => {
+						await callWecodeFeishuPreviousReplyOption("onPartialReply", payload);
+						if (streamingEnabled) {
+							if (payload.text) {
+								const cleaned = stripReasoningTagsFromText(payload.text, {
+									mode: "strict",
+									trim: "both"
+								});
+								if (cleaned) {
+									queueStreamingUpdate(cleaned, {
+										dedupeWithLastPartial: true,
+										mode: "snapshot"
+									});
+								}
+							}
+						}
+						await sendWecodeApprovalPromptFromReplyPayload(payload);
+					},
+					onBlockReplyQueued: async (payload, context) => {
+						await callWecodeFeishuPreviousReplyOption("onBlockReplyQueued", payload, context);
+						await sendWecodeApprovalPromptFromReplyPayload(payload);
+					},
+				};
+			})(),"#;
+
+    if source.contains(ORIGINAL) {
+        return Ok(source.replace(ORIGINAL, PATCHED));
+    }
+    Err(format!(
+        "unsupported Feishu monitor.account format; replyOptions partial hook not found in {}",
+        path.display()
+    ))
 }
 
 fn ensure_wecode_approval_control_helper(source: &str, anchor: &str) -> Result<String, String> {
