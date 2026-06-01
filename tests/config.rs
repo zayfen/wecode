@@ -162,4 +162,15 @@ fn parses_openclaw_prevent_sleep_mode() {
     .expect("config should parse");
 
     assert_eq!(cfg.openclaw.prevent_sleep, PreventSleepMode::Off);
+
+    let cfg = read_config_str(
+        r#"{
+          "openclaw": {
+            "preventSleep": "always"
+          }
+        }"#,
+    )
+    .expect("config should parse");
+
+    assert_eq!(cfg.openclaw.prevent_sleep, PreventSleepMode::Always);
 }

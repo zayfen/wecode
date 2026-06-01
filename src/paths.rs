@@ -3,14 +3,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::platform;
+
 pub fn expand_tilde(value: &str) -> String {
     if value == "~" {
-        return env::var("HOME").unwrap_or_else(|_| value.to_string());
+        return platform::home_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| value.to_string());
     }
 
     if let Some(rest) = value.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(rest).display().to_string();
+        if let Some(home) = platform::home_dir() {
+            return home.join(rest).display().to_string();
         }
     }
 

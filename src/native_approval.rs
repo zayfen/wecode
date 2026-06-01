@@ -383,25 +383,40 @@ fn format_native_approval_prompt(
     summary: &[String],
 ) -> String {
     let title = match method {
-        "item/commandExecution/requestApproval" => "Codex requests permission to run a command.",
-        "item/fileChange/requestApproval" => "Codex requests permission to change files.",
-        "item/permissions/requestApproval" => "Codex requests additional permissions.",
-        _ => "Codex requests permission.",
+        "item/commandExecution/requestApproval" => "执行命令",
+        "item/fileChange/requestApproval" => "修改文件",
+        "item/permissions/requestApproval" => "额外权限",
+        _ => "权限请求",
     };
-    let mut lines = vec![title.to_string(), format!("Approval: {approval_id}")];
+    let mut lines = vec![
+        "# 权限审批".to_string(),
+        "".to_string(),
+        format!("**类型**: {title}"),
+        format!("**审批 ID**: `{approval_id}`"),
+    ];
     if let Some(command) = command {
-        lines.push(format!("Command: {}", compact_text(command, 500)));
+        lines.push(String::new());
+        lines.push("**执行命令**".to_string());
+        lines.push(markdown_code_block(&compact_text(command, 500), "bash"));
     }
     if let Some(cwd) = cwd {
-        lines.push(format!("CWD: {}", compact_text(cwd, 240)));
+        lines.push(String::new());
+        lines.push("**目录**".to_string());
+        lines.push(format!("`{}`", compact_text(cwd, 240)));
     }
-    for item in summary {
-        if !lines.iter().any(|line| line == item) {
-            lines.push(item.clone());
+    let details = summary
+        .iter()
+        .filter(|item| !item.starts_with("Command: ") && !item.starts_with("CWD: "))
+        .collect::<Vec<_>>();
+    if !details.is_empty() {
+        lines.push(String::new());
+        lines.push("**详情**".to_string());
+        for item in details {
+            lines.push(format!("- {item}"));
         }
     }
-    lines.push(format!("Approve: yes, :yes, or :yes {approval_id}"));
-    lines.push(format!("Deny: no, :no, or :no {approval_id}"));
+    lines.push(String::new());
+    lines.push("回复 `yes` 批准，回复 `no` 拒绝".to_string());
     lines.join("\n")
 }
 
@@ -466,6 +481,26 @@ fn compact_text(value: &str, max_chars: usize) -> String {
         output.push_str("...");
     }
     output
+}
+
+fn markdown_code_block(message: &str, language: &str) -> String {
+    let fence_len = longest_backtick_run(message).saturating_add(1).max(3);
+    let fence = "`".repeat(fence_len);
+    format!("{fence}{language}\n{message}\n{fence}")
+}
+
+fn longest_backtick_run(input: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for ch in input.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 fn create_approval_id() -> String {

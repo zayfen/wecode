@@ -12,6 +12,9 @@ pub enum CliCommand {
     ConfigValidate {
         path: Option<String>,
     },
+    RuntimeStatus {
+        config_path: Option<String>,
+    },
     Bootstrap {
         config_path: Option<String>,
         dry_run: bool,
@@ -64,6 +67,13 @@ where
         "install-weixin" => Ok(CliCommand::InstallWeixin),
         "patch-openclaw-runtime" => parse_patch_openclaw_runtime_command(&args[1..]),
         "config" => parse_config_command(&args[1..]),
+        "runtime-status" => {
+            let (config_path, rest) = parse_optional_config(&args[1..])?;
+            if !rest.is_empty() {
+                return Err(format!("unexpected runtime-status argument: {}", rest[0]));
+            }
+            Ok(CliCommand::RuntimeStatus { config_path })
+        }
         "bootstrap" => parse_bootstrap_command(&args[1..]),
         "configure-codex" => {
             let (config_path, rest) = parse_optional_config(&args[1..])?;

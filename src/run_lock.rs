@@ -2,13 +2,19 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
-use crate::{config::WecodeConfig, paths::expand_tilde};
+use crate::{config::WecodeConfig, paths::expand_tilde, platform};
 
 pub struct CodexRunLock {
     path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopCodexRunResult {
+    pub stopped: bool,
+    pub pid: Option<u32>,
+    pub lock_path: PathBuf,
 }
 
 impl Drop for CodexRunLock {
@@ -23,11 +29,11 @@ pub fn try_acquire_codex_run_lock(
     config: &WecodeConfig,
     key: &str,
 ) -> Result<CodexRunLock, String> {
-    let lock_dir = PathBuf::from(expand_tilde(&config.openclaw.state_dir)).join("locks");
+    let lock_dir = codex_run_lock_dir(config);
     if fs::create_dir_all(&lock_dir).is_err() {
         return Ok(CodexRunLock { path: None });
     }
-    let path = lock_dir.join(format!("codex-run-{}.lock", stable_key_hash(key)));
+    let path = codex_run_lock_path(config, key);
     let content = format!("pid={}\nkey={key}\n", std::process::id());
     match create_lock_file(&path) {
         Ok(mut file) => {
@@ -53,6 +59,42 @@ pub fn try_acquire_codex_run_lock(
         }
         Err(_) => Ok(CodexRunLock { path: None }),
     }
+}
+
+pub fn stop_codex_run(config: &WecodeConfig, key: &str) -> Result<StopCodexRunResult, String> {
+    let path = codex_run_lock_path(config, key);
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Ok(StopCodexRunResult {
+            stopped: false,
+            pid: None,
+            lock_path: path,
+        });
+    };
+    let pid = lock_pid(&content);
+    let stopped = if let Some(pid) = pid {
+        if process_is_alive(pid) {
+            terminate_process_tree(pid);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let _ = fs::remove_file(&path);
+    Ok(StopCodexRunResult {
+        stopped,
+        pid,
+        lock_path: path,
+    })
+}
+
+fn codex_run_lock_dir(config: &WecodeConfig) -> PathBuf {
+    PathBuf::from(expand_tilde(&config.openclaw.state_dir)).join("locks")
+}
+
+fn codex_run_lock_path(config: &WecodeConfig, key: &str) -> PathBuf {
+    codex_run_lock_dir(config).join(format!("codex-run-{}.lock", stable_key_hash(key)))
 }
 
 fn create_lock_file(path: &Path) -> io::Result<fs::File> {
@@ -88,16 +130,11 @@ fn lock_pid(content: &str) -> Option<u32> {
 }
 
 fn process_is_alive(pid: u32) -> bool {
-    if pid == std::process::id() {
-        return true;
-    }
-    Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(true)
+    platform::process_is_alive(pid)
+}
+
+fn terminate_process_tree(pid: u32) {
+    platform::kill_process_tree(pid);
 }
 
 fn stable_key_hash(value: &str) -> String {

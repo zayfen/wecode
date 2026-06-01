@@ -14,7 +14,10 @@ use crate::{
         wait_for_native_approval_decision_with_progress,
     },
     paths::expand_tilde,
+    yolo::project_yolo_enabled,
 };
+
+const NATIVE_APPROVAL_DENIED_MESSAGE: &str = "已拒绝权限请求。";
 
 pub struct CodexRemoteRunRequest<'a> {
     pub config: &'a WecodeConfig,
@@ -158,32 +161,33 @@ fn run_codex_remote_turn_with_proxy_command(
         })?
     };
 
-    let turn_params = json!({
-        "threadId": thread_id,
-        "input": [
-            {
-                "type": "text",
-                "text": request.prompt,
-                "text_elements": []
-            }
-        ],
-        "cwd": codex_target_cwd(request.config)?.display().to_string(),
-        "model": effective_codex_model(request.config, request.selected_model)?
-    });
+    let turn_params = turn_params(
+        request.config,
+        &thread_id,
+        request.prompt,
+        request.selected_model,
+    )?;
+    let mut native_approval_denied = false;
     let turn_response = client.request_with_unhandled_server_requests(
         "turn/start",
         turn_params,
         |client, message| {
-            handle_native_approval_request(
+            if handle_native_approval_request(
                 request.config,
                 client,
                 message,
                 &thread_id,
                 event_handler,
-            )
+            )? == Some(native_approval::NativeApprovalDecision::Deny)
+            {
+                native_approval_denied = true;
+            }
+            Ok(())
         },
     )?;
-    if let Some(message) = extract_final_message(turn_response.get("turn")) {
+    if let Some(message) =
+        final_message_from_turn(turn_response.get("turn"), native_approval_denied)
+    {
         return Ok(CodexRemoteRunResult {
             thread_id,
             final_message: message,
@@ -199,19 +203,24 @@ fn run_codex_remote_turn_with_proxy_command(
             if completed_thread.map_or(true, |id| id == thread_id) {
                 return Ok(CodexRemoteRunResult {
                     thread_id,
-                    final_message: extract_final_message(params.get("turn"))
-                        .or_else(|| turn_state.final_message())
-                        .unwrap_or_default(),
+                    final_message: final_message_from_turn_and_state(
+                        params.get("turn"),
+                        &turn_state,
+                        native_approval_denied,
+                    ),
                 });
             }
         } else if message.get("id").is_some() && message.get("method").is_some() {
-            handle_native_approval_request(
+            if handle_native_approval_request(
                 request.config,
                 &mut client,
                 &message,
                 &thread_id,
                 event_handler,
-            )?;
+            )? == Some(native_approval::NativeApprovalDecision::Deny)
+            {
+                native_approval_denied = true;
+            }
         } else {
             if let Some(agent_message) = turn_state.observe_notification(&message) {
                 event_handler(CodexRemoteRunEvent::AgentMessage {
@@ -230,10 +239,11 @@ fn handle_native_approval_request(
     message: &Value,
     fallback_thread_id: &str,
     event_handler: &mut impl FnMut(CodexRemoteRunEvent) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<Option<native_approval::NativeApprovalDecision>, String> {
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     if !native_approval::is_supported_approval_method(method) {
-        return client.decline_server_request(message);
+        client.decline_server_request(message)?;
+        return Ok(None);
     }
     let record = create_native_approval_record(config, message)?;
     let thread_id = record
@@ -241,6 +251,16 @@ fn handle_native_approval_request(
         .clone()
         .unwrap_or_else(|| fallback_thread_id.to_string());
     let approval_id = record.approval_id.clone();
+    if project_yolo_enabled(config)? {
+        native_approval::cleanup_native_approval(config, &approval_id);
+        let result = approval_response_for_decision(
+            &record.request_method,
+            &record.request_params,
+            native_approval::NativeApprovalDecision::Approve,
+        );
+        client.respond_to_server_request(message, result)?;
+        return Ok(Some(native_approval::NativeApprovalDecision::Approve));
+    }
     event_handler(CodexRemoteRunEvent::NativeApprovalRequested {
         thread_id: thread_id.clone(),
         approval_id: approval_id.clone(),
@@ -254,7 +274,8 @@ fn handle_native_approval_request(
     })?;
     let result =
         approval_response_for_decision(&record.request_method, &record.request_params, decision);
-    client.respond_to_server_request(message, result)
+    client.respond_to_server_request(message, result)?;
+    Ok(Some(decision))
 }
 
 fn remote_proxy_commands(config: &WecodeConfig) -> Vec<&str> {
@@ -341,6 +362,10 @@ impl RemoteTurnState {
                     .last()
                     .cloned()
             })
+    }
+
+    fn final_answer(&self) -> Option<String> {
+        self.last_final_message.clone()
     }
 }
 
@@ -479,13 +504,43 @@ fn thread_params(
     selected_model: Option<&str>,
     resume_session_id: Option<&str>,
 ) -> Result<Value, String> {
+    let yolo_enabled = project_yolo_enabled(config)?;
     let mut params = json!({
         "cwd": codex_target_cwd(config)?.display().to_string(),
         "model": effective_codex_model(config, selected_model)?,
-        "sandbox": config.codex.sandbox
+        "sandbox": if yolo_enabled { "danger-full-access" } else { config.codex.sandbox.as_str() }
     });
+    if yolo_enabled {
+        params["approvalPolicy"] = Value::String("never".to_string());
+    }
     if let Some(session_id) = resume_session_id {
         params["threadId"] = Value::String(session_id.to_string());
+    }
+    Ok(params)
+}
+
+fn turn_params(
+    config: &WecodeConfig,
+    thread_id: &str,
+    prompt: &str,
+    selected_model: Option<&str>,
+) -> Result<Value, String> {
+    let yolo_enabled = project_yolo_enabled(config)?;
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": [
+            {
+                "type": "text",
+                "text": prompt,
+                "text_elements": []
+            }
+        ],
+        "cwd": codex_target_cwd(config)?.display().to_string(),
+        "model": effective_codex_model(config, selected_model)?
+    });
+    if yolo_enabled {
+        params["approvalPolicy"] = Value::String("never".to_string());
+        params["sandboxPolicy"] = json!({ "type": "dangerFullAccess" });
     }
     Ok(params)
 }
@@ -513,6 +568,39 @@ fn extract_final_message(turn: Option<&Value>) -> Option<String> {
         }
     }
     last_final_message.or(last_agent_message)
+}
+
+fn final_message_from_turn(turn: Option<&Value>, native_approval_denied: bool) -> Option<String> {
+    extract_final_answer(turn)
+        .or_else(|| native_approval_denied.then(|| NATIVE_APPROVAL_DENIED_MESSAGE.to_string()))
+        .or_else(|| extract_final_message(turn))
+}
+
+fn final_message_from_turn_and_state(
+    turn: Option<&Value>,
+    state: &RemoteTurnState,
+    native_approval_denied: bool,
+) -> String {
+    extract_final_answer(turn)
+        .or_else(|| state.final_answer())
+        .or_else(|| native_approval_denied.then(|| NATIVE_APPROVAL_DENIED_MESSAGE.to_string()))
+        .or_else(|| extract_final_message(turn))
+        .or_else(|| state.final_message())
+        .unwrap_or_default()
+}
+
+fn extract_final_answer(turn: Option<&Value>) -> Option<String> {
+    let items = turn?.get("items")?.as_array()?;
+    for item in items.iter().rev() {
+        if item.get("type").and_then(Value::as_str) == Some("agentMessage")
+            && item.get("phase").and_then(Value::as_str) == Some("final_answer")
+        {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn effective_codex_model(

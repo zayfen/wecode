@@ -16,12 +16,14 @@ use wecode::{
         CodexRemoteRunRequest,
     },
     config::CodexTransport,
-    default_config, diagnose_tools, list_all_codex_sessions,
+    default_config, diagnose_tools, gateway_launch_agent_path, list_all_codex_sessions,
     native_approval::{self, NativeApprovalDecision},
     openclaw_bin_path, parse_node_version, patch_gateway_launch_agent_prevent_sleep,
     patch_openclaw_runtime, prepare_backend_input_with_trace, read_config_str,
-    render_command_input, run_lock, weixin_install_steps, BackendInput, CliCommand, CommandStep,
-    PreparedBackendInput, ToolReport, ToolSnapshot, WecodeConfig, WECODE_WEIXIN_PLUGIN_NPM_SPEC,
+    render_command_input, run_lock, weixin_install_steps,
+    yolo::{project_yolo_enabled, set_project_yolo_enabled, toggle_project_yolo_enabled},
+    BackendInput, CliCommand, CommandStep, PreparedBackendInput, PreventSleepMode, ToolReport,
+    ToolSnapshot, WecodeConfig, WECODE_WEIXIN_PLUGIN_NPM_SPEC,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -63,6 +65,11 @@ pub fn run(command: CliCommand) -> Result<(), String> {
                 config.codex.sandbox,
                 config.commands.len()
             );
+            Ok(())
+        }
+        CliCommand::RuntimeStatus { config_path } => {
+            let (config, source) = load_config(config_path)?;
+            print_runtime_status(&config, &source);
             Ok(())
         }
         CliCommand::Bootstrap {
@@ -182,15 +189,8 @@ pub fn run(command: CliCommand) -> Result<(), String> {
                     resume_session_id,
                     Some(&flow_run_id),
                 ),
-                BackendInput::Review { instructions } => run_codex_review(
-                    &config,
-                    instructions.as_deref(),
-                    model.as_deref(),
-                    jsonl,
-                    Some(&flow_run_id),
-                ),
                 BackendInput::Help => emit_local_markdown(&weixin_help_message(&config), jsonl),
-                BackendInput::Status => emit_local_message(
+                BackendInput::Status => emit_local_markdown(
                     &weixin_status_message(&config, resume_session_id, model.as_deref()),
                     jsonl,
                 ),
@@ -228,6 +228,23 @@ pub fn run(command: CliCommand) -> Result<(), String> {
                     Some(&flow_run_id),
                 ),
                 BackendInput::Deny { approval_id } => deny_approval(&config, approval_id, jsonl),
+                BackendInput::YoloToggle => {
+                    let enabled = toggle_project_yolo_enabled(&config)?;
+                    emit_local_markdown(&format_yolo_status(enabled), jsonl)
+                }
+                BackendInput::YoloSet { enabled } => {
+                    set_project_yolo_enabled(&config, enabled)?;
+                    emit_local_markdown(&format_yolo_status(enabled), jsonl)
+                }
+                BackendInput::Stop => {
+                    stop_codex_run_command(&config, resume_session_id.as_deref(), jsonl)
+                }
+                BackendInput::UndefinedCommand => {
+                    emit_local_markdown("未定义的命令！可以使用:help查看命令", jsonl)
+                }
+                BackendInput::ApprovalWaiting => {
+                    emit_local_markdown("等待权限审批：请输入 `yes` or `no`", jsonl)
+                }
             }
         }
         CliCommand::Render { config_path, input } => {
@@ -679,14 +696,6 @@ fn log_prepared_backend_input(run_id: &str, prepared: &PreparedBackendInput) {
             final_prompt = ?prompt.as_str(),
             "prompt_flow"
         ),
-        BackendInput::Review { instructions } => tracing::info!(
-            run_id = %run_id,
-            event = "backend_input_prepared",
-            command_input = ?prepared.command_input.as_str(),
-            backend_input_kind = "review",
-            instructions = ?instructions.as_deref(),
-            "prompt_flow"
-        ),
         BackendInput::Ls { path } => tracing::info!(
             run_id = %run_id,
             event = "backend_input_prepared",
@@ -776,7 +785,6 @@ fn log_prepared_backend_input(run_id: &str, prepared: &PreparedBackendInput) {
 fn backend_input_kind(input: &BackendInput) -> &'static str {
     match input {
         BackendInput::Prompt(_) => "prompt",
-        BackendInput::Review { .. } => "review",
         BackendInput::Help => "help",
         BackendInput::Status => "status",
         BackendInput::Diff => "diff",
@@ -792,6 +800,11 @@ fn backend_input_kind(input: &BackendInput) -> &'static str {
         BackendInput::Fresh { .. } => "fresh",
         BackendInput::Approve { .. } => "approve",
         BackendInput::Deny { .. } => "deny",
+        BackendInput::YoloToggle => "yolo_toggle",
+        BackendInput::YoloSet { .. } => "yolo_set",
+        BackendInput::Stop => "stop",
+        BackendInput::UndefinedCommand => "undefined_command",
+        BackendInput::ApprovalWaiting => "approval_waiting",
         BackendInput::ApprovalRequired { .. } => "approval_required",
     }
 }
@@ -1205,88 +1218,22 @@ fn run_fresh_thread_command(
     }
 }
 
-fn run_codex_review(
+fn stop_codex_run_command(
     config: &WecodeConfig,
-    instructions: Option<&str>,
-    selected_model: Option<&str>,
+    resume_session_id: Option<&str>,
     jsonl: bool,
-    flow_run_id: Option<&str>,
 ) -> Result<(), String> {
-    let lock_key = codex_run_lock_key(config, None);
-    let _run_lock = run_lock::try_acquire_codex_run_lock(config, &lock_key)?;
-    let output_path = codex_output_path();
-    let mut command = Command::new("codex");
-    command
-        .arg("exec")
-        .arg("review")
-        .arg("--yolo")
-        .arg("--json");
-    command.arg("-o").arg(&output_path);
-    command.arg("--uncommitted");
-    if let Some(model) = effective_codex_model(config, selected_model)? {
-        command.arg("-m").arg(model);
+    let target_key = codex_run_lock_key(config, resume_session_id);
+    let mut stopped = run_lock::stop_codex_run(config, &target_key)?.stopped;
+    if !stopped && resume_session_id.is_some() {
+        stopped = run_lock::stop_codex_run(config, &codex_run_lock_key(config, None))?.stopped;
     }
-    if let Some(instructions) = instructions {
-        if !instructions.trim().is_empty() {
-            command.arg("--").arg(instructions);
-        }
+    clear_pending_approvals(config);
+    if stopped {
+        emit_local_markdown("已停止当前任务。", jsonl)
+    } else {
+        emit_local_markdown("没有正在运行的任务。", jsonl)
     }
-    command.current_dir(codex_target_cwd(config)?);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    eprintln!(
-        "$ codex exec review --yolo --json -o {} --uncommitted",
-        output_path.display()
-    );
-    if let Some(run_id) = flow_run_id {
-        tracing::info!(
-            run_id = %run_id,
-            event = "codex_review_command",
-            instructions = ?instructions,
-            selected_model = ?selected_model,
-            output_path = %output_path.display(),
-            cwd = %codex_target_cwd(config)?.display(),
-            "prompt_flow"
-        );
-    }
-    let output = command
-        .output()
-        .map_err(|err| format!("failed to start codex review: {err}"))?;
-    if let Some(run_id) = flow_run_id {
-        tracing::info!(
-            run_id = %run_id,
-            event = "codex_review_result",
-            success = output.status.success(),
-            status_code = ?output.status.code(),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "prompt_flow"
-        );
-    }
-    let result = CodexBackendResult {
-        success: output.status.success(),
-        status_code: output.status.code(),
-        stdout: output.stdout,
-        stderr: output.stderr,
-        stdout_emitted: false,
-        stderr_emitted: false,
-    };
-    emit_codex_backend_result(&result, jsonl)?;
-    if !result.success {
-        return Err("codex review failed".to_string());
-    }
-    if !jsonl {
-        let final_message = fs::read_to_string(&output_path).map_err(|err| {
-            format!(
-                "failed to read Codex review final message {}: {err}",
-                output_path.display()
-            )
-        })?;
-        println!("{}", final_message.trim());
-    }
-    let _ = fs::remove_file(output_path);
-    Ok(())
 }
 
 struct CodexBackendResult {
@@ -1434,7 +1381,6 @@ fn capture_and_forward_stderr<R: Read>(mut reader: R) -> io::Result<Vec<u8>> {
 fn capture_codex_stdout_session_jsonl<R: Read>(reader: R) -> io::Result<Vec<u8>> {
     let mut captured = Vec::new();
     let mut reader = BufReader::new(reader);
-    let mut writer = io::stdout().lock();
     let mut line = String::new();
 
     loop {
@@ -1449,9 +1395,10 @@ fn capture_codex_stdout_session_jsonl<R: Read>(reader: R) -> io::Result<Vec<u8>>
             continue;
         }
         if let Some(value) = codex_stdout_jsonl_line_to_openclaw_value(trimmed) {
+            let mut writer = io::stdout().lock();
             write_jsonl_value(&mut writer, &value)?;
+            writer.flush()?;
         }
-        writer.flush()?;
     }
 
     Ok(captured)
@@ -1755,6 +1702,10 @@ fn emit_models_list(config: &WecodeConfig, jsonl: bool) -> Result<(), String> {
     emit_local_message(&lines.join("\n"), jsonl)
 }
 
+fn format_yolo_status(enabled: bool) -> String {
+    format!("Yolo: {}", if enabled { "on" } else { "off" })
+}
+
 fn set_model_override(config: &WecodeConfig, model: &str, jsonl: bool) -> Result<(), String> {
     let normalized = codex_model_from_openclaw_model(model);
     let path = model_override_path(config);
@@ -1818,15 +1769,14 @@ fn emit_resume_session(
 }
 
 fn compact_home_path(value: &str) -> String {
-    let Ok(home) = env::var("HOME") else {
+    let Some(home) = wecode::platform::home_dir() else {
         return value.to_string();
     };
-    let home = Path::new(&home);
     let path = Path::new(value);
     if path == home {
         return "~".to_string();
     }
-    if let Ok(rest) = path.strip_prefix(home) {
+    if let Ok(rest) = path.strip_prefix(&home) {
         return format!("~/{}", rest.display());
     }
     value.to_string()
@@ -2026,6 +1976,19 @@ fn collect_approval_ids_from_dir(dir: &Path, ids: &mut Vec<String>) {
     }
 }
 
+fn clear_pending_approvals(config: &WecodeConfig) {
+    if let Ok(entries) = fs::read_dir(approvals_dir(config)) {
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    for approval_id in native_approval::pending_native_approval_ids(config) {
+        native_approval::cleanup_native_approval(config, &approval_id);
+    }
+}
+
 fn write_pending_approval(
     config: &WecodeConfig,
     approval_id: &str,
@@ -2067,11 +2030,12 @@ fn weixin_help_message(config: &WecodeConfig) -> String {
         "- `:shell <command>` - 在当前 Codex 项目目录执行 shell 命令".to_string(),
         "- `:diff` - 显示当前项目 git diff".to_string(),
         "- `:status` - 显示后端、项目、session、审批、模型和 git 状态".to_string(),
+        "- `:yolo [true|false]` - 切换或设置当前项目的 yolo 模式".to_string(),
+        "- `:stop` - 停止当前正在运行的 Codex 任务".to_string(),
         "".to_string(),
         "## Codex 命令（会调用 Codex）".to_string(),
         "".to_string(),
         "- `:init [notes]` - 转成 `/init ...` 后发送给 Codex 原生命令".to_string(),
-        "- `:review [instructions]` - 对未提交改动执行 Codex review".to_string(),
         "- `:new [prompt]` - 转成 `/new ...` 后发送给 Codex 原生命令，不保证切换 Wecode 绑定的 session".to_string(),
         "- `:compact [notes]` - 转成 `/compact ...` 后发送给 Codex 原生命令".to_string(),
         "- `:plan [task]` - 转成 `/plan ...` 后发送给 Codex 原生命令".to_string(),
@@ -2150,6 +2114,15 @@ fn weixin_status_message(
         .ok()
         .flatten()
         .unwrap_or_else(|| "(Codex default)".to_string());
+    let yolo = project_yolo_enabled(config)
+        .map(|enabled| {
+            if enabled {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }
+        })
+        .unwrap_or_else(|err| format!("unavailable ({err})"));
     let transport = codex_transport_label(config.codex.transport);
     let git_status = run_git(config, &["status", "--short"])
         .map(|status| {
@@ -2161,15 +2134,16 @@ fn weixin_status_message(
         })
         .unwrap_or_else(|err| format!("unavailable ({err})"));
     format!(
-        "Wecode status:\nmodel: {}\nbackend model: {}\ntransport: {}\nsandbox: {}\ncwd: {}\ncurrent session: {}\npending approvals: {}\ngit: {}",
+        "# Wecode 状态\n\n- **Model**: `{}`\n- **Backend model**: `{}`\n- **Transport**: `{}`\n- **Sandbox**: `{}`\n- **Yolo**: {}\n- **CWD**: `{}`\n- **Current session**: `{}`\n- **Pending approvals**: {}\n\n## Git\n\n{}",
         config.openclaw.model,
         model,
         transport,
         config.codex.sandbox,
+        yolo,
         target_cwd,
         current_session,
         pending,
-        git_status
+        markdown_code_block(&git_status, "text")
     )
 }
 
@@ -2185,9 +2159,9 @@ fn codex_sessions_root() -> PathBuf {
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return PathBuf::from(codex_home).join("sessions");
     }
-    env::var("HOME")
-        .map(|home| PathBuf::from(home).join(".codex").join("sessions"))
-        .unwrap_or_else(|_| PathBuf::from(".codex").join("sessions"))
+    wecode::platform::home_dir()
+        .map(|home| home.join(".codex").join("sessions"))
+        .unwrap_or_else(|| PathBuf::from(".codex").join("sessions"))
 }
 
 fn codex_target_cwd(config: &WecodeConfig) -> Result<PathBuf, String> {
@@ -2552,12 +2526,7 @@ fn default_config_path() -> Option<PathBuf> {
         return Some(PathBuf::from(path).join("wecode").join("config.json"));
     }
 
-    env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("wecode")
-            .join("config.json")
-    })
+    wecode::platform::config_dir().map(|dir| dir.join("wecode").join("config.json"))
 }
 
 fn codex_output_path() -> PathBuf {
@@ -2620,6 +2589,138 @@ fn print_report(report: &ToolReport) {
     }
 }
 
+fn print_runtime_status(config: &WecodeConfig, source: &str) {
+    let launch_agent = gateway_launch_agent_path(config);
+    println!("# Wecode Runtime Status");
+    println!();
+    println!("- **Config**: `{source}`");
+    println!(
+        "- **Configured preventSleep**: `{}`",
+        prevent_sleep_mode_label(config.openclaw.prevent_sleep)
+    );
+    println!("- **LaunchAgent**: {}", launch_agent_status(&launch_agent));
+    println!(
+        "- **Sleep guard**: {}",
+        launch_agent_sleep_guard(&launch_agent)
+    );
+    println!(
+        "- **Gateway process**: {}",
+        gateway_process_status(&config.openclaw.profile)
+    );
+    println!(
+        "- **Latest OpenClaw log**: {}",
+        latest_openclaw_log_status()
+    );
+}
+
+fn prevent_sleep_mode_label(mode: PreventSleepMode) -> &'static str {
+    match mode {
+        PreventSleepMode::Off => "off",
+        PreventSleepMode::Ac => "ac",
+        PreventSleepMode::Always => "always",
+    }
+}
+
+fn launch_agent_status(path: &Path) -> String {
+    if path.exists() {
+        format!("present at `{}`", path.display())
+    } else {
+        format!("missing at `{}`", path.display())
+    }
+}
+
+fn launch_agent_sleep_guard(path: &Path) -> String {
+    if !path.exists() {
+        return "`missing`".to_string();
+    }
+    let Ok(source) = fs::read_to_string(path) else {
+        return "`unreadable`".to_string();
+    };
+    if !source.contains("/usr/bin/caffeinate") {
+        return "`off`".to_string();
+    }
+    if source.contains("<string>-i</string>") || source.contains("\"-i\"") {
+        return "`always` (`/usr/bin/caffeinate -i`)".to_string();
+    }
+    if source.contains("<string>-s</string>") || source.contains("\"-s\"") {
+        return "`ac` (`/usr/bin/caffeinate -s`)".to_string();
+    }
+    "`custom caffeinate`".to_string()
+}
+
+fn gateway_process_status(profile: &str) -> String {
+    #[cfg(unix)]
+    let output = Command::new("/bin/ps")
+        .args(["ax", "-o", "command="])
+        .output();
+
+    #[cfg(windows)]
+    let output = Command::new("tasklist")
+        .args(["/V", "/FO", "CSV", "/NH"])
+        .output();
+
+    let Ok(output) = output else {
+        return "`unknown`".to_string();
+    };
+    if !output.status.success() {
+        return "`unknown`".to_string();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let running = stdout.lines().any(|line| {
+        line.contains("openclaw")
+            && line.contains("gateway")
+            && (line.contains(profile)
+                || line.contains("OPENCLAW_PROFILE")
+                || line.contains("--port"))
+            && !line.contains("runtime-status")
+    });
+    if running {
+        "`running`".to_string()
+    } else {
+        "`not running`".to_string()
+    }
+}
+
+fn latest_openclaw_log_status() -> String {
+    let log_dir = Path::new("/tmp/openclaw");
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return "`missing`".to_string();
+    };
+    let latest = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("openclaw-") && name.ends_with(".log"))
+        })
+        .filter_map(|path| {
+            let modified = fs::metadata(&path).ok()?.modified().ok()?;
+            Some((path, modified))
+        })
+        .max_by_key(|(_, modified)| *modified);
+    let Some((path, modified)) = latest else {
+        return "`missing`".to_string();
+    };
+    format!("`{}` ({})", path.display(), modified_age_label(modified))
+}
+
+fn modified_age_label(modified: SystemTime) -> String {
+    let Ok(age) = SystemTime::now().duration_since(modified) else {
+        return "modified in the future".to_string();
+    };
+    let seconds = age.as_secs();
+    if seconds < 60 {
+        format!("modified {seconds}s ago")
+    } else if seconds < 3600 {
+        format!("modified {}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("modified {}h ago", seconds / 3600)
+    } else {
+        format!("modified {}d ago", seconds / 86_400)
+    }
+}
+
 fn ensure_private_openclaw_dirs(config: &WecodeConfig) -> Result<(), String> {
     ensure_project_state_paths_writable(config, "bootstrap Wecode", &[])?;
     fs::create_dir_all(expand_tilde(&config.openclaw.workspace_dir))
@@ -2637,6 +2738,7 @@ pub fn print_help() {
 
 Usage:
   wecode doctor
+  wecode runtime-status [--config path]
   wecode sample-config
   wecode config validate [path]
   wecode bootstrap [--config path] [--dry-run] [--weixin|--feishu]
@@ -2698,7 +2800,7 @@ fn resolve_supported_node_bin_dir(config: &WecodeConfig) -> Option<String> {
 }
 
 fn node_bin_dir_is_supported(path: &Path) -> bool {
-    let node = path.join("node");
+    let node = path.join(if cfg!(windows) { "node.exe" } else { "node" });
     let version = capture_version_with_path(&node.display().to_string(), &["--version"], &[]);
     version
         .as_deref()
@@ -2707,6 +2809,7 @@ fn node_bin_dir_is_supported(path: &Path) -> bool {
 }
 
 fn supported_node_bin_dir_candidates() -> Vec<PathBuf> {
+    #[cfg(not(windows))]
     let mut candidates = vec![
         PathBuf::from("/opt/homebrew/opt/node/bin"),
         PathBuf::from("/opt/homebrew/opt/node@24/bin"),
@@ -2716,14 +2819,36 @@ fn supported_node_bin_dir_candidates() -> Vec<PathBuf> {
         PathBuf::from("/usr/local/opt/node@22/bin"),
     ];
 
-    if let Ok(home) = env::var("HOME") {
+    #[cfg(windows)]
+    let mut candidates = vec![
+        PathBuf::from(r"C:\Program Files\nodejs"),
+    ];
+
+    if let Some(home) = wecode::platform::home_dir() {
+        #[cfg(not(windows))]
+        {
+            candidates.extend(versioned_node_bin_dirs(
+                home.join(".local/share/mise/installs/node"),
+            ));
+            candidates.extend(versioned_node_bin_dirs(
+                home.join(".nvm/versions/node"),
+            ));
+        }
+        candidates.push(home.join(".volta").join("bin"));
+    }
+
+    #[cfg(windows)]
+    if let Some(appdata) = env::var_os("APPDATA") {
+        let appdata = PathBuf::from(appdata);
+        candidates.extend(versioned_node_bin_dirs(appdata.join("nvm")));
         candidates.extend(versioned_node_bin_dirs(
-            Path::new(&home).join(".local/share/mise/installs/node"),
+            appdata.join("fnm").join("node-versions"),
         ));
-        candidates.extend(versioned_node_bin_dirs(
-            Path::new(&home).join(".nvm/versions/node"),
-        ));
-        candidates.push(Path::new(&home).join(".volta/bin"));
+    }
+
+    #[cfg(windows)]
+    if let Ok(nvm_home) = env::var("NVM_HOME") {
+        candidates.extend(versioned_node_bin_dirs(PathBuf::from(nvm_home)));
     }
 
     candidates
@@ -2754,15 +2879,5 @@ fn path_with_prepend(paths: &[String]) -> String {
 }
 
 fn expand_tilde(value: &str) -> String {
-    if value == "~" {
-        return env::var("HOME").unwrap_or_else(|_| value.to_string());
-    }
-
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(rest).display().to_string();
-        }
-    }
-
-    value.to_string()
+    wecode::paths::expand_tilde(value)
 }
