@@ -1010,11 +1010,175 @@ fn patch_feishu_monitor_account(path: &Path) -> Result<(), String> {
             path.display()
         ));
     };
+    let patched = patch_feishu_native_approval_control(&patched, path)?;
     if patched != source {
         fs::write(path, patched)
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     }
     Ok(())
+}
+
+fn patch_feishu_native_approval_control(source: &str, path: &Path) -> Result<String, String> {
+    let mut patched = source.to_string();
+    if !patched.contains("async function handleFeishuMessage(params) {") {
+        return Ok(patched);
+    }
+    if !patched.contains("async function handleWecodeNativeApprovalControl") {
+        const HELPER_ANCHOR: &str = r#"async function handleFeishuMessage(params) {"#;
+        const HELPER: &str = r#"function parseWecodeApprovalControlText(text) {
+	const match = String(text ?? "").trim().match(/^(?::?(yes|approve|no|deny))(?:\s+([\w-]+))?$/i);
+	if (!match) return null;
+	const action = match[1].toLowerCase();
+	return {
+		decision: action === "yes" || action === "approve" ? "approve" : "deny",
+		approvalId: match[2],
+	};
+}
+function resolveWecodeOpenClawStateDir() {
+	const configured = process.env.OPENCLAW_STATE_DIR?.trim();
+	const stateDir = configured && configured.length > 0 ? configured : "~/.wecode/openclaw-state";
+	if (stateDir === "~") return process.env.HOME || ".";
+	if (stateDir.startsWith("~/")) return path.join(process.env.HOME || ".", stateDir.slice(2));
+	return path.resolve(stateDir);
+}
+function wecodeNativeApprovalsDir() {
+	return path.join(resolveWecodeOpenClawStateDir(), "approvals", "native");
+}
+function readWecodeNativeApproval(approvalId, log) {
+	const approvalPath = path.join(wecodeNativeApprovalsDir(), `${approvalId}.json`);
+	try {
+		const record = JSON.parse(fs.readFileSync(approvalPath, "utf8"));
+		const expiresAt = Number(record?.expires_at_millis ?? 0);
+		if (expiresAt > 0 && expiresAt < Date.now()) return null;
+		return { approvalId, approvalPath, record };
+	}
+	catch (err) {
+		if (err?.code !== "ENOENT") {
+			log(`wecode approval control read failed approvalId=${approvalId} err=${String(err)}`);
+		}
+		return null;
+	}
+}
+function listWecodePendingNativeApprovalIds(log) {
+	const dir = wecodeNativeApprovalsDir();
+	try {
+		return fs.readdirSync(dir, { withFileTypes: true })
+			.filter((entry) => entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".decision.json"))
+			.map((entry) => entry.name.slice(0, -".json".length))
+			.filter((approvalId) => Boolean(readWecodeNativeApproval(approvalId, log)))
+			.sort();
+	}
+	catch (err) {
+		if (err?.code !== "ENOENT") {
+			log(`wecode approval control list failed dir=${dir} err=${String(err)}`);
+		}
+		return [];
+	}
+}
+function resolveWecodeNativeApprovalId(requestedApprovalId, log) {
+	const approvalId = requestedApprovalId?.trim();
+	if (approvalId) {
+		return readWecodeNativeApproval(approvalId, log)
+			? { status: "ok", approvalId }
+			: { status: "not_found", approvalId };
+	}
+	const ids = listWecodePendingNativeApprovalIds(log);
+	if (ids.length === 1) return { status: "ok", approvalId: ids[0] };
+	if (ids.length === 0) return { status: "none" };
+	return { status: "multiple", ids };
+}
+async function sendWecodeApprovalControlMessage(params, text) {
+	try {
+		await sendMessageFeishu({
+			cfg: params.cfg,
+			to: `chat:${params.chatId}`,
+			text,
+			accountId: params.accountId,
+		});
+	}
+	catch (err) {
+		params.error(`wecode approval control ack failed err=${String(err)}`);
+	}
+}
+async function handleWecodeNativeApprovalControl(params) {
+	const log = typeof params.log === "function" ? params.log : console.log;
+	const error = typeof params.error === "function" ? params.error : console.error;
+	const approval = parseWecodeApprovalControlText(params.text);
+	if (!approval) return false;
+	const resolved = resolveWecodeNativeApprovalId(approval.approvalId, log);
+	if (resolved.status === "none") return false;
+	if (resolved.status === "not_found") {
+		await sendWecodeApprovalControlMessage({ ...params, error }, `Approval ${resolved.approvalId} was not found.`);
+		return true;
+	}
+	if (resolved.status === "multiple") {
+		await sendWecodeApprovalControlMessage({ ...params, error }, `Multiple pending approvals: ${resolved.ids.join(", ")}. Reply :yes <id> or :no <id>.`);
+		return true;
+	}
+	const approvalId = resolved.approvalId;
+	const decisionPath = path.join(wecodeNativeApprovalsDir(), `${approvalId}.decision.json`);
+	try {
+		fs.mkdirSync(wecodeNativeApprovalsDir(), { recursive: true });
+		fs.writeFileSync(decisionPath, JSON.stringify({
+			approval_id: approvalId,
+			decision: approval.decision,
+			decided_at_millis: Date.now(),
+		}, null, 2));
+		log(`wecode approval control wrote decision approvalId=${approvalId} decision=${approval.decision}`);
+	}
+	catch (err) {
+		error(`wecode approval control write failed approvalId=${approvalId} err=${String(err)}`);
+		await sendWecodeApprovalControlMessage({ ...params, error }, `Failed to update Codex approval ${approvalId}: ${String(err)}`);
+		return true;
+	}
+	const action = approval.decision === "approve" ? "Approved" : "Denied";
+	await sendWecodeApprovalControlMessage({ ...params, error }, `${action} Codex approval ${approvalId}. Codex will continue in the original turn.`);
+	return true;
+}
+
+"#;
+        if patched.contains(HELPER_ANCHOR) {
+            patched = patched.replace(HELPER_ANCHOR, &format!("{HELPER}{HELPER_ANCHOR}"));
+        } else {
+            return Err(format!(
+                "unsupported Feishu monitor.account format; handleFeishuMessage anchor not found in {}",
+                path.display()
+            ));
+        }
+    }
+
+    const FEISHU_FROM_LINE: &str = r#"const feishuFrom = `feishu:${ctx.senderOpenId}`;"#;
+    if !patched.contains("if (await handleWecodeNativeApprovalControl({") {
+        let Some(line_start) = patched.find(FEISHU_FROM_LINE) else {
+            return Err(format!(
+                "unsupported Feishu monitor.account format; agent dispatch prelude not found in {}",
+                path.display()
+            ));
+        };
+        let line_indent_start = patched[..line_start]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let indent = &patched[line_indent_start..line_start];
+        let branch = format!(
+            r#"{indent}if (await handleWecodeNativeApprovalControl({{
+{indent}	text: ctx.content,
+{indent}	cfg,
+{indent}	chatId: ctx.chatId,
+{indent}	accountId: account.accountId,
+{indent}	log,
+{indent}	error,
+{indent}}})) {{
+{indent}	return;
+{indent}}}
+{indent}{FEISHU_FROM_LINE}"#
+        );
+        patched.replace_range(
+            line_indent_start..line_start + FEISHU_FROM_LINE.len(),
+            &branch,
+        );
+    }
+    Ok(patched)
 }
 
 fn ensure_wecode_approval_control_helper(source: &str, anchor: &str) -> Result<String, String> {

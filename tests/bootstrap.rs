@@ -1240,6 +1240,91 @@ fn patch_openclaw_runtime_routes_feishu_approval_replies_on_control_lane() {
 }
 
 #[test]
+fn patch_openclaw_runtime_handles_feishu_approval_replies_before_agent_queue() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let feishu_dist = state_dir
+        .join("npm")
+        .join("projects")
+        .join("feishu-project")
+        .join("node_modules")
+        .join("@openclaw")
+        .join("feishu")
+        .join("dist");
+    fs::create_dir_all(&feishu_dist).expect("feishu dist dir");
+    let monitor_file = feishu_dist.join("monitor.account-test.js");
+    fs::write(
+        &monitor_file,
+        r#"function getFeishuSequentialKey(params) {
+	const { accountId, event, botOpenId, botName } = params;
+	const baseKey = `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}`;
+	const text = parseFeishuMessageEvent(event, botOpenId, botName).content.trim();
+	if (isAbortRequestText(text)) return `${baseKey}:control`;
+	if (isBtwRequestText(text)) return `${baseKey}:btw`;
+	return baseKey;
+}
+async function handleFeishuMessage(params) {
+	const { cfg, accountId } = params;
+	const account = { accountId };
+	const ctx = { content: "yes", chatId: "oc_test" };
+	const dmIngress = { senderAccess: { effectiveAllowFrom: [] } };
+	const groupConfig = undefined;
+	const configAllowFrom = [];
+	const isGroup = false;
+	const commandAllowFrom = isGroup ? groupConfig?.allowFrom ?? configAllowFrom : dmIngress?.senderAccess.effectiveAllowFrom ?? configAllowFrom;
+	const feishuFrom = `feishu:${ctx.senderOpenId}`;
+	await dispatchToAgent({ commandAllowFrom, feishuFrom });
+}
+"#,
+    )
+    .expect("feishu monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
+    assert!(
+        patched.contains("handleWecodeNativeApprovalControl")
+            && patched.contains("parseWecodeApprovalControlText")
+            && patched.contains(r#""approvals", "native""#),
+        "feishu approval control helper should be installed:\n{patched}"
+    );
+    assert!(
+        patched.contains("`${approvalId}.decision.json`")
+            && patched.contains(r#"decision: approval.decision"#)
+            && patched.contains("sendMessageFeishu({"),
+        "feishu approval replies should write Codex native approval decisions and acknowledge in chat:\n{patched}"
+    );
+    let approval_index = patched
+        .find("if (await handleWecodeNativeApprovalControl({")
+        .expect("approval control branch");
+    let dispatch_index = patched.find("dispatchToAgent").expect("agent dispatch");
+    assert!(
+        approval_index < dispatch_index,
+        "feishu approval reply must return before entering the agent queue:\n{patched}"
+    );
+    assert_eq!(
+        patched
+            .matches("if (await handleWecodeNativeApprovalControl({")
+            .count(),
+        1,
+        "approval control branch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
 fn prevent_sleep_wraps_gateway_launch_agent_arguments_on_ac_power() {
     let original = vec![
         "/Users/riven/.wecode/openclaw-state/service-env/ai.openclaw.wecode-env-wrapper.sh"
