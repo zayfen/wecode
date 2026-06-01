@@ -55,6 +55,23 @@ pub fn native_decision_path(config: &WecodeConfig, approval_id: &str) -> PathBuf
     native_approvals_dir(config).join(format!("{approval_id}.decision.json"))
 }
 
+pub fn pending_native_approval_ids(config: &WecodeConfig) -> Vec<String> {
+    let mut ids = Vec::new();
+    let Ok(entries) = fs::read_dir(native_approvals_dir(config)) else {
+        return ids;
+    };
+    for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+        if !path_is_native_approval_record(&path) || native_approval_is_expired(&path) {
+            continue;
+        }
+        if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids.sort();
+    ids
+}
+
 pub fn is_supported_approval_method(method: &str) -> bool {
     matches!(
         method,
@@ -62,6 +79,25 @@ pub fn is_supported_approval_method(method: &str) -> bool {
             | "item/fileChange/requestApproval"
             | "item/permissions/requestApproval"
     )
+}
+
+fn path_is_native_approval_record(path: &std::path::Path) -> bool {
+    path.is_file()
+        && path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        && !path.to_string_lossy().ends_with(".decision.json")
+}
+
+fn native_approval_is_expired(path: &std::path::Path) -> bool {
+    let Ok(input) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&input) else {
+        return false;
+    };
+    value
+        .get("expires_at_millis")
+        .and_then(Value::as_u64)
+        .is_some_and(|expires| u128::from(expires) <= current_millis())
 }
 
 pub fn create_native_approval_record(
@@ -344,10 +380,8 @@ fn format_native_approval_prompt(
             lines.push(item.clone());
         }
     }
-    lines.push(format!(
-        "Approve: :approve {approval_id} or :yes {approval_id}"
-    ));
-    lines.push(format!("Deny: :deny {approval_id} or :no {approval_id}"));
+    lines.push(format!("Approve: yes, :yes, or :yes {approval_id}"));
+    lines.push(format!("Deny: no, :no, or :no {approval_id}"));
     lines.join("\n")
 }
 

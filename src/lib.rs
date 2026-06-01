@@ -28,7 +28,7 @@ pub use openclaw::{
     codex_config_plan_with_backend_command, feishu_install_steps, gateway_install_step,
     gateway_launch_agent_path, openclaw_bin_dir, openclaw_bin_path, openclaw_install_step,
     openclaw_runtime_patch_step, patch_gateway_launch_agent_prevent_sleep,
-    patch_gateway_launch_agent_prevent_sleep_at, patch_openclaw_text_command_routing,
-    prevent_sleep_program_arguments, weixin_install_step,
+    patch_gateway_launch_agent_prevent_sleep_at, patch_openclaw_runtime,
+    patch_openclaw_text_command_routing, prevent_sleep_program_arguments, weixin_install_step,
 };
 pub use sessions::{list_all_codex_sessions, list_codex_sessions, CodexSessionSummary};

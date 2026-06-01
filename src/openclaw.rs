@@ -61,6 +61,7 @@ pub fn bootstrap_plan_with_backend_command(
     steps.push(openclaw_install_step(config));
     steps.extend(codex_bridge_config_plan(config, backend_command));
     steps.extend(channel_install_steps(config, channel));
+    steps.push(openclaw_runtime_patch_step(config, backend_command));
     steps.push(gateway_install_step(config));
 
     steps
@@ -89,6 +90,8 @@ pub fn openclaw_runtime_patch_step(config: &WecodeConfig, backend_command: &str)
             "patch-openclaw-runtime".to_string(),
             "--runtime-dir".to_string(),
             config.openclaw.runtime_dir.clone(),
+            "--state-dir".to_string(),
+            config.openclaw.state_dir.clone(),
         ],
     )
 }
@@ -244,7 +247,7 @@ fn write_launch_agent_program_arguments(path: &Path, args: &[String]) -> Result<
 
 pub fn feishu_install_steps(config: &WecodeConfig) -> Vec<CommandStep> {
     let openclaw = openclaw_bin_path(config);
-    vec![
+    let mut steps = vec![
         openclaw_step(
             config,
             &openclaw,
@@ -265,7 +268,51 @@ pub fn feishu_install_steps(config: &WecodeConfig) -> Vec<CommandStep> {
                 "feishu".to_string(),
             ],
         ),
+    ];
+    steps.extend(feishu_streaming_config_steps(config, &openclaw));
+    steps
+}
+
+fn feishu_streaming_config_steps(config: &WecodeConfig, openclaw: &str) -> Vec<CommandStep> {
+    vec![
+        openclaw_config_set_strict_json_step(
+            config,
+            openclaw,
+            "channels.feishu.streaming",
+            "true".to_string(),
+        ),
+        openclaw_config_set_strict_json_step(
+            config,
+            openclaw,
+            "channels.feishu.renderMode",
+            serde_json::to_string("card").expect("serializing static string cannot fail"),
+        ),
+        openclaw_config_set_strict_json_step(
+            config,
+            openclaw,
+            "channels.feishu.blockStreaming",
+            "true".to_string(),
+        ),
     ]
+}
+
+fn openclaw_config_set_strict_json_step(
+    config: &WecodeConfig,
+    openclaw: &str,
+    key: &str,
+    json_value: String,
+) -> CommandStep {
+    openclaw_step(
+        config,
+        openclaw,
+        vec![
+            "config".to_string(),
+            "set".to_string(),
+            key.to_string(),
+            json_value,
+            "--strict-json".to_string(),
+        ],
+    )
 }
 
 pub fn openclaw_bin_path(config: &WecodeConfig) -> String {
@@ -289,6 +336,13 @@ pub fn patch_openclaw_text_command_routing(runtime_dir: &Path) -> Result<(), Str
         .join("dist");
     patch_text_command_routing(&dist_dir)?;
     patch_builtin_compact_command(&dist_dir)?;
+    Ok(())
+}
+
+pub fn patch_openclaw_runtime(runtime_dir: &Path, state_dir: &Path) -> Result<(), String> {
+    patch_openclaw_text_command_routing(runtime_dir)?;
+    patch_weixin_runtime(state_dir)?;
+    patch_feishu_runtime(state_dir)?;
     Ok(())
 }
 
@@ -370,6 +424,206 @@ fn patch_builtin_compact_command(dist_dir: &Path) -> Result<(), String> {
     }
 
     Err("unsupported OpenClaw commands handler format; expected /compact command handler was not found".to_string())
+}
+
+fn patch_weixin_runtime(state_dir: &Path) -> Result<(), String> {
+    let files = files_named_under(state_dir, "process-message.js")?;
+    for path in files
+        .iter()
+        .filter(|path| path.to_string_lossy().contains("openclaw-weixin"))
+    {
+        patch_weixin_process_message(path)?;
+    }
+
+    let files = files_named_under(state_dir, "lane-key.js")?;
+    for path in files
+        .iter()
+        .filter(|path| path.to_string_lossy().contains("openclaw-weixin"))
+    {
+        patch_weixin_lane_key(path)?;
+    }
+    Ok(())
+}
+
+fn patch_weixin_process_message(path: &Path) -> Result<(), String> {
+    let source = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if source.contains("disableBlockStreaming: false") {
+        return Ok(());
+    }
+    if !source.contains("disableBlockStreaming: true") {
+        return Err(format!(
+            "unsupported Weixin process-message format; disableBlockStreaming flag not found in {}",
+            path.display()
+        ));
+    }
+    let patched = source.replace(
+        "disableBlockStreaming: true",
+        "disableBlockStreaming: false",
+    );
+    fs::write(path, patched).map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+fn patch_weixin_lane_key(path: &Path) -> Result<(), String> {
+    const ORIGINAL: &str = r#"const baseKey = `wx:${ctx.accountId}:${userId}`;
+    if (isWeixinAbortMessage(ctx.msg)) {
+        return `${baseKey}:control`;
+    }
+    return baseKey;"#;
+    const PATCHED: &str = r#"const baseKey = `wx:${ctx.accountId}:${userId}`;
+    const textBody = extractTextBodyForLane(ctx.msg).trim();
+    if (isWeixinAbortMessage(ctx.msg) || isWecodeApprovalControlText(textBody)) {
+        return `${baseKey}:control`;
+    }
+    return baseKey;"#;
+    const HELPER_ANCHOR: &str = r#"/**
+ * Compute the lane key used by the per-key scheduler. Abort requests get the
+ * `:control` suffix to bypass the main lane.
+ *
+ * Note: the fallback `unknown` user happens for malformed payloads. Keep them
+ * on a shared lane so they cannot fan out and exhaust resources.
+ */"#;
+
+    let source = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let with_helper = ensure_wecode_approval_control_helper(&source, HELPER_ANCHOR)?;
+    let patched = if with_helper.contains(PATCHED) {
+        with_helper
+    } else if with_helper.contains(ORIGINAL) {
+        with_helper.replace(ORIGINAL, PATCHED)
+    } else {
+        return Err(format!(
+            "unsupported Weixin lane-key format; control lane branch not found in {}",
+            path.display()
+        ));
+    };
+    if patched != source {
+        fs::write(path, patched)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn patch_feishu_runtime(state_dir: &Path) -> Result<(), String> {
+    let files = files_named_under(state_dir, "monitor.account-vUWzYlT_.js")?
+        .into_iter()
+        .chain(files_with_prefix_under(
+            state_dir,
+            "monitor.account-",
+            ".js",
+        )?)
+        .chain(files_named_under(state_dir, "monitor.account-test.js")?)
+        .collect::<Vec<_>>();
+
+    for path in files
+        .iter()
+        .filter(|path| path.to_string_lossy().contains("@openclaw/feishu"))
+    {
+        patch_feishu_monitor_account(path)?;
+    }
+    Ok(())
+}
+
+fn patch_feishu_monitor_account(path: &Path) -> Result<(), String> {
+    const ORIGINAL: &str = r#"if (isAbortRequestText(text)) return `${baseKey}:control`;"#;
+    const PATCHED: &str = r#"if (isAbortRequestText(text) || isWecodeApprovalControlText(text)) return `${baseKey}:control`;"#;
+    const HELPER_ANCHOR: &str = r#"//#region extensions/feishu/src/sequential-key.ts"#;
+
+    let source = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    if !source.contains("function getFeishuSequentialKey") {
+        return Ok(());
+    }
+    let with_helper = ensure_wecode_approval_control_helper(&source, HELPER_ANCHOR)?;
+    let patched = if with_helper.contains(PATCHED) {
+        with_helper
+    } else if with_helper.contains(ORIGINAL) {
+        with_helper.replace(ORIGINAL, PATCHED)
+    } else {
+        return Err(format!(
+            "unsupported Feishu monitor.account format; sequential control branch not found in {}",
+            path.display()
+        ));
+    };
+    if patched != source {
+        fs::write(path, patched)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_wecode_approval_control_helper(source: &str, anchor: &str) -> Result<String, String> {
+    if source.contains("function isWecodeApprovalControlText") {
+        return Ok(source.to_string());
+    }
+    let helper = r#"function isWecodeApprovalControlText(text) {
+	const normalized = String(text ?? "").trim().toLowerCase();
+	return /^(?::?(?:yes|no|approve|deny))(?:\s+[\w-]+)?$/.test(normalized);
+}
+
+"#;
+    if source.contains(anchor) {
+        Ok(source.replace(anchor, &format!("{helper}{anchor}")))
+    } else {
+        Ok(format!("{helper}{source}"))
+    }
+}
+
+fn files_named_under(root: &Path, file_name: &str) -> Result<Vec<PathBuf>, String> {
+    files_matching_under(root, &|name| name == file_name)
+}
+
+fn files_with_prefix_under(
+    root: &Path,
+    prefix: &str,
+    suffix: &str,
+) -> Result<Vec<PathBuf>, String> {
+    files_matching_under(root, &|name| {
+        name.starts_with(prefix) && name.ends_with(suffix)
+    })
+}
+
+fn files_matching_under(
+    root: &Path,
+    predicate: &dyn Fn(&str) -> bool,
+) -> Result<Vec<PathBuf>, String> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut matches = Vec::new();
+    collect_files_matching(root, predicate, &mut matches)?;
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+fn collect_files_matching(
+    dir: &Path,
+    predicate: &dyn Fn(&str) -> bool,
+    matches: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|err| {
+        format!(
+            "failed to read OpenClaw runtime dir {}: {err}",
+            dir.display()
+        )
+    })?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_matching(&path, predicate, matches)?;
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(predicate)
+            .unwrap_or(false)
+        {
+            matches.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn openclaw_dist_candidates(
@@ -508,6 +762,7 @@ fn cli_backend_config_json(config: &WecodeConfig, backend_command: &str) -> Stri
             "args": ["codex-backend", "--jsonl", "--cwd", project_cwd],
             "command": backend_command,
             "input": "stdin",
+            "jsonlDialect": "claude-stream-json",
             "modelArg": "--model",
             "output": "jsonl",
             "reliability": {

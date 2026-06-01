@@ -1,3 +1,5 @@
+use std::fs;
+
 use wecode::{
     default_config, prepare_backend_input, prepare_backend_prompt, read_config_str,
     render_command_input, BackendInput,
@@ -155,19 +157,35 @@ fn backend_input_recognizes_control_commands() {
     ));
     assert!(matches!(
         prepare_backend_input(&cfg, ":approve abc123").expect("approve"),
-        BackendInput::Approve { approval_id } if approval_id == "abc123"
+        BackendInput::Approve {
+            approval_id: Some(approval_id),
+        } if approval_id == "abc123"
     ));
     assert!(matches!(
         prepare_backend_input(&cfg, ":yes abc123").expect("yes"),
-        BackendInput::Approve { approval_id } if approval_id == "abc123"
+        BackendInput::Approve {
+            approval_id: Some(approval_id),
+        } if approval_id == "abc123"
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":yes").expect("bare yes"),
+        BackendInput::Approve { approval_id: None }
     ));
     assert!(matches!(
         prepare_backend_input(&cfg, ":deny abc123").expect("deny"),
-        BackendInput::Deny { approval_id } if approval_id == "abc123"
+        BackendInput::Deny {
+            approval_id: Some(approval_id),
+        } if approval_id == "abc123"
     ));
     assert!(matches!(
         prepare_backend_input(&cfg, ":no abc123").expect("no"),
-        BackendInput::Deny { approval_id } if approval_id == "abc123"
+        BackendInput::Deny {
+            approval_id: Some(approval_id),
+        } if approval_id == "abc123"
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":no").expect("bare no"),
+        BackendInput::Deny { approval_id: None }
     ));
     assert!(matches!(
         prepare_backend_input(&cfg, ":pwd").expect("pwd"),
@@ -193,6 +211,52 @@ fn backend_input_recognizes_control_commands() {
         prepare_backend_input(&cfg, ":shell"),
         Err(":shell expects a command".to_string())
     );
+}
+
+#[test]
+fn backend_input_treats_plain_yes_no_as_approval_only_when_approval_is_pending() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let empty_state_dir = temp.path().join("empty-state");
+    let cfg = read_config_str(&format!(
+        r#"{{"openclaw":{{"stateDir":{}}},"commands":[]}}"#,
+        serde_json::to_string(&empty_state_dir.display().to_string()).expect("state json")
+    ))
+    .expect("config should parse");
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, "yes").expect("plain yes without pending approval"),
+        BackendInput::Prompt(prompt) if prompt == "yes"
+    ));
+    let expired_native_dir = empty_state_dir.join("approvals").join("native");
+    fs::create_dir_all(&expired_native_dir).expect("expired native dir");
+    fs::write(
+        expired_native_dir.join("appr-expired.json"),
+        r#"{"approval_id":"appr-expired","expires_at_millis":1}"#,
+    )
+    .expect("expired approval");
+    assert!(matches!(
+        prepare_backend_input(&cfg, "yes").expect("plain yes with expired approval"),
+        BackendInput::Prompt(prompt) if prompt == "yes"
+    ));
+
+    let state_dir = temp.path().join("state");
+    let cfg = read_config_str(&format!(
+        r#"{{"openclaw":{{"stateDir":{}}},"commands":[]}}"#,
+        serde_json::to_string(&state_dir.display().to_string()).expect("state json")
+    ))
+    .expect("config should parse");
+    let native_dir = state_dir.join("approvals").join("native");
+    fs::create_dir_all(&native_dir).expect("native dir");
+    fs::write(native_dir.join("appr-one.json"), "{}").expect("pending native approval");
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, "yes").expect("plain yes with pending approval"),
+        BackendInput::Approve { approval_id: None }
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, "NO").expect("plain no with pending approval"),
+        BackendInput::Deny { approval_id: None }
+    ));
 }
 
 #[test]

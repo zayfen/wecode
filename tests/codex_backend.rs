@@ -88,7 +88,15 @@ fn codex_backend_exec_fallback_uses_yolo() {
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
     let config_path = temp.path().join("wecode.json");
-    fs::write(&config_path, r#"{"codex":{"transport":"exec"}}"#).expect("write config");
+    let state_dir = temp.path().join("state");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":"{}"}},"codex":{{"transport":"exec"}}}}"#,
+            state_dir.display()
+        ),
+    )
+    .expect("write config");
     write_fake_codex(&codex_path, &calls_path);
 
     let path = format!(
@@ -123,6 +131,7 @@ fn codex_backend_streams_jsonl_before_codex_exits() {
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
     let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
 
     fs::write(
         &codex_path,
@@ -137,7 +146,14 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
         ),
     )
     .expect("write fake codex");
-    fs::write(&config_path, r#"{"codex":{"transport":"exec"}}"#).expect("write config");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":"{}"}},"codex":{{"transport":"exec"}}}}"#,
+            state_dir.display()
+        ),
+    )
+    .expect("write config");
     let mut permissions = fs::metadata(&codex_path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&codex_path, permissions).expect("chmod fake codex");
@@ -199,6 +215,7 @@ fn codex_backend_exec_jsonl_emits_openclaw_item_text_from_output_file() {
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
     let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
 
     fs::write(
         &codex_path,
@@ -222,7 +239,14 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
         ),
     )
     .expect("write fake codex");
-    fs::write(&config_path, r#"{"codex":{"transport":"exec"}}"#).expect("write config");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":"{}"}},"codex":{{"transport":"exec"}}}}"#,
+            state_dir.display()
+        ),
+    )
+    .expect("write config");
     let mut permissions = fs::metadata(&codex_path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&codex_path, permissions).expect("chmod fake codex");
@@ -835,11 +859,98 @@ fn codex_backend_remote_approval_waits_for_wechat_approve() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Codex requests permission"), "{stdout}");
-    assert!(stdout.contains(":approve"), "{stdout}");
+    assert!(stdout.contains("Approve: yes, :yes"), "{stdout}");
     assert!(stdout.contains("approval ok"), "{stdout}");
     let calls = fs::read_to_string(calls_path).expect("calls");
     assert!(calls.contains(r#""id":99"#), "{calls}");
     assert!(calls.contains(r#""decision":"accept""#), "{calls}");
+}
+
+#[test]
+fn codex_backend_remote_approval_streams_claude_delta_before_decision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let proxy_path = temp.path().join("codex-remote-proxy");
+    let calls_path = temp.path().join("remote-calls.txt");
+    let state_dir = temp.path().join("state");
+    write_fake_remote_proxy_with_command_approval(&proxy_path, &calls_path, "approval-thread");
+    let config_path = temp.path().join("wecode.json");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw":{{"stateDir":{},"cliNoOutputTimeoutMs":900000}},
+              "codex":{{
+                "transport":"remote-strict",
+                "remote":{{
+                  "autoStart":false,
+                  "proxyCommand":{},
+                  "fallbackProxyCommand":"",
+                  "approvalTimeoutSeconds":30
+                }}
+              }}
+            }}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json"),
+            serde_json::to_string(&proxy_path.display().to_string()).expect("proxy json")
+        ),
+    )
+    .expect("write config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "please ask approval",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn backend");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut first_line = String::new();
+        let mut second_line = String::new();
+        let first_result = reader.read_line(&mut first_line);
+        let second_result = reader.read_line(&mut second_line);
+        let _ = tx.send((first_result, first_line, second_result, second_line));
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+    });
+
+    let _approval_file = wait_for_first_native_approval_file(&state_dir);
+    let (first_result, first_line, second_result, second_line) =
+        match rx.recv_timeout(Duration::from_millis(5000)) {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("expected approval prompt JSONL before approval decision: {err}");
+            }
+        };
+    assert_eq!(first_result.expect("read thread line"), first_line.len());
+    assert_eq!(
+        second_result.expect("read approval stream line"),
+        second_line.len()
+    );
+    assert!(
+        first_line.contains(r#""thread_id":"approval-thread""#),
+        "first stdout line:\n{first_line}"
+    );
+    assert!(
+        second_line.contains(r#""type":"stream_event""#)
+            && second_line.contains(r#""content_block_delta""#)
+            && second_line.contains(r#""text_delta""#)
+            && second_line.contains("Codex requests permission"),
+        "approval prompt must be emitted as Claude-stream JSONL for OpenClaw partial delivery:\n{second_line}"
+    );
+    assert!(
+        child.try_wait().expect("check child status").is_none(),
+        "approval prompt should be emitted while the original turn is still waiting"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]
@@ -1001,7 +1112,7 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
     );
     let request_stdout = String::from_utf8_lossy(&request.stdout);
     assert!(request_stdout.contains("requires approval"));
-    assert!(request_stdout.contains(":approve "));
+    assert!(request_stdout.contains("Approve: yes, :yes"));
     assert!(!calls_path.exists(), "codex should not run before approval");
 
     let approvals_dir = state_dir.join("approvals");
@@ -1102,6 +1213,65 @@ fn codex_backend_approve_writes_native_approval_decision() {
     assert!(decision.contains(r#""decision": "approve""#), "{decision}");
     assert!(
         String::from_utf8_lossy(&approved.stdout).contains("Approved Codex approval appr-native")
+    );
+}
+
+#[test]
+fn codex_backend_bare_yes_approves_single_pending_native_approval() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":{}}},"codex":{{"transport":"remote-strict"}}}}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json")
+        ),
+    )
+    .expect("write config");
+    let native_dir = state_dir.join("approvals").join("native");
+    fs::create_dir_all(&native_dir).expect("native dir");
+    fs::write(
+        native_dir.join("appr-single.json"),
+        r#"{
+          "kind": "codex-native",
+          "approval_id": "appr-single",
+          "request_method": "item/commandExecution/requestApproval",
+          "jsonrpc_id": 99,
+          "thread_id": "thread-1",
+          "turn_id": "turn-1",
+          "command": "cargo test",
+          "cwd": "/tmp/project",
+          "summary": ["Command: cargo test"],
+          "prompt": "Codex requests permission.",
+          "request_params": {"command":"cargo test"},
+          "created_at_millis": 1,
+          "expires_at_millis": 9999999999999
+        }"#,
+    )
+    .expect("pending native");
+
+    let approved = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":yes",
+        ])
+        .output()
+        .expect("approve");
+
+    assert!(
+        approved.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    let decision =
+        fs::read_to_string(native_dir.join("appr-single.decision.json")).expect("decision");
+    assert!(decision.contains(r#""decision": "approve""#), "{decision}");
+    assert!(
+        String::from_utf8_lossy(&approved.stdout).contains("Approved Codex approval appr-single")
     );
 }
 
@@ -1411,8 +1581,15 @@ fn openclaw_model_arg_is_passed_to_codex_without_backend_prefix() {
     let temp = tempfile::tempdir().expect("temp dir");
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
 
     write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(r#"{{"openclaw":{{"stateDir":"{}"}}}}"#, state_dir.display()),
+    )
+    .expect("write config");
     let path = format!(
         "{}:{}",
         temp.path().display(),
@@ -1421,6 +1598,8 @@ fn openclaw_model_arg_is_passed_to_codex_without_backend_prefix() {
     let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
         .args([
             "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
             "--jsonl",
             "--model",
             "wecode-codex/gpt-5.4",
@@ -1943,8 +2122,8 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
         "## Session 命令",
         "- `:fresh [prompt]` - 硬新开 Codex thread；带 prompt 时立即执行，不带 prompt 时作用于下一条请求",
         "## 审批命令",
-        "- `:approve <id>` / `:yes <id>` - 批准并执行待确认命令",
-        "- `:deny <id>` / `:no <id>` - 拒绝待确认命令",
+        "- `yes` / `:yes [id]` - 批准并执行待确认命令",
+        "- `no` / `:no [id]` - 拒绝待确认命令",
         "## 模型命令",
         "- `:model default` - 清除项目模型覆盖",
         "## 自定义命令",
@@ -2414,8 +2593,15 @@ fn fresh_command_runs_prompt_in_new_codex_thread() {
     let temp = tempfile::tempdir().expect("temp dir");
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
 
     write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(r#"{{"openclaw":{{"stateDir":"{}"}}}}"#, state_dir.display()),
+    )
+    .expect("write config");
     let path = format!(
         "{}:{}",
         temp.path().display(),
@@ -2424,6 +2610,8 @@ fn fresh_command_runs_prompt_in_new_codex_thread() {
     let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
         .args([
             "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
             "--jsonl",
             "--resume",
             "existing-thread",

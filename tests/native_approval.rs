@@ -111,7 +111,7 @@ fn native_record_is_written_under_native_approval_dir() {
     assert!(native_approvals_dir(&config)
         .join(format!("{}.json", record.approval_id))
         .exists());
-    assert!(record.prompt.contains(":approve "));
-    assert!(record.prompt.contains(":deny "));
+    assert!(record.prompt.contains(":yes "));
+    assert!(record.prompt.contains(":no "));
     assert!(record.prompt.contains("cargo test"));
 }

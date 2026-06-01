@@ -19,7 +19,7 @@ use wecode::{
     default_config, diagnose_tools, list_all_codex_sessions,
     native_approval::{self, NativeApprovalDecision},
     openclaw_bin_path, parse_node_version, patch_gateway_launch_agent_prevent_sleep,
-    patch_openclaw_text_command_routing, prepare_backend_input_with_trace, read_config_str,
+    patch_openclaw_runtime, prepare_backend_input_with_trace, read_config_str,
     render_command_input, run_lock, weixin_install_step, BackendInput, CliCommand, CommandStep,
     PreparedBackendInput, ToolReport, ToolSnapshot, WecodeConfig,
 };
@@ -88,9 +88,15 @@ pub fn run(command: CliCommand) -> Result<(), String> {
             print_bootstrap_success();
             Ok(())
         }
-        CliCommand::PatchOpenclawRuntime { runtime_dir } => {
-            patch_openclaw_text_command_routing(Path::new(&expand_tilde(&runtime_dir)))?;
-            eprintln!("patched OpenClaw command routing in {runtime_dir}");
+        CliCommand::PatchOpenclawRuntime {
+            runtime_dir,
+            state_dir,
+        } => {
+            patch_openclaw_runtime(
+                Path::new(&expand_tilde(&runtime_dir)),
+                Path::new(&expand_tilde(&state_dir)),
+            )?;
+            eprintln!("patched OpenClaw runtime in {runtime_dir}");
             Ok(())
         }
         CliCommand::InstallWeixin => {
@@ -215,13 +221,13 @@ pub fn run(command: CliCommand) -> Result<(), String> {
                 }
                 BackendInput::Approve { approval_id } => approve_approval(
                     &config,
-                    &approval_id,
+                    approval_id,
                     resume_session_id,
                     model,
                     jsonl,
                     Some(&flow_run_id),
                 ),
-                BackendInput::Deny { approval_id } => deny_approval(&config, &approval_id, jsonl),
+                BackendInput::Deny { approval_id } => deny_approval(&config, approval_id, jsonl),
             }
         }
         CliCommand::Render { config_path, input } => {
@@ -411,13 +417,29 @@ fn replace_openclaw_case_insensitive(input: &str) -> String {
 
     while let Some(offset) = lower[cursor..].find("openclaw") {
         let start = cursor + offset;
+        let end = start + "openclaw".len();
         output.push_str(&input[cursor..start]);
-        output.push_str("wecode");
-        cursor = start + "openclaw".len();
+        if is_openclaw_brand_reference(input, start, end) {
+            output.push_str("Wecode");
+        } else {
+            output.push_str(&input[start..end]);
+        }
+        cursor = end;
     }
 
     output.push_str(&input[cursor..]);
     output
+}
+
+fn is_openclaw_brand_reference(input: &str, start: usize, end: usize) -> bool {
+    let previous = input[..start].chars().next_back();
+    let next = input[end..].chars().next();
+    !previous.is_some_and(is_openclaw_identifier_char)
+        && !next.is_some_and(is_openclaw_identifier_char)
+}
+
+fn is_openclaw_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\' | '@')
 }
 
 fn run_logged_step(
@@ -710,7 +732,7 @@ fn log_prepared_backend_input(run_id: &str, prepared: &PreparedBackendInput) {
             event = "backend_input_prepared",
             command_input = ?prepared.command_input.as_str(),
             backend_input_kind = "approve",
-            approval_id = ?approval_id.as_str(),
+            approval_id = ?approval_id.as_deref(),
             "prompt_flow"
         ),
         BackendInput::Deny { approval_id } => tracing::info!(
@@ -718,7 +740,7 @@ fn log_prepared_backend_input(run_id: &str, prepared: &PreparedBackendInput) {
             event = "backend_input_prepared",
             command_input = ?prepared.command_input.as_str(),
             backend_input_kind = "deny",
-            approval_id = ?approval_id.as_str(),
+            approval_id = ?approval_id.as_deref(),
             "prompt_flow"
         ),
         BackendInput::ApprovalRequired {
@@ -909,6 +931,7 @@ fn run_remote_backend_with_fallback(
         resume_session_id,
     };
     let mut thread_id_emitted = false;
+    let mut streamed_text = String::new();
     match run_codex_remote_turn_with_events(&request, |event| match event {
         CodexRemoteRunEvent::AgentMessage {
             thread_id,
@@ -922,18 +945,32 @@ fn run_remote_backend_with_fallback(
                 emit_remote_thread_jsonl(&thread_id)?;
                 thread_id_emitted = true;
             }
-            emit_remote_assistant_message_jsonl(&text)
+            let delta = remote_stream_delta(&mut streamed_text, &text);
+            emit_remote_assistant_delta_jsonl(&delta)
         }
         CodexRemoteRunEvent::NativeApprovalRequested {
             thread_id,
-            approval_id: _,
+            approval_id,
             prompt,
         } => {
             if !thread_id_emitted {
                 emit_remote_thread_jsonl(&thread_id)?;
                 thread_id_emitted = true;
             }
-            emit_remote_assistant_message_jsonl(&prompt)
+            let delta = remote_stream_delta(&mut streamed_text, &prompt);
+            emit_remote_assistant_delta_jsonl(&delta)?;
+            if let Some(run_id) = flow_run_id {
+                tracing::info!(
+                    run_id = %run_id,
+                    event = "codex_remote_native_approval_prompt_emitted",
+                    thread_id = ?thread_id.as_str(),
+                    approval_id = ?approval_id.as_str(),
+                    prompt_bytes = prompt.len(),
+                    delta_bytes = delta.len(),
+                    "prompt_flow"
+                );
+            }
+            Ok(())
         }
     }) {
         Ok(result) => {
@@ -985,6 +1022,11 @@ fn emit_remote_assistant_message_jsonl(text: &str) -> Result<(), String> {
     emit_jsonl_value(&assistant_message)
 }
 
+fn emit_remote_assistant_delta_jsonl(delta: &str) -> Result<(), String> {
+    let assistant_delta = openclaw_assistant_delta_jsonl_value(delta);
+    emit_jsonl_value(&assistant_delta)
+}
+
 fn openclaw_thread_jsonl_value(thread_id: &str) -> serde_json::Value {
     serde_json::json!({ "thread_id": thread_id })
 }
@@ -996,6 +1038,30 @@ fn openclaw_assistant_message_jsonl_value(text: &str) -> serde_json::Value {
             "text": text
         }
     })
+}
+
+fn openclaw_assistant_delta_jsonl_value(delta: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "text_delta",
+                "text": delta
+            }
+        }
+    })
+}
+
+fn remote_stream_delta(streamed_text: &mut String, next_text: &str) -> String {
+    if streamed_text.is_empty() {
+        streamed_text.push_str(next_text);
+        return next_text.to_string();
+    }
+    let delta = format!("\n\n{next_text}");
+    streamed_text.push_str(&delta);
+    delta
 }
 
 fn emit_jsonl_value(value: &serde_json::Value) -> Result<(), String> {
@@ -1767,7 +1833,7 @@ fn emit_approval_request(
     write_pending_approval(config, &approval_id, &approval)?;
     emit_local_message(
         &format!(
-            "Command `{command_name}` requires approval.\nApprove: :approve {approval_id} or :yes {approval_id}\nDeny: :deny {approval_id} or :no {approval_id}"
+            "Command `{command_name}` requires approval.\nApproval: {approval_id}\nApprove: yes, :yes, or :yes {approval_id}\nDeny: no, :no, or :no {approval_id}"
         ),
         jsonl,
     )
@@ -1775,17 +1841,21 @@ fn emit_approval_request(
 
 fn approve_approval(
     config: &WecodeConfig,
-    approval_id: &str,
+    approval_id: Option<String>,
     resume_session_id: Option<String>,
     selected_model: Option<String>,
     jsonl: bool,
     flow_run_id: Option<&str>,
 ) -> Result<(), String> {
-    let custom_path = approval_path(config, approval_id);
+    let Some(approval_id) = resolve_pending_approval_id(config, approval_id, "approve", jsonl)?
+    else {
+        return Ok(());
+    };
+    let custom_path = approval_path(config, &approval_id);
     if custom_path.exists() {
         return run_approved_prompt(
             config,
-            approval_id,
+            &approval_id,
             resume_session_id,
             selected_model,
             jsonl,
@@ -1795,7 +1865,7 @@ fn approve_approval(
 
     match native_approval::write_native_approval_decision(
         config,
-        approval_id,
+        &approval_id,
         NativeApprovalDecision::Approve,
     ) {
         Ok(()) => emit_local_markdown(
@@ -1832,8 +1902,15 @@ fn run_approved_prompt(
     Ok(())
 }
 
-fn deny_approval(config: &WecodeConfig, approval_id: &str, jsonl: bool) -> Result<(), String> {
-    let path = approval_path(config, approval_id);
+fn deny_approval(
+    config: &WecodeConfig,
+    approval_id: Option<String>,
+    jsonl: bool,
+) -> Result<(), String> {
+    let Some(approval_id) = resolve_pending_approval_id(config, approval_id, "deny", jsonl)? else {
+        return Ok(());
+    };
+    let path = approval_path(config, &approval_id);
     if path.exists() {
         fs::remove_file(&path)
             .map_err(|err| format!("failed to delete approval {approval_id}: {err}"))?;
@@ -1842,7 +1919,7 @@ fn deny_approval(config: &WecodeConfig, approval_id: &str, jsonl: bool) -> Resul
 
     match native_approval::write_native_approval_decision(
         config,
-        approval_id,
+        &approval_id,
         NativeApprovalDecision::Deny,
     ) {
         Ok(()) => emit_local_markdown(
@@ -1852,6 +1929,65 @@ fn deny_approval(config: &WecodeConfig, approval_id: &str, jsonl: bool) -> Resul
             jsonl,
         ),
         Err(_) => emit_local_markdown(&format!("Approval {approval_id} was not found."), jsonl),
+    }
+}
+
+fn resolve_pending_approval_id(
+    config: &WecodeConfig,
+    approval_id: Option<String>,
+    action: &str,
+    jsonl: bool,
+) -> Result<Option<String>, String> {
+    if approval_id.is_some() {
+        return Ok(approval_id);
+    }
+
+    let ids = pending_approval_ids(config);
+    match ids.as_slice() {
+        [id] => Ok(Some(id.clone())),
+        [] => {
+            emit_local_markdown(
+                &format!("No pending approvals to {action}. Use :status to check current state."),
+                jsonl,
+            )?;
+            Ok(None)
+        }
+        _ => {
+            emit_local_markdown(
+                &format!(
+                    "Multiple pending approvals: {}. Reply :yes <id> or :no <id>.",
+                    ids.join(", ")
+                ),
+                jsonl,
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+fn pending_approval_ids(config: &WecodeConfig) -> Vec<String> {
+    let mut ids = Vec::new();
+    collect_approval_ids_from_dir(&approvals_dir(config), &mut ids);
+    ids.extend(native_approval::pending_native_approval_ids(config));
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn collect_approval_ids_from_dir(dir: &Path, ids: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+        if !path.is_file()
+            || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+            || path.to_string_lossy().ends_with(".decision.json")
+        {
+            continue;
+        }
+        if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
+            ids.push(id.to_string());
+        }
     }
 }
 
@@ -1916,8 +2052,8 @@ fn weixin_help_message(config: &WecodeConfig) -> String {
         "".to_string(),
         "## 审批命令".to_string(),
         "".to_string(),
-        "- `:approve <id>` / `:yes <id>` - 批准并执行待确认命令".to_string(),
-        "- `:deny <id>` / `:no <id>` - 拒绝待确认命令".to_string(),
+        "- `yes` / `:yes [id]` - 批准并执行待确认命令".to_string(),
+        "- `no` / `:no [id]` - 拒绝待确认命令".to_string(),
         "".to_string(),
         "## 模型命令".to_string(),
         "".to_string(),
@@ -1973,16 +2109,7 @@ fn weixin_status_message(
                 .count()
         })
         .unwrap_or(0);
-    let native_pending = fs::read_dir(native_approval::native_approvals_dir(config))
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-                .filter(|path| !path.to_string_lossy().ends_with(".decision.json"))
-                .count()
-        })
-        .unwrap_or(0);
+    let native_pending = native_approval::pending_native_approval_ids(config).len();
     let pending = custom_pending + native_pending;
     let model = effective_codex_model(config, selected_model)
         .ok()

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Bridge Codex app-server native approval requests to WeChat/Feishu so `:approve appr-...` or `:deny appr-...` unblocks the running Codex turn.
+**Goal:** Bridge Codex app-server native approval requests to WeChat/Feishu so `yes` / `no` or explicit `:yes appr-...` / `:no appr-...` unblocks the running Codex turn.
 
-**Architecture:** Keep the bridge inside the existing `wecode codex-backend` CLI flow. The running remote Codex process persists a native approval record, emits a channel-visible approval prompt, polls for a decision file, then sends the matching JSON-RPC approval response back to Codex. Because OpenClaw `serialize: true` can prevent the second `:approve` backend invocation from running while the first turn is blocked, generated backend config must switch to `serialize: false` and Wecode must add its own Codex-run lock that excludes approval commands.
+**Architecture:** Keep the bridge inside the existing `wecode codex-backend` CLI flow. The running remote Codex process persists a native approval record, emits a channel-visible approval prompt, polls for a decision file, then sends the matching JSON-RPC approval response back to Codex. Because channel queues can prevent the approval reply from running while the first turn is blocked, generated backend config must switch to `serialize: false`, Wecode must add its own Codex-run lock that excludes approval commands, and the OpenClaw Weixin/Feishu runtime must route approval replies through the control lane.
 
 **Tech Stack:** Rust, serde/serde_json, JSONL stdout for OpenClaw, Codex app-server JSON-RPC, file-backed state under `openclaw.stateDir`.
 
@@ -16,10 +16,10 @@
 - Not supported in this implementation: bridging `codex exec --json` fallback approvals. The exec transport does not expose the interactive app-server server-request JSON-RPC path currently used by Wecode.
 - Exec fallback must invoke `codex exec --yolo --json ...` and `codex exec resume --yolo --json ...` so fallback turns run with Codex's YOLO approval mode instead of hanging on an interactive approval request.
 - Existing custom command approvals (`requireConfirm: true`) must keep working. Native approvals must not start a second Codex run when approved.
-- `:yes <id>` and `:no <id>` are supported aliases for `:approve <id>` and `:deny <id>`.
+- `yes` / `no` and `:yes` / `:no` resolve the single pending approval. Explicit `:yes <id>` / `:no <id>` still works when multiple approvals are pending. `:approve` / `:deny` remain compatibility aliases.
 - Native approval files live under `openclaw.stateDir/approvals/native/` to avoid changing the old custom approval record format.
 - Native approval timeout defaults to 10 minutes and is capped below OpenClaw's CLI no-output watchdog so the backend auto-denies before OpenClaw kills the process.
-- Approval messages are plain Markdown text. Remote-turn approval prompts are emitted as OpenClaw JSONL assistant-message items so WeChat/Feishu can display them while the process keeps waiting.
+- Approval messages are plain Markdown text. Remote-turn approval prompts are emitted as Claude-stream JSONL text deltas so OpenClaw can display them while the process keeps waiting. Runtime patching keeps Weixin block streaming enabled and routes Weixin/Feishu approval replies around the blocked main lane.
 
 ## Protocol Contract
 
@@ -1477,8 +1477,8 @@ Replace the limitation:
 with:
 
 ```markdown
-- remote 模式会把 Codex app-server 原生审批请求转成微信/飞书可见的 `appr-...` 审批提示。发送 `:approve appr-...` 会批准当前 Codex turn 的这一次请求，发送 `:deny appr-...` 会拒绝。这个能力只覆盖 remote/app-server transport；`codex exec` fallback 仍不能做交互式审批桥接。
-- 如果你已经运行过旧版 `wecode configure-codex`，升级后重新运行一次 `wecode configure-codex`，让 OpenClaw backend 配置从 `serialize: true` 更新为 `serialize: false`。Wecode 会用自己的运行锁串行化 Codex turn，并允许 `:approve` / `:deny` 在等待审批时进入。
+- remote 模式会把 Codex app-server 原生审批请求转成微信/飞书可见的 `appr-...` 审批提示。只有一个待审批项时，回复 `yes` / `:yes` 批准，回复 `no` / `:no` 拒绝；多个待审批项时使用 `:yes appr-...` / `:no appr-...` 指定 id。这个能力只覆盖 remote/app-server transport；`codex exec` fallback 仍不能做交互式审批桥接。
+- 如果你已经运行过旧版 `wecode configure-codex`，升级后重新运行一次 `wecode configure-codex`，让 OpenClaw backend 配置从 `serialize: true` 更新为 `serialize: false`。Wecode 会用自己的运行锁串行化 Codex turn，并允许审批回复在等待审批时进入。旧版微信/飞书 bootstrap 还需要重新运行对应 bootstrap，让渠道运行时补丁生效。
 ```
 
 - [ ] **Step 4: Run focused tests**
@@ -1540,10 +1540,10 @@ Expected: `valid config: examples/wecode.config.json`.
 Run:
 
 ```bash
-CARGO_TARGET_DIR=/private/tmp/wecode-target cargo run -- bootstrap --dry-run --install-openclaw
+CARGO_TARGET_DIR=/private/tmp/wecode-target cargo run -- bootstrap --dry-run
 ```
 
-Expected: generated backend config includes `"serialize":false`, `sessionIdFields:["thread_id"]`, `output:"jsonl"`, and `resumeOutput:"jsonl"`.
+Expected: generated backend config includes `"serialize":false`, `"jsonlDialect":"claude-stream-json"`, `sessionIdFields:["thread_id"]`, `output:"jsonl"`, and `resumeOutput:"jsonl"`.
 
 - [ ] **Step 5: Manual WeChat test after user approval**
 
@@ -1557,7 +1557,7 @@ Expected: existing smoke test still succeeds. Then ask the user to send a WeChat
 
 ```text
 Codex requests permission
-:approve appr-
+yes
 ```
 
 Expected user flow:
@@ -1565,7 +1565,7 @@ Expected user flow:
 ```text
 User sends normal task
 Wecode emits approval prompt with appr-...
-User sends :approve appr-...
+User sends yes
 Wecode writes native decision file
 Original Codex turn continues and returns final assistant output
 ```
