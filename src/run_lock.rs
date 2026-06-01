@@ -2,12 +2,9 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
 };
 
-use crate::{config::WecodeConfig, paths::expand_tilde};
+use crate::{config::WecodeConfig, paths::expand_tilde, platform};
 
 pub struct CodexRunLock {
     path: Option<PathBuf>,
@@ -133,73 +130,11 @@ fn lock_pid(content: &str) -> Option<u32> {
 }
 
 fn process_is_alive(pid: u32) -> bool {
-    if pid == std::process::id() {
-        return true;
-    }
-    Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(true)
+    platform::process_is_alive(pid)
 }
 
 fn terminate_process_tree(pid: u32) {
-    let descendants = descendant_pids(pid);
-    for child in descendants.iter().rev() {
-        signal_process(*child, "TERM");
-    }
-    signal_process(pid, "TERM");
-
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while process_is_alive(pid) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
-    }
-    if process_is_alive(pid) {
-        for child in descendants.iter().rev() {
-            signal_process(*child, "KILL");
-        }
-        signal_process(pid, "KILL");
-    }
-}
-
-fn descendant_pids(pid: u32) -> Vec<u32> {
-    let mut result = Vec::new();
-    for child in child_pids(pid) {
-        result.extend(descendant_pids(child));
-        result.push(child);
-    }
-    result
-}
-
-fn child_pids(pid: u32) -> Vec<u32> {
-    let output = Command::new("/usr/bin/pgrep")
-        .arg("-P")
-        .arg(pid.to_string())
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .filter(|child| *child > 0 && *child != std::process::id())
-        .collect()
-}
-
-fn signal_process(pid: u32, signal: &str) {
-    if pid == std::process::id() {
-        return;
-    }
-    let _ = Command::new("/bin/kill")
-        .arg(format!("-{signal}"))
-        .arg(pid.to_string())
-        .stderr(Stdio::null())
-        .status();
+    platform::kill_process_tree(pid);
 }
 
 fn stable_key_hash(value: &str) -> String {

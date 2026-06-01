@@ -1769,15 +1769,14 @@ fn emit_resume_session(
 }
 
 fn compact_home_path(value: &str) -> String {
-    let Ok(home) = env::var("HOME") else {
+    let Some(home) = wecode::platform::home_dir() else {
         return value.to_string();
     };
-    let home = Path::new(&home);
     let path = Path::new(value);
     if path == home {
         return "~".to_string();
     }
-    if let Ok(rest) = path.strip_prefix(home) {
+    if let Ok(rest) = path.strip_prefix(&home) {
         return format!("~/{}", rest.display());
     }
     value.to_string()
@@ -2160,9 +2159,9 @@ fn codex_sessions_root() -> PathBuf {
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return PathBuf::from(codex_home).join("sessions");
     }
-    env::var("HOME")
-        .map(|home| PathBuf::from(home).join(".codex").join("sessions"))
-        .unwrap_or_else(|_| PathBuf::from(".codex").join("sessions"))
+    wecode::platform::home_dir()
+        .map(|home| home.join(".codex").join("sessions"))
+        .unwrap_or_else(|| PathBuf::from(".codex").join("sessions"))
 }
 
 fn codex_target_cwd(config: &WecodeConfig) -> Result<PathBuf, String> {
@@ -2527,12 +2526,7 @@ fn default_config_path() -> Option<PathBuf> {
         return Some(PathBuf::from(path).join("wecode").join("config.json"));
     }
 
-    env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("wecode")
-            .join("config.json")
-    })
+    wecode::platform::config_dir().map(|dir| dir.join("wecode").join("config.json"))
 }
 
 fn codex_output_path() -> PathBuf {
@@ -2655,9 +2649,16 @@ fn launch_agent_sleep_guard(path: &Path) -> String {
 }
 
 fn gateway_process_status(profile: &str) -> String {
+    #[cfg(unix)]
     let output = Command::new("/bin/ps")
         .args(["ax", "-o", "command="])
         .output();
+
+    #[cfg(windows)]
+    let output = Command::new("tasklist")
+        .args(["/V", "/FO", "CSV", "/NH"])
+        .output();
+
     let Ok(output) = output else {
         return "`unknown`".to_string();
     };
@@ -2799,7 +2800,7 @@ fn resolve_supported_node_bin_dir(config: &WecodeConfig) -> Option<String> {
 }
 
 fn node_bin_dir_is_supported(path: &Path) -> bool {
-    let node = path.join("node");
+    let node = path.join(if cfg!(windows) { "node.exe" } else { "node" });
     let version = capture_version_with_path(&node.display().to_string(), &["--version"], &[]);
     version
         .as_deref()
@@ -2808,6 +2809,7 @@ fn node_bin_dir_is_supported(path: &Path) -> bool {
 }
 
 fn supported_node_bin_dir_candidates() -> Vec<PathBuf> {
+    #[cfg(not(windows))]
     let mut candidates = vec![
         PathBuf::from("/opt/homebrew/opt/node/bin"),
         PathBuf::from("/opt/homebrew/opt/node@24/bin"),
@@ -2817,14 +2819,36 @@ fn supported_node_bin_dir_candidates() -> Vec<PathBuf> {
         PathBuf::from("/usr/local/opt/node@22/bin"),
     ];
 
-    if let Ok(home) = env::var("HOME") {
+    #[cfg(windows)]
+    let mut candidates = vec![
+        PathBuf::from(r"C:\Program Files\nodejs"),
+    ];
+
+    if let Some(home) = wecode::platform::home_dir() {
+        #[cfg(not(windows))]
+        {
+            candidates.extend(versioned_node_bin_dirs(
+                home.join(".local/share/mise/installs/node"),
+            ));
+            candidates.extend(versioned_node_bin_dirs(
+                home.join(".nvm/versions/node"),
+            ));
+        }
+        candidates.push(home.join(".volta").join("bin"));
+    }
+
+    #[cfg(windows)]
+    if let Some(appdata) = env::var_os("APPDATA") {
+        let appdata = PathBuf::from(appdata);
+        candidates.extend(versioned_node_bin_dirs(appdata.join("nvm")));
         candidates.extend(versioned_node_bin_dirs(
-            Path::new(&home).join(".local/share/mise/installs/node"),
+            appdata.join("fnm").join("node-versions"),
         ));
-        candidates.extend(versioned_node_bin_dirs(
-            Path::new(&home).join(".nvm/versions/node"),
-        ));
-        candidates.push(Path::new(&home).join(".volta/bin"));
+    }
+
+    #[cfg(windows)]
+    if let Ok(nvm_home) = env::var("NVM_HOME") {
+        candidates.extend(versioned_node_bin_dirs(PathBuf::from(nvm_home)));
     }
 
     candidates
@@ -2855,15 +2879,5 @@ fn path_with_prepend(paths: &[String]) -> String {
 }
 
 fn expand_tilde(value: &str) -> String {
-    if value == "~" {
-        return env::var("HOME").unwrap_or_else(|_| value.to_string());
-    }
-
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(rest).display().to_string();
-        }
-    }
-
-    value.to_string()
+    wecode::paths::expand_tilde(value)
 }

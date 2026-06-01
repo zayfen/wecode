@@ -612,8 +612,8 @@ fn patch_weixin_native_approval_control(source: &str, path: &Path) -> Result<Str
 function resolveWecodeOpenClawStateDir() {
     const configured = process.env.OPENCLAW_STATE_DIR?.trim();
     const stateDir = configured && configured.length > 0 ? configured : "~/.wecode/openclaw-state";
-    if (stateDir === "~") return process.env.HOME || ".";
-    if (stateDir.startsWith("~/")) return path.join(process.env.HOME || ".", stateDir.slice(2));
+    if (stateDir === "~") return process.env.HOME || process.env.USERPROFILE || ".";
+    if (stateDir.startsWith("~/")) return path.join(process.env.HOME || process.env.USERPROFILE || ".", stateDir.slice(2));
     return path.resolve(stateDir);
 }
 function wecodeNativeApprovalsDir() {
@@ -1084,8 +1084,8 @@ fn patch_feishu_native_approval_control(source: &str, path: &Path) -> Result<Str
 function resolveWecodeOpenClawStateDir() {
 	const configured = process.env.OPENCLAW_STATE_DIR?.trim();
 	const stateDir = configured && configured.length > 0 ? configured : "~/.wecode/openclaw-state";
-	if (stateDir === "~") return process.env.HOME || ".";
-	if (stateDir.startsWith("~/")) return path.join(process.env.HOME || ".", stateDir.slice(2));
+	if (stateDir === "~") return process.env.HOME || process.env.USERPROFILE || ".";
+	if (stateDir.startsWith("~/")) return path.join(process.env.HOME || process.env.USERPROFILE || ".", stateDir.slice(2));
 	return path.resolve(stateDir);
 }
 function wecodeNativeApprovalsDir() {
@@ -1279,6 +1279,16 @@ function wecodeProcessIsAlive(pid) {
 async function wecodeChildPids(pid, log = () => {}) {
     try {
         const { execFileSync } = await import("node:child_process");
+        if (process.platform === "win32") {
+            const output = execFileSync("wmic", ["process", "where", `ParentProcessId=${pid}`, "get", "ProcessId", "/FORMAT:LIST"], {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "ignore"],
+            });
+            return output.split(/\r?\n/)
+                .filter((line) => line.startsWith("ProcessId="))
+                .map((line) => Number(line.slice("ProcessId=".length).trim()))
+                .filter((child) => Number.isInteger(child) && child > 0 && child !== process.pid);
+        }
         const output = execFileSync("/usr/bin/pgrep", ["-P", String(pid)], {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "ignore"],

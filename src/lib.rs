@@ -8,6 +8,7 @@ pub mod diagnostics;
 pub mod native_approval;
 pub mod openclaw;
 pub mod paths;
+pub mod platform;
 pub mod run_lock;
 pub mod sessions;
 pub mod yolo;
