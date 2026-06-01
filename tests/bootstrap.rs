@@ -1429,6 +1429,76 @@ async function handleFeishuMessage(params) {
 }
 
 #[test]
+fn patch_openclaw_runtime_aligns_feishu_queue_timeout_with_agent_timeout() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let feishu_dist = state_dir
+        .join("npm")
+        .join("projects")
+        .join("feishu-project")
+        .join("node_modules")
+        .join("@openclaw")
+        .join("feishu")
+        .join("dist");
+    fs::create_dir_all(&feishu_dist).expect("feishu dist dir");
+    let monitor_file = feishu_dist.join("monitor.account-test.js");
+    fs::write(
+        &monitor_file,
+        r#"const DEFAULT_TASK_TIMEOUT_MS = 300 * 1e3;
+function createSequentialQueue(options = {}) {
+	const taskTimeoutMs = options.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
+	return async (key, task) => taskTimeoutMs && task();
+}
+function createFeishuMessageReceiveHandler({ cfg, core, accountId, runtime, chatHistories, fireAndForget, handleMessage, resolveDebounceText: resolveText, hasProcessedMessage, recordProcessedMessage, getBotOpenId = () => void 0, getBotName = () => void 0, resolveSequentialKey = ({ accountId, event }) => `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}` }) {
+	const log = runtime?.log ?? console.log;
+	const error = runtime?.error ?? console.error;
+	const enqueue = createSequentialQueue({ onTaskTimeout: (key, timeoutMs) => {
+		log(`feishu[${accountId}]: per-chat task exceeded ${timeoutMs}ms cap (key=${key}); evicting from queue so later same-key messages can proceed (#70133)`);
+	} });
+	return enqueue;
+}
+function getFeishuSequentialKey(params) {
+	const { accountId, event, botOpenId, botName } = params;
+	const baseKey = `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}`;
+	const text = parseFeishuMessageEvent(event, botOpenId, botName).content.trim();
+	if (isAbortRequestText(text)) return `${baseKey}:control`;
+	if (isBtwRequestText(text)) return `${baseKey}:btw`;
+	return baseKey;
+}
+"#,
+    )
+    .expect("feishu monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
+    assert!(
+        patched.contains("wecodeFeishuTaskTimeoutMs")
+            && patched.contains("cfg?.agents?.defaults?.timeoutSeconds")
+            && patched.contains("taskTimeoutMs: wecodeFeishuTaskTimeoutMs"),
+        "feishu per-chat queue timeout should follow OpenClaw agent timeout so approval waits do not fail at 300s:\n{patched}"
+    );
+    assert_eq!(
+        patched.matches("wecodeFeishuTaskTimeoutMs").count(),
+        2,
+        "feishu timeout patch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
 fn prevent_sleep_wraps_gateway_launch_agent_arguments_on_ac_power() {
     let original = vec![
         "/Users/riven/.wecode/openclaw-state/service-env/ai.openclaw.wecode-env-wrapper.sh"

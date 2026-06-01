@@ -999,7 +999,8 @@ fn patch_feishu_monitor_account(path: &Path) -> Result<(), String> {
     if !source.contains("function getFeishuSequentialKey") {
         return Ok(());
     }
-    let with_helper = ensure_wecode_approval_control_helper(&source, HELPER_ANCHOR)?;
+    let with_timeout = patch_feishu_message_queue_timeout(&source, path)?;
+    let with_helper = ensure_wecode_approval_control_helper(&with_timeout, HELPER_ANCHOR)?;
     let patched = if with_helper.contains(PATCHED) {
         with_helper
     } else if with_helper.contains(ORIGINAL) {
@@ -1017,6 +1018,37 @@ fn patch_feishu_monitor_account(path: &Path) -> Result<(), String> {
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     }
     Ok(())
+}
+
+fn patch_feishu_message_queue_timeout(source: &str, path: &Path) -> Result<String, String> {
+    if source.contains("wecodeFeishuTaskTimeoutMs") {
+        return Ok(source.to_string());
+    }
+    if !source.contains("function createFeishuMessageReceiveHandler") {
+        return Ok(source.to_string());
+    }
+    const ORIGINAL: &str = r#"	const log = runtime?.log ?? console.log;
+	const error = runtime?.error ?? console.error;
+	const enqueue = createSequentialQueue({ onTaskTimeout: (key, timeoutMs) => {
+		log(`feishu[${accountId}]: per-chat task exceeded ${timeoutMs}ms cap (key=${key}); evicting from queue so later same-key messages can proceed (#70133)`);
+	} });"#;
+    const PATCHED: &str = r#"	const log = runtime?.log ?? console.log;
+	const error = runtime?.error ?? console.error;
+	const wecodeFeishuAgentTimeoutSeconds = Number(cfg?.agents?.defaults?.timeoutSeconds);
+	const wecodeFeishuTaskTimeoutMs = Number.isFinite(wecodeFeishuAgentTimeoutSeconds) && wecodeFeishuAgentTimeoutSeconds > 0
+		? Math.max(DEFAULT_TASK_TIMEOUT_MS, Math.ceil(wecodeFeishuAgentTimeoutSeconds * 1e3) + 60 * 1e3)
+		: DEFAULT_TASK_TIMEOUT_MS;
+	const enqueue = createSequentialQueue({ taskTimeoutMs: wecodeFeishuTaskTimeoutMs, onTaskTimeout: (key, timeoutMs) => {
+		log(`feishu[${accountId}]: per-chat task exceeded ${timeoutMs}ms cap (key=${key}); evicting from queue so later same-key messages can proceed (#70133)`);
+	} });"#;
+
+    if source.contains(ORIGINAL) {
+        return Ok(source.replace(ORIGINAL, PATCHED));
+    }
+    Err(format!(
+        "unsupported Feishu monitor.account format; message queue timeout block not found in {}",
+        path.display()
+    ))
 }
 
 fn patch_feishu_native_approval_control(source: &str, path: &Path) -> Result<String, String> {
