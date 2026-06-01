@@ -9,6 +9,10 @@ use serde_json::{json, Value};
 
 use crate::{
     config::{codex_model_from_openclaw_model, WecodeConfig},
+    native_approval::{
+        self, approval_response_for_decision, create_native_approval_record,
+        wait_for_native_approval_decision_with_progress,
+    },
     paths::expand_tilde,
 };
 
@@ -25,6 +29,15 @@ pub enum CodexRemoteRunEvent {
         thread_id: String,
         text: String,
         final_answer: bool,
+    },
+    NativeApprovalRequested {
+        thread_id: String,
+        approval_id: String,
+        prompt: String,
+    },
+    NativeApprovalStillPending {
+        thread_id: String,
+        approval_id: String,
     },
 }
 
@@ -145,20 +158,30 @@ fn run_codex_remote_turn_with_proxy_command(
         })?
     };
 
-    let turn_response = client.request(
+    let turn_params = json!({
+        "threadId": thread_id,
+        "input": [
+            {
+                "type": "text",
+                "text": request.prompt,
+                "text_elements": []
+            }
+        ],
+        "cwd": codex_target_cwd(request.config)?.display().to_string(),
+        "model": effective_codex_model(request.config, request.selected_model)?
+    });
+    let turn_response = client.request_with_unhandled_server_requests(
         "turn/start",
-        json!({
-            "threadId": thread_id,
-            "input": [
-                {
-                    "type": "text",
-                    "text": request.prompt,
-                    "text_elements": []
-                }
-            ],
-            "cwd": codex_target_cwd(request.config)?.display().to_string(),
-            "model": effective_codex_model(request.config, request.selected_model)?
-        }),
+        turn_params,
+        |client, message| {
+            handle_native_approval_request(
+                request.config,
+                client,
+                message,
+                &thread_id,
+                event_handler,
+            )
+        },
     )?;
     if let Some(message) = extract_final_message(turn_response.get("turn")) {
         return Ok(CodexRemoteRunResult {
@@ -182,7 +205,13 @@ fn run_codex_remote_turn_with_proxy_command(
                 });
             }
         } else if message.get("id").is_some() && message.get("method").is_some() {
-            client.decline_server_request(&message)?;
+            handle_native_approval_request(
+                request.config,
+                &mut client,
+                &message,
+                &thread_id,
+                event_handler,
+            )?;
         } else {
             if let Some(agent_message) = turn_state.observe_notification(&message) {
                 event_handler(CodexRemoteRunEvent::AgentMessage {
@@ -193,6 +222,39 @@ fn run_codex_remote_turn_with_proxy_command(
             }
         }
     }
+}
+
+fn handle_native_approval_request(
+    config: &WecodeConfig,
+    client: &mut JsonRpcClient,
+    message: &Value,
+    fallback_thread_id: &str,
+    event_handler: &mut impl FnMut(CodexRemoteRunEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    if !native_approval::is_supported_approval_method(method) {
+        return client.decline_server_request(message);
+    }
+    let record = create_native_approval_record(config, message)?;
+    let thread_id = record
+        .thread_id
+        .clone()
+        .unwrap_or_else(|| fallback_thread_id.to_string());
+    let approval_id = record.approval_id.clone();
+    event_handler(CodexRemoteRunEvent::NativeApprovalRequested {
+        thread_id: thread_id.clone(),
+        approval_id: approval_id.clone(),
+        prompt: record.prompt.clone(),
+    })?;
+    let decision = wait_for_native_approval_decision_with_progress(config, &record, || {
+        event_handler(CodexRemoteRunEvent::NativeApprovalStillPending {
+            thread_id: thread_id.clone(),
+            approval_id: approval_id.clone(),
+        })
+    })?;
+    let result =
+        approval_response_for_decision(&record.request_method, &record.request_params, decision);
+    client.respond_to_server_request(message, result)
 }
 
 fn remote_proxy_commands(config: &WecodeConfig) -> Vec<&str> {
@@ -309,6 +371,20 @@ impl JsonRpcClient {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_unhandled_server_requests(method, params, |client, message| {
+            client.decline_server_request(message)
+        })
+    }
+
+    fn request_with_unhandled_server_requests<F>(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut handler: F,
+    ) -> Result<Value, String>
+    where
+        F: FnMut(&mut JsonRpcClient, &Value) -> Result<(), String>,
+    {
         let id = self.next_id;
         self.next_id += 1;
         let request = json!({
@@ -328,7 +404,7 @@ impl JsonRpcClient {
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
             if message.get("id").is_some() && message.get("method").is_some() {
-                self.decline_server_request(&message)?;
+                handler(self, &message)?;
             }
         }
     }
@@ -364,9 +440,9 @@ impl JsonRpcClient {
     }
 
     fn decline_server_request(&mut self, message: &Value) -> Result<(), String> {
-        let Some(id) = message.get("id").cloned() else {
+        if message.get("id").is_none() {
             return Ok(());
-        };
+        }
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let result = match method {
             "item/commandExecution/requestApproval" => json!({ "decision": "decline" }),
@@ -375,6 +451,13 @@ impl JsonRpcClient {
                 json!({ "permissions": {}, "scope": "turn", "strictAutoReview": true })
             }
             _ => Value::Null,
+        };
+        self.respond_to_server_request(message, result)
+    }
+
+    fn respond_to_server_request(&mut self, message: &Value, result: Value) -> Result<(), String> {
+        let Some(id) = message.get("id").cloned() else {
+            return Ok(());
         };
         self.write_message(&json!({
             "jsonrpc": "2.0",
@@ -468,7 +551,7 @@ fn shell_command(command: &str) -> Command {
         shell
     } else {
         let mut shell = Command::new("sh");
-        shell.arg("-lc").arg(command);
+        shell.arg("-c").arg(command);
         shell
     }
 }

@@ -47,7 +47,7 @@ CARGO_TARGET_DIR=/private/tmp/wecode-target cargo test
 
 ```bash
 CARGO_TARGET_DIR=/private/tmp/wecode-target cargo run -- config validate examples/wecode.config.json
-CARGO_TARGET_DIR=/private/tmp/wecode-target cargo run -- bootstrap --dry-run --install-openclaw
+CARGO_TARGET_DIR=/private/tmp/wecode-target cargo run -- bootstrap --dry-run
 ```
 
 只有在用户已经配置并启动私有 OpenClaw Gateway 时，才运行：
@@ -58,7 +58,7 @@ node scripts/openclaw-agent-smoke.mjs
 
 ## 安全与外部状态
 
-- 不要默认执行会修改用户机器状态的命令，例如 `bootstrap --install-openclaw`、
+- 不要默认执行会修改用户机器状态的命令，例如 `bootstrap`、
   `install-weixin`、`openclaw gateway install`。
 - 不要默认清理 `~/.wecode/` 或 `~/.codex/sessions/` 下的文件。
 - `/resume` 相关输出只列最小必要信息：session id、时间、cwd、originator、

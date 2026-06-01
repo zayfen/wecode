@@ -35,8 +35,8 @@ fn parses_cli_commands() {
     );
 
     assert_eq!(
-        parse_cli_args(["wecode", "bootstrap", "--install-openclaw"]),
-        Err("unexpected bootstrap argument: --install-openclaw".to_string())
+        parse_cli_args(["wecode", "bootstrap", "--unknown"]),
+        Err("unexpected bootstrap argument: --unknown".to_string())
     );
 
     assert_eq!(
@@ -44,10 +44,13 @@ fn parses_cli_commands() {
             "wecode",
             "patch-openclaw-runtime",
             "--runtime-dir",
-            "~/.wecode/openclaw-runtime"
+            "~/.wecode/openclaw-runtime",
+            "--state-dir",
+            "~/.wecode/openclaw-state"
         ]),
         Ok(CliCommand::PatchOpenclawRuntime {
-            runtime_dir: "~/.wecode/openclaw-runtime".to_string()
+            runtime_dir: "~/.wecode/openclaw-runtime".to_string(),
+            state_dir: "~/.wecode/openclaw-state".to_string()
         })
     );
 

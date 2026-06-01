@@ -55,6 +55,7 @@ impl AssistantBackend for CodexBackend {
         if request.resume_session_id.is_some() {
             args.push("resume".to_string());
         }
+        args.push("--yolo".to_string());
         args.push("--json".to_string());
         args.push("-o".to_string());
         args.push(output_path.display().to_string());

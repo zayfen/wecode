@@ -98,6 +98,11 @@ pub struct CodexRemoteConfig {
         rename = "fallbackProxyCommand"
     )]
     pub fallback_proxy_command: String,
+    #[serde(
+        default = "default_codex_remote_approval_timeout_seconds",
+        rename = "approvalTimeoutSeconds"
+    )]
+    pub approval_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -160,6 +165,7 @@ impl Default for CodexRemoteConfig {
             proxy_command: default_codex_remote_proxy_command(),
             start_command: default_codex_remote_start_command(),
             fallback_proxy_command: default_codex_remote_fallback_proxy_command(),
+            approval_timeout_seconds: default_codex_remote_approval_timeout_seconds(),
         }
     }
 }
@@ -226,6 +232,10 @@ fn default_codex_remote_start_command() -> String {
 
 fn default_codex_remote_fallback_proxy_command() -> String {
     "codex app-server --listen stdio://".to_string()
+}
+
+fn default_codex_remote_approval_timeout_seconds() -> u64 {
+    600
 }
 
 fn default_codex_models() -> Vec<String> {

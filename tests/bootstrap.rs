@@ -2,8 +2,9 @@ mod common;
 
 use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 use wecode::{
-    bootstrap_plan_with_backend_command, default_config, patch_openclaw_text_command_routing,
-    prevent_sleep_program_arguments, BootstrapChannel, CommandStep, PreventSleepMode,
+    bootstrap_plan_with_backend_command, default_config, patch_openclaw_runtime,
+    patch_openclaw_text_command_routing, prevent_sleep_program_arguments, BootstrapChannel,
+    CommandStep, PreventSleepMode,
 };
 
 #[test]
@@ -28,7 +29,7 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
             ]
         )
     );
-    assert!(!steps
+    assert!(steps
         .iter()
         .any(|step| step.args.iter().any(|arg| arg == "patch-openclaw-runtime")));
     assert!(common::has_step(
@@ -72,7 +73,7 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
         .iter()
         .any(|arg| arg == "plugins.entries.codex.enabled")));
     let cli_backend_json = format!(
-        "{{\"wecode-codex\":{{\"args\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{}],\"command\":\"/usr/local/bin/wecode\",\"input\":\"stdin\",\"modelArg\":\"--model\",\"output\":\"jsonl\",\"reliability\":{{\"watchdog\":{{\"fresh\":{{\"noOutputTimeoutMs\":900000}},\"resume\":{{\"noOutputTimeoutMs\":900000}}}}}},\"resumeArgs\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{},\"--resume\",\"{{sessionId}}\"],\"resumeOutput\":\"jsonl\",\"serialize\":true,\"sessionIdFields\":[\"thread_id\"]}}}}",
+        "{{\"wecode-codex\":{{\"args\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{}],\"command\":\"/usr/local/bin/wecode\",\"input\":\"stdin\",\"jsonlDialect\":\"claude-stream-json\",\"modelArg\":\"--model\",\"output\":\"jsonl\",\"reliability\":{{\"watchdog\":{{\"fresh\":{{\"noOutputTimeoutMs\":900000}},\"resume\":{{\"noOutputTimeoutMs\":900000}}}}}},\"resumeArgs\":[\"codex-backend\",\"--jsonl\",\"--cwd\",{},\"--resume\",\"{{sessionId}}\"],\"resumeOutput\":\"jsonl\",\"serialize\":false,\"sessionIdFields\":[\"thread_id\"]}}}}",
         serde_json::to_string(&project_dir).expect("project dir json"),
         serde_json::to_string(&project_dir).expect("project dir json")
     );
@@ -119,24 +120,41 @@ fn bootstrap_plan_connects_weixin_to_wecode_codex_backend() {
             ]
         )
     ));
-    let weixin_install = steps
-        .iter()
-        .find(|step| step.program == "npx")
-        .expect("npx installer step");
-    assert_eq!(
-        weixin_install.args,
-        vec![
-            "-y",
-            "@tencent-weixin/openclaw-weixin-cli@latest",
-            "install"
-        ]
+    assert!(
+        common::has_openclaw_args(
+            &steps,
+            &[
+                "plugins",
+                "install",
+                "@tencent-weixin/openclaw-weixin@2.4.4",
+                "--force"
+            ]
+        ),
+        "weixin plugin must be pinned because runtime patches depend on plugin internals"
+    );
+    assert!(common::has_openclaw_args(
+        &steps,
+        &["channels", "login", "--channel", "openclaw-weixin"]
+    ));
+    assert!(
+        !steps.iter().any(|step| step.args.iter().any(|arg| {
+            arg == "@tencent-weixin/openclaw-weixin@latest"
+                || arg == "@tencent-weixin/openclaw-weixin-cli@latest"
+        })),
+        "weixin install plan must not rely on floating latest versions"
     );
     assert_eq!(
-        weixin_install.path_prepend,
-        vec!["~/.wecode/openclaw-runtime/node_modules/.bin"]
-    );
-    assert_eq!(
-        weixin_install.env,
+        steps
+            .iter()
+            .find(|step| step.args
+                == [
+                    "plugins",
+                    "install",
+                    "@tencent-weixin/openclaw-weixin@2.4.4",
+                    "--force",
+                ])
+            .expect("weixin plugin install step")
+            .env,
         vec![
             ("OPENCLAW_PROFILE".to_string(), "wecode".to_string()),
             (
@@ -209,10 +227,6 @@ if [ "$1" = "--version" ]; then
   echo 10.0.0
   exit 0
 fi
-echo "Weixin QR code stdout"
-echo "openclaw-weixin internal stdout"
-echo "OpenClaw mixed-case stdout"
-echo "Weixin login stderr" >&2
 "#,
     );
     write_executable(
@@ -239,6 +253,20 @@ cat > "$prefix/node_modules/.bin/openclaw" <<'EOF'
 #!/bin/sh
 if [ "$1" = "--version" ]; then
   echo "OpenClaw 2026.5.27"
+  exit 0
+fi
+if [ "$1" = "plugins" ] && [ "$2" = "install" ] && [ "$3" = "@tencent-weixin/openclaw-weixin@2.4.4" ]; then
+  echo "OpenClaw noisy weixin plugin stdout"
+  echo "OpenClaw noisy weixin plugin stderr" >&2
+  exit 0
+fi
+if [ "$1" = "channels" ] && [ "$2" = "login" ] && [ "$3" = "--channel" ] && [ "$4" = "openclaw-weixin" ]; then
+  echo "Weixin QR code stdout"
+  echo "openclaw-weixin internal stdout"
+  echo "OpenClaw mixed-case stdout"
+  echo "Local login saved auth for openclaw-weixin/default"
+  echo "Config: $OPENCLAW_CONFIG_PATH"
+  echo "Weixin login stderr" >&2
   exit 0
 fi
 if [ "$1" = "gateway" ] && [ "$2" = "install" ]; then
@@ -339,15 +367,30 @@ echo "OpenClaw noisy npm stderr" >&2
         "stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("wecode-weixin internal stdout"),
+        stdout.contains("openclaw-weixin internal stdout"),
         "stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("wecode mixed-case stdout"),
+        stdout.contains("Wecode mixed-case stdout"),
         "stdout:\n{stdout}"
     );
     assert!(
-        !stdout.to_ascii_lowercase().contains("openclaw"),
+        stdout.contains("Local login saved auth for openclaw-weixin/default"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Config: {}",
+            state_dir.join("openclaw.json").display()
+        )),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("wecode-weixin/default"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("wecode-state/wecode.json"),
         "stdout:\n{stdout}"
     );
     assert!(stderr.contains("Weixin login stderr"), "stderr:\n{stderr}");
@@ -363,6 +406,14 @@ echo "OpenClaw noisy npm stderr" >&2
     let log = fs::read_to_string(state_dir.join("bootstrap.log")).expect("bootstrap log");
     assert!(log.contains("OpenClaw noisy npm stdout"), "log:\n{log}");
     assert!(log.contains("OpenClaw noisy npm stderr"), "log:\n{log}");
+    assert!(
+        log.contains("OpenClaw noisy weixin plugin stdout"),
+        "log:\n{log}"
+    );
+    assert!(
+        log.contains("OpenClaw noisy weixin plugin stderr"),
+        "log:\n{log}"
+    );
     assert!(log.contains("OpenClaw noisy gateway stdout"), "log:\n{log}");
     assert!(log.contains("OpenClaw noisy gateway stderr"), "log:\n{log}");
     assert!(!log.contains("Weixin QR code stdout"), "log:\n{log}");
@@ -527,7 +578,7 @@ chmod 755 "$prefix/node_modules/.bin/openclaw"
         "combined output:\n{combined}"
     );
     assert!(
-        stdout.contains("wecode Feishu App ID: "),
+        stdout.contains("Wecode Feishu App ID: "),
         "stdout:\n{stdout}"
     );
     assert!(
@@ -541,6 +592,12 @@ chmod 755 "$prefix/node_modules/.bin/openclaw"
 
     let log = fs::read_to_string(state_dir.join("bootstrap.log")).expect("bootstrap log");
     assert!(log.contains("@openclaw/feishu --force"), "log:\n{log}");
+    assert!(log.contains("channels.feishu.streaming"), "log:\n{log}");
+    assert!(log.contains("channels.feishu.renderMode"), "log:\n{log}");
+    assert!(
+        log.contains("channels.feishu.blockStreaming"),
+        "log:\n{log}"
+    );
     assert!(!log.contains("Feishu App Secret prompt"), "log:\n{log}");
     assert_launch_agent_prevents_sleep(temp.path());
 }
@@ -750,6 +807,698 @@ fn patch_openclaw_runtime_disables_builtin_compact_when_text_commands_disabled()
 }
 
 #[test]
+fn patch_openclaw_runtime_enables_weixin_block_streaming_for_approval_prompts() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_messaging = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("messaging");
+    fs::create_dir_all(&weixin_messaging).expect("weixin messaging dir");
+    let process_file = weixin_messaging.join("process-message.js");
+    fs::write(
+        &process_file,
+        r#"import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { sendMessageWeixin } from "./send.js";
+/** Extract text body from item_list (for slash command detection). */
+function extractTextBody(itemList) {
+    return itemList?.[0]?.text_item?.text ?? "";
+}
+export async function processOneMessage(full, deps) {
+    const textBody = extractTextBody(full.item_list);
+    const ctx = weixinMessageToMsgContext(full, deps.accountId, {});
+    const finalized = deps.channelRuntime.reply.finalizeInboundContext(ctx);
+    const contextToken = getContextTokenFromMsgContext(ctx);
+    if (contextToken) {
+        setContextToken(deps.accountId, full.from_user_id ?? "", contextToken);
+    }
+    const runId = randomUUID();
+    await deps.channelRuntime.reply.dispatchReplyFromConfig({
+                ctx: finalized,
+                cfg: deps.config,
+                dispatcher,
+                replyOptions: {
+                    ...replyOptions,
+                    ...(replyProgressSender?.replyOptions ?? {}),
+                    disableBlockStreaming: true,
+                },
+            });
+}
+"#,
+    )
+    .expect("process message file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&process_file).expect("patched process message");
+    assert!(
+        patched.contains("disableBlockStreaming: false"),
+        "weixin block streaming must be enabled so approval prompts are delivered before the Codex turn finishes:\n{patched}"
+    );
+    assert!(
+        patched.contains("onPartialReply:")
+            && patched.contains("onBlockReplyQueued:")
+            && patched.contains("sendWecodeApprovalPromptFromReplyPayload")
+            && patched.contains("Codex requests permission")
+            && patched.contains("Approval: appr-")
+            && patched.contains("sendMessageWeixin"),
+        "weixin approval partials must be sent as ordinary Weixin text messages:\n{patched}"
+    );
+    assert!(!patched.contains("disableBlockStreaming: true"));
+}
+
+#[test]
+fn patch_openclaw_runtime_handles_weixin_approval_replies_before_agent_queue() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_messaging = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("messaging");
+    fs::create_dir_all(&weixin_messaging).expect("weixin messaging dir");
+    let process_file = weixin_messaging.join("process-message.js");
+    fs::write(
+        &process_file,
+        r#"import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { sendMessageWeixin } from "./send.js";
+function extractTextBody(itemList) {
+    return itemList?.[0]?.text_item?.text ?? "";
+}
+export async function processOneMessage(full, deps) {
+    const textBody = extractTextBody(full.item_list);
+    const ctx = weixinMessageToMsgContext(full, deps.accountId, {});
+    const finalized = deps.channelRuntime.reply.finalizeInboundContext(ctx);
+    const contextToken = getContextTokenFromMsgContext(ctx);
+    if (contextToken) {
+        setContextToken(deps.accountId, full.from_user_id ?? "", contextToken);
+    }
+    const runId = randomUUID();
+    await deps.channelRuntime.reply.withReplyDispatcher({
+        dispatcher,
+        run: () => deps.channelRuntime.reply.dispatchReplyFromConfig({
+            ctx: finalized,
+            cfg: deps.config,
+            dispatcher,
+            replyOptions: {
+                    ...replyOptions,
+                    ...(replyProgressSender?.replyOptions ?? {}),
+                    disableBlockStreaming: true,
+            },
+        }),
+    });
+}
+"#,
+    )
+    .expect("process message file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&process_file).expect("patched process message");
+    assert!(
+        patched.contains(r#"import fs from "node:fs";"#),
+        "weixin approval control must be able to write decision files:\n{patched}"
+    );
+    assert!(
+        patched.contains("handleWecodeNativeApprovalControl")
+            && patched.contains("parseWecodeApprovalControlText")
+            && patched.contains(r#""approvals", "native""#),
+        "weixin approval control helper should be installed:\n{patched}"
+    );
+    assert!(
+        patched.contains("`${approvalId}.decision.json`")
+            && patched.contains(r#"decision: approval.decision"#)
+            && patched.contains(r#"await sendMessageWeixin({"#),
+        "weixin approval replies should write Codex native approval decisions and acknowledge in chat:\n{patched}"
+    );
+    let approval_index = patched
+        .find("if (await handleWecodeNativeApprovalControl({")
+        .expect("approval control branch");
+    let run_id_index = patched.find("const runId = randomUUID();").expect("run id");
+    let dispatch_index = patched
+        .find("dispatchReplyFromConfig")
+        .expect("agent dispatch");
+    assert!(
+        approval_index < run_id_index && approval_index < dispatch_index,
+        "weixin approval reply must return before entering the agent queue:\n{patched}"
+    );
+    assert_eq!(
+        patched
+            .matches("if (await handleWecodeNativeApprovalControl({")
+            .count(),
+        1,
+        "approval control branch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_marks_cli_stdout_as_progress() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let execute_file = runtime_dist.join("execute.runtime-test.js");
+    fs::write(
+        &execute_file,
+        r#"import { i as emitAgentEvent } from "./agent-events-BuYtWSh4.js";
+const managedRun = await supervisor.spawn({
+                    onStdout: (chunk) => {
+                        stdoutTail = appendCliOutputTail(stdoutTail, chunk);
+                        if (!stdoutParseExceeded) {
+                            const nextStdoutParse = appendCliOutputParseBuffer(stdoutParseBuffer, chunk);
+                            stdoutParseBuffer = nextStdoutParse.buffer;
+                            stdoutParseExceeded = nextStdoutParse.exceeded;
+                        }
+                        streamingParser?.push(chunk);
+                    },
+});
+"#,
+    )
+    .expect("execute runtime file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &temp.path().join("state"))
+        .expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &temp.path().join("state"))
+        .expect("patch runtime again");
+
+    let patched = fs::read_to_string(&execute_file).expect("patched execute runtime");
+    assert!(
+        patched.contains(
+            r#"import { a as emitTrustedDiagnosticEvent } from "./diagnostic-events-CNGydBWO.js";"#
+        ),
+        "CLI runtime should import OpenClaw diagnostic progress emitter:\n{patched}"
+    );
+    assert!(
+        patched.contains(r#"type: "run.progress""#) && patched.contains(r#"reason: "cli:stdout""#),
+        "CLI stdout must refresh OpenClaw diagnostic progress:\n{patched}"
+    );
+    assert_eq!(
+        patched.matches(r#"reason: "cli:stdout""#).count(),
+        1,
+        "stdout progress patch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_keeps_weixin_monitor_polling_during_long_turns() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_monitor = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("monitor");
+    fs::create_dir_all(&weixin_monitor).expect("weixin monitor dir");
+    let monitor_file = weixin_monitor.join("monitor.js");
+    fs::write(
+        &monitor_file,
+        r#"import { getUpdates } from "../api/api.js";
+import { processOneMessage } from "../messaging/process-message.js";
+export async function monitorWeixinProvider(opts) {
+    const { baseUrl, cdnBaseUrl, token, accountId, config, channelRuntime } = opts;
+    const log = opts.runtime?.log ?? (() => { });
+    const aLog = logger.withAccount(accountId);
+    const configManager = new WeixinConfigManager({ baseUrl, token }, log);
+    for (const full of list) {
+                const now = Date.now();
+                setStatus?.({ accountId, lastEventAt: now, lastInboundAt: now });
+                // allowFrom filtering is delegated to processOneMessage via the framework
+                // authorization pipeline (resolveSenderCommandAuthorizationWithRuntime).
+                const fromUserId = full.from_user_id ?? "";
+                const cachedConfig = await configManager.getForUser(fromUserId, full.context_token);
+                await processOneMessage(full, {
+                    accountId,
+                    config,
+                    channelRuntime,
+                    baseUrl,
+                    cdnBaseUrl,
+                    token,
+                    typingTicket: cachedConfig.typingTicket,
+                    log: opts.runtime?.log ?? (() => { }),
+                    errLog,
+                });
+    }
+}
+"#,
+    )
+    .expect("monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched monitor");
+    assert!(
+        patched.contains(r#"import { getWeixinLaneKey } from "../messaging/lane-key.js";"#)
+            && patched.contains(r#"import { createLaneScheduler } from "./lane-scheduler.js";"#),
+        "weixin monitor should import lane routing helpers:\n{patched}"
+    );
+    assert!(
+        patched.contains("const wecodeLaneScheduler = createLaneScheduler();")
+            && patched.contains("void wecodeLaneScheduler.enqueue(laneKey, async () =>")
+            && patched.contains("const laneKey = getWeixinLaneKey({ accountId, msg: full });"),
+        "weixin monitor should enqueue inbound work without blocking long-polling:\n{patched}"
+    );
+    assert!(
+        !patched.contains(
+            r#"                await processOneMessage(full, {
+                    accountId,"#
+        ),
+        "weixin monitor must not await long-running message handling in the poll loop:\n{patched}"
+    );
+    assert_eq!(
+        patched.matches("wecodeLaneScheduler.enqueue").count(),
+        1,
+        "weixin monitor polling patch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_routes_weixin_approval_replies_on_control_lane() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_messaging = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("messaging");
+    fs::create_dir_all(&weixin_messaging).expect("weixin messaging dir");
+    let lane_file = weixin_messaging.join("lane-key.js");
+    fs::write(
+        &lane_file,
+        r#"export function getWeixinLaneKey(ctx) {
+    const userId = ctx.msg.from_user_id?.trim() || "unknown";
+    const baseKey = `wx:${ctx.accountId}:${userId}`;
+    if (isWeixinAbortMessage(ctx.msg)) {
+        return `${baseKey}:control`;
+    }
+    return baseKey;
+}
+"#,
+    )
+    .expect("lane key file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+
+    let patched = fs::read_to_string(&lane_file).expect("patched lane key");
+    assert!(patched.contains("isWecodeApprovalControlText"));
+    assert!(
+        patched.contains("isWeixinAbortMessage(ctx.msg) || isWecodeApprovalControlText(textBody)"),
+        "weixin approval replies should bypass the busy main lane:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_routes_feishu_approval_replies_on_control_lane() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let feishu_dist = state_dir
+        .join("npm")
+        .join("projects")
+        .join("feishu-project")
+        .join("node_modules")
+        .join("@openclaw")
+        .join("feishu")
+        .join("dist");
+    fs::create_dir_all(&feishu_dist).expect("feishu dist dir");
+    let monitor_file = feishu_dist.join("monitor.account-test.js");
+    fs::write(
+        &monitor_file,
+        r#"function getFeishuSequentialKey(params) {
+	const { accountId, event, botOpenId, botName } = params;
+	const baseKey = `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}`;
+	const text = parseFeishuMessageEvent(event, botOpenId, botName).content.trim();
+	if (isAbortRequestText(text)) return `${baseKey}:control`;
+	if (isBtwRequestText(text)) return `${baseKey}:btw`;
+	return baseKey;
+}
+"#,
+    )
+    .expect("feishu monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
+    assert!(patched.contains("isWecodeApprovalControlText"));
+    assert!(
+        patched.contains("if (isAbortRequestText(text) || isWecodeApprovalControlText(text)) return `${baseKey}:control`;"),
+        "feishu approval replies should bypass the busy per-chat FIFO lane:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_handles_feishu_approval_replies_before_agent_queue() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let feishu_dist = state_dir
+        .join("npm")
+        .join("projects")
+        .join("feishu-project")
+        .join("node_modules")
+        .join("@openclaw")
+        .join("feishu")
+        .join("dist");
+    fs::create_dir_all(&feishu_dist).expect("feishu dist dir");
+    let monitor_file = feishu_dist.join("monitor.account-test.js");
+    fs::write(
+        &monitor_file,
+        r#"function getFeishuSequentialKey(params) {
+	const { accountId, event, botOpenId, botName } = params;
+	const baseKey = `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}`;
+	const text = parseFeishuMessageEvent(event, botOpenId, botName).content.trim();
+	if (isAbortRequestText(text)) return `${baseKey}:control`;
+	if (isBtwRequestText(text)) return `${baseKey}:btw`;
+	return baseKey;
+}
+async function handleFeishuMessage(params) {
+	const { cfg, accountId } = params;
+	const account = { accountId };
+	const ctx = { content: "yes", chatId: "oc_test" };
+	const dmIngress = { senderAccess: { effectiveAllowFrom: [] } };
+	const groupConfig = undefined;
+	const configAllowFrom = [];
+	const isGroup = false;
+	const commandAllowFrom = isGroup ? groupConfig?.allowFrom ?? configAllowFrom : dmIngress?.senderAccess.effectiveAllowFrom ?? configAllowFrom;
+	const feishuFrom = `feishu:${ctx.senderOpenId}`;
+	await dispatchToAgent({ commandAllowFrom, feishuFrom });
+}
+"#,
+    )
+    .expect("feishu monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
+    assert!(
+        patched.contains("handleWecodeNativeApprovalControl")
+            && patched.contains("parseWecodeApprovalControlText")
+            && patched.contains(r#""approvals", "native""#),
+        "feishu approval control helper should be installed:\n{patched}"
+    );
+    assert!(
+        patched.contains("`${approvalId}.decision.json`")
+            && patched.contains(r#"decision: approval.decision"#)
+            && patched.contains("sendMessageFeishu({"),
+        "feishu approval replies should write Codex native approval decisions and acknowledge in chat:\n{patched}"
+    );
+    let approval_index = patched
+        .find("if (await handleWecodeNativeApprovalControl({")
+        .expect("approval control branch");
+    let dispatch_index = patched.find("dispatchToAgent").expect("agent dispatch");
+    assert!(
+        approval_index < dispatch_index,
+        "feishu approval reply must return before entering the agent queue:\n{patched}"
+    );
+    assert_eq!(
+        patched
+            .matches("if (await handleWecodeNativeApprovalControl({")
+            .count(),
+        1,
+        "approval control branch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_sends_feishu_approval_prompts_as_plain_messages() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let feishu_dist = state_dir
+        .join("npm")
+        .join("projects")
+        .join("feishu-project")
+        .join("node_modules")
+        .join("@openclaw")
+        .join("feishu")
+        .join("dist");
+    fs::create_dir_all(&feishu_dist).expect("feishu dist dir");
+    let monitor_file = feishu_dist.join("monitor.account-test.js");
+    fs::write(
+        &monitor_file,
+        r#"function getFeishuSequentialKey(params) {
+	const { accountId, event, botOpenId, botName } = params;
+	const baseKey = `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}`;
+	const text = parseFeishuMessageEvent(event, botOpenId, botName).content.trim();
+	if (isAbortRequestText(text)) return `${baseKey}:control`;
+	if (isBtwRequestText(text)) return `${baseKey}:btw`;
+	return baseKey;
+}
+function createFeishuReplyDispatcher(params) {
+	const { cfg, accountId, chatId } = params;
+	const account = { config: { blockStreaming: true } };
+	const prefixContext = {};
+	const replyOptions = {};
+	const streamingEnabled = true;
+	return {
+		replyOptions: {
+			...replyOptions,
+			onModelSelected: prefixContext.onModelSelected,
+			disableBlockStreaming: typeof account.config?.blockStreaming === "boolean" ? !account.config.blockStreaming : true,
+			onPartialReply: streamingEnabled ? (payload) => {
+				if (!payload.text) return;
+				const cleaned = stripReasoningTagsFromText(payload.text, {
+					mode: "strict",
+					trim: "both"
+				});
+				if (!cleaned) return;
+				queueStreamingUpdate(cleaned, {
+					dedupeWithLastPartial: true,
+					mode: "snapshot"
+				});
+			} : void 0,
+			onReasoningStream: undefined
+		}
+	};
+}
+async function handleFeishuMessage(params) {
+	const { cfg, accountId } = params;
+	const account = { accountId };
+	const ctx = { content: "yes", chatId: "oc_test" };
+	const dmIngress = { senderAccess: { effectiveAllowFrom: [] } };
+	const groupConfig = undefined;
+	const configAllowFrom = [];
+	const isGroup = false;
+	const commandAllowFrom = isGroup ? groupConfig?.allowFrom ?? configAllowFrom : dmIngress?.senderAccess.effectiveAllowFrom ?? configAllowFrom;
+	const feishuFrom = `feishu:${ctx.senderOpenId}`;
+	await dispatchToAgent({ commandAllowFrom, feishuFrom });
+}
+"#,
+    )
+    .expect("feishu monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
+    assert!(
+        patched.contains("sendWecodeApprovalPromptFromReplyPayload")
+            && patched.contains("Codex requests permission")
+            && patched.contains("Approval: appr-")
+            && patched.contains("sendMessageFeishu({"),
+        "feishu approval prompts should also be sent as ordinary text messages:\n{patched}"
+    );
+    assert!(
+        patched.contains("onPartialReply: async (payload) => {")
+            && patched.contains("onBlockReplyQueued: async (payload, context) => {"),
+        "feishu approval prompt sender should hook partial and block replies:\n{patched}"
+    );
+    assert_eq!(
+        patched
+            .matches("sendWecodeApprovalPromptFromReplyPayload")
+            .count(),
+        3,
+        "approval prompt sender should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_aligns_feishu_queue_timeout_with_agent_timeout() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let feishu_dist = state_dir
+        .join("npm")
+        .join("projects")
+        .join("feishu-project")
+        .join("node_modules")
+        .join("@openclaw")
+        .join("feishu")
+        .join("dist");
+    fs::create_dir_all(&feishu_dist).expect("feishu dist dir");
+    let monitor_file = feishu_dist.join("monitor.account-test.js");
+    fs::write(
+        &monitor_file,
+        r#"const DEFAULT_TASK_TIMEOUT_MS = 300 * 1e3;
+function createSequentialQueue(options = {}) {
+	const taskTimeoutMs = options.taskTimeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
+	return async (key, task) => taskTimeoutMs && task();
+}
+function createFeishuMessageReceiveHandler({ cfg, core, accountId, runtime, chatHistories, fireAndForget, handleMessage, resolveDebounceText: resolveText, hasProcessedMessage, recordProcessedMessage, getBotOpenId = () => void 0, getBotName = () => void 0, resolveSequentialKey = ({ accountId, event }) => `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}` }) {
+	const log = runtime?.log ?? console.log;
+	const error = runtime?.error ?? console.error;
+	const enqueue = createSequentialQueue({ onTaskTimeout: (key, timeoutMs) => {
+		log(`feishu[${accountId}]: per-chat task exceeded ${timeoutMs}ms cap (key=${key}); evicting from queue so later same-key messages can proceed (#70133)`);
+	} });
+	return enqueue;
+}
+function getFeishuSequentialKey(params) {
+	const { accountId, event, botOpenId, botName } = params;
+	const baseKey = `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}`;
+	const text = parseFeishuMessageEvent(event, botOpenId, botName).content.trim();
+	if (isAbortRequestText(text)) return `${baseKey}:control`;
+	if (isBtwRequestText(text)) return `${baseKey}:btw`;
+	return baseKey;
+}
+"#,
+    )
+    .expect("feishu monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
+    assert!(
+        patched.contains("wecodeFeishuTaskTimeoutMs")
+            && patched.contains("cfg?.agents?.defaults?.timeoutSeconds")
+            && patched.contains("taskTimeoutMs: wecodeFeishuTaskTimeoutMs"),
+        "feishu per-chat queue timeout should follow OpenClaw agent timeout so approval waits do not fail at 300s:\n{patched}"
+    );
+    assert_eq!(
+        patched.matches("wecodeFeishuTaskTimeoutMs").count(),
+        2,
+        "feishu timeout patch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
 fn prevent_sleep_wraps_gateway_launch_agent_arguments_on_ac_power() {
     let original = vec![
         "/Users/riven/.wecode/openclaw-state/service-env/ai.openclaw.wecode-env-wrapper.sh"
@@ -809,6 +1558,57 @@ fn bootstrap_plan_connects_feishu_to_wecode_codex_backend() {
         &steps,
         &["channels", "login", "--channel", "feishu"]
     ));
+    assert!(common::has_openclaw_args(
+        &steps,
+        &[
+            "config",
+            "set",
+            "channels.feishu.streaming",
+            "true",
+            "--strict-json"
+        ]
+    ));
+    assert!(common::has_openclaw_args(
+        &steps,
+        &[
+            "config",
+            "set",
+            "channels.feishu.renderMode",
+            "\"card\"",
+            "--strict-json"
+        ]
+    ));
+    assert!(common::has_openclaw_args(
+        &steps,
+        &[
+            "config",
+            "set",
+            "channels.feishu.blockStreaming",
+            "true",
+            "--strict-json"
+        ]
+    ));
+    let login_index = steps
+        .iter()
+        .position(|step| step.args == ["channels", "login", "--channel", "feishu"])
+        .expect("feishu login step");
+    let render_mode_index = steps
+        .iter()
+        .position(|step| {
+            step.args
+                == [
+                    "config",
+                    "set",
+                    "channels.feishu.renderMode",
+                    "\"card\"",
+                    "--strict-json",
+                ]
+        })
+        .expect("feishu render mode step");
+    assert!(
+        login_index < render_mode_index,
+        "Feishu streaming config must be written after login so login cannot overwrite it"
+    );
     assert!(!steps.iter().any(|step| step.program == "npx"));
     let last = steps.last().expect("last step");
     assert_eq!(
@@ -844,17 +1644,7 @@ fn bootstrap_plan_prepends_configured_node_bin_dir_to_node_based_steps() {
         .iter()
         .all(|step| step.path_prepend == vec!["~/node24/bin"]));
 
-    let weixin_install = steps
-        .iter()
-        .find(|step| step.program == "npx")
-        .expect("npx installer step");
-    assert_eq!(
-        weixin_install.path_prepend,
-        vec![
-            "~/node24/bin",
-            "~/.wecode/openclaw-runtime/node_modules/.bin"
-        ]
-    );
+    assert!(!steps.iter().any(|step| step.program == "npx"));
 }
 
 fn write_executable(path: &Path, contents: &str) {

@@ -1,4 +1,6 @@
-use crate::config::WecodeConfig;
+use std::{fs, path::PathBuf};
+
+use crate::{config::WecodeConfig, native_approval, paths::expand_tilde};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedCommand {
@@ -47,10 +49,10 @@ pub enum BackendInput {
         prompt: Option<String>,
     },
     Approve {
-        approval_id: String,
+        approval_id: Option<String>,
     },
     Deny {
-        approval_id: String,
+        approval_id: Option<String>,
     },
     ApprovalRequired {
         command_name: String,
@@ -113,7 +115,7 @@ pub fn prepare_backend_input_with_trace(
     let message = backend_message_input(input);
     let input = message.as_deref().unwrap_or(input);
     let command_input = command_input_candidate(input).unwrap_or(input);
-    let input = match parse_control_command(command_input)? {
+    let input = match parse_control_command(config, command_input)? {
         Some(input) => input,
         None => match render_command_input(config, command_input) {
             Some(rendered) if rendered.require_confirm => BackendInput::ApprovalRequired {
@@ -424,7 +426,10 @@ fn non_empty_string(value: &str) -> Option<&str> {
     }
 }
 
-fn parse_control_command(input: &str) -> Result<Option<BackendInput>, String> {
+fn parse_control_command(
+    config: &WecodeConfig,
+    input: &str,
+) -> Result<Option<BackendInput>, String> {
     let trimmed = input.trim();
     if matches!(trimmed, ":help" | ":commands") {
         return Ok(Some(BackendInput::Help));
@@ -513,17 +518,85 @@ fn parse_control_command(input: &str) -> Result<Option<BackendInput>, String> {
         }));
     }
 
+    if matches!(trimmed, ":approve" | ":yes") {
+        return Ok(Some(BackendInput::Approve { approval_id: None }));
+    }
     if let Some(rest) = trimmed.strip_prefix(":approve ") {
-        return parse_approval_id(rest, ":approve")
-            .map(|approval_id| Some(BackendInput::Approve { approval_id }));
+        return parse_approval_id(rest, ":approve").map(|approval_id| {
+            Some(BackendInput::Approve {
+                approval_id: Some(approval_id),
+            })
+        });
+    }
+    if let Some(rest) = trimmed.strip_prefix(":yes ") {
+        return parse_approval_id(rest, ":yes").map(|approval_id| {
+            Some(BackendInput::Approve {
+                approval_id: Some(approval_id),
+            })
+        });
     }
 
+    if matches!(trimmed, ":deny" | ":no") {
+        return Ok(Some(BackendInput::Deny { approval_id: None }));
+    }
     if let Some(rest) = trimmed.strip_prefix(":deny ") {
-        return parse_approval_id(rest, ":deny")
-            .map(|approval_id| Some(BackendInput::Deny { approval_id }));
+        return parse_approval_id(rest, ":deny").map(|approval_id| {
+            Some(BackendInput::Deny {
+                approval_id: Some(approval_id),
+            })
+        });
+    }
+    if let Some(rest) = trimmed.strip_prefix(":no ") {
+        return parse_approval_id(rest, ":no").map(|approval_id| {
+            Some(BackendInput::Deny {
+                approval_id: Some(approval_id),
+            })
+        });
+    }
+
+    match trimmed.to_ascii_lowercase().as_str() {
+        "yes" if has_pending_approval(config) => {
+            return Ok(Some(BackendInput::Approve { approval_id: None }));
+        }
+        "no" if has_pending_approval(config) => {
+            return Ok(Some(BackendInput::Deny { approval_id: None }));
+        }
+        _ => {}
     }
 
     Ok(None)
+}
+
+fn has_pending_approval(config: &WecodeConfig) -> bool {
+    pending_approval_files(approvals_dir(config))
+        .into_iter()
+        .map(|_| ())
+        .chain(
+            native_approval::pending_native_approval_ids(config)
+                .into_iter()
+                .map(|_| ()),
+        )
+        .next()
+        .is_some()
+}
+
+fn approvals_dir(config: &WecodeConfig) -> PathBuf {
+    PathBuf::from(expand_tilde(&config.openclaw.state_dir)).join("approvals")
+}
+
+fn pending_approval_files(dir: PathBuf) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                && !path.to_string_lossy().ends_with(".decision.json")
+        })
+        .collect()
 }
 
 fn normalize_prompt_input(input: &str) -> String {

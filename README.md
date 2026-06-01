@@ -47,7 +47,7 @@ GitHub 默认展示的文档就是本文件 `README.md`，因此这里使用中�
 - Codex session 续接：OpenClaw 保存 Codex 返回的 `thread_id`，后续消息自动用 `--resume` 继续同一会话。
 - Codex 内置命令透传：聊天里发送 `:init`、`:new`、`:compact`、`:plan`、`:goal`、`:agent`、`:side`，`wecode` 会转成 Codex 原生 `/...` prompt，也可用自定义命令覆盖 prompt。
 - 聊天中管理 session：`:resume [session_id]` 绑定到最近或指定的本机 Codex session，`:fresh [prompt]` 硬新开 Codex thread。
-- 微信审批：配置了 `requireConfirm: true` 的命令会先生成审批 id，微信发送 `:approve <id>` 后才执行。
+- 聊天审批：配置了 `requireConfirm: true` 的命令会先生成审批 id；Codex remote 原生审批也会转成同样的审批提示。只有一个待审批项时直接回复 `yes` / `no` 或 `:yes` / `:no` 即可，多个待审批项时回复 `:yes <id>` / `:no <id>`。
 - 私有 OpenClaw 运行时：默认安装到 `~/.wecode/openclaw-runtime`，不污染全局 OpenClaw 配置。
 - macOS AC 防睡眠：默认用 `caffeinate -s` 包装 OpenClaw Gateway LaunchAgent，避免外接电源下息屏后系统睡眠导致消息不处理。
 
@@ -119,7 +119,7 @@ cargo run -- bootstrap --weixin
 cargo run -- bootstrap --feishu
 ```
 
-`bootstrap` 一定会安装私有 OpenClaw，不再需要 `--install-openclaw`。这个命令会执行 OpenClaw 安装、Gateway 配置、Codex CLI 后端配置、通信通道安装/登录和 Gateway 安装。通道登录过程中可能会出现二维码或登录提示，需要按目标通道完成确认。
+`bootstrap` 一定会安装私有 OpenClaw。这个命令会执行 OpenClaw 安装、Gateway 配置、Codex CLI 后端配置、通信通道安装/登录和 Gateway 安装。微信通道会安装固定版本的 `@tencent-weixin/openclaw-weixin@2.4.4`，避免插件升级导致运行时补丁失效。通道登录过程中可能会出现二维码或登录提示，需要按目标通道完成确认。
 
 聊天里的 `wecode` 命令统一使用 `:` 前缀，例如 `:help`、`:status`、`:compact`。这样可以避开 OpenClaw 自己的 slash 命令路由，不需要补丁 OpenClaw，也不需要关闭 `commands.text`。当命令需要交给 Codex 原生处理时，`wecode` 只把开头的 `:` 转成 `/`，例如 `:compact keep decisions` 会作为 `/compact keep decisions` 发给 Codex。
 
@@ -142,7 +142,7 @@ wecode codex-backend --jsonl --cwd /Users/riven/Github/wecode --model wecode-cod
 :model gpt-5.4
 ```
 
-`:model <model>` 会把模型保存到当前项目自己的状态文件中，不同项目互不影响。后续 `wecode` 调用 Codex 时会优先通过 Codex app-server remote API 设置模型和工作目录；如果 remote 不可用，会回退到 Codex CLI 原生参数 `codex exec -m <model> -C <project_dir>`。
+`:model <model>` 会把模型保存到当前项目自己的状态文件中，不同项目互不影响。后续 `wecode` 调用 Codex 时会优先通过 Codex app-server remote API 设置模型和工作目录；如果 remote 不可用，会回退到 Codex CLI 原生参数 `codex exec --yolo -m <model> -C <project_dir>`。
 
 ## 常用本地命令
 
@@ -188,13 +188,13 @@ node scripts/openclaw-agent-smoke.mjs
 :report [说明]            等价于旁路查询“任务状态”，适合长任务中查看进展
 :resume [session_id]      绑定到最近或指定的 Codex session，不请求 Codex
 :fresh [prompt]           硬新开 Codex thread；带 prompt 时立即执行，不带 prompt 时作用于下一条请求
-:approve <id>             批准待执行命令
-:deny <id>                拒绝待执行命令
+:yes [id] / :approve [id] 批准待执行命令
+:no [id] / :deny [id]     拒绝待执行命令
 ```
 
 处理方式：
 
-- `:help`、`:diff`、`:pwd`、`:ls`、`:cat`、`:cd`、`:shell`、`:status`、`:model`、`:models`、`:resume`、`:fresh`、`:approve`、`:deny` 由 `wecode` 本地直接回答或执行，不会作为 prompt 进入 Codex。普通本地命令结果会以 markdown code block 返回；`:resume` 是 session 控制命令，会返回 `thread_id` 让 OpenClaw 绑定 session。
+- `:help`、`:diff`、`:pwd`、`:ls`、`:cat`、`:cd`、`:shell`、`:status`、`:model`、`:models`、`:resume`、`:fresh`、`:approve`、`:yes`、`:deny`、`:no` 由 `wecode` 本地直接回答或执行，不会作为 prompt 进入 Codex。普通本地命令结果会以 markdown code block 返回；`:resume` 是 session 控制命令，会返回 `thread_id` 让 OpenClaw 绑定 session。
 - `:cd <目录>` 会把目标目录写入 `openclaw.stateDir/codex-cwd.txt`，并让下一次 Codex 请求新开 thread，避免续接旧项目 session。
 - `:fresh` 会让下一次 Codex 请求不带 `--resume`；`:fresh <prompt>` 会立刻以新 Codex thread 执行 `<prompt>`。
 - `:shell <命令>` 会在当前 Codex 项目目录执行命令；Unix/macOS 使用 `sh -lc`，Windows 使用 `cmd /C`，返回命令真实 stdout/stderr 内容。
@@ -253,9 +253,9 @@ $XDG_CONFIG_HOME/wecode/config.json
 
 `openclaw.preventSleep` 控制 wecode 是否改写 OpenClaw Gateway 的 macOS LaunchAgent。默认值 `"ac"` 会把 Gateway 启动命令包装成 `/usr/bin/caffeinate -s ...`，只在外接电源时阻止系统睡眠，不阻止显示器息屏；设置为 `"off"` 会移除 wecode 添加的 `caffeinate` 包装。修改这个配置后运行 `wecode configure-codex` 或重新 `bootstrap`，LaunchAgent 才会被更新。
 
-`codex.transport` 控制 wecode 如何调用 Codex。默认 `"remote"` 会先通过 `codex remote-control start --json` + `codex app-server proxy` 使用 managed remote；如果本机 Codex 不是 standalone 安装，或者 managed proxy 不可用，会改用 `codex.remote.fallbackProxyCommand`，默认是 `codex app-server --listen stdio://`。只有两条 remote 路径都失败时，`"remote"` 才自动回退 `codex exec`；`"remote-strict"` 不会回退 exec，但仍会尝试这个 stdio app-server 兼容路径；`"exec"` 会强制使用旧的 `codex exec --json` 路径。
+`codex.transport` 控制 wecode 如何调用 Codex。默认 `"remote"` 会先通过 `codex remote-control start --json` + `codex app-server proxy` 使用 managed remote；如果本机 Codex 不是 standalone 安装，或者 managed proxy 不可用，会改用 `codex.remote.fallbackProxyCommand`，默认是 `codex app-server --listen stdio://`。只有两条 remote 路径都失败时，`"remote"` 才自动回退 `codex exec`；`"remote-strict"` 不会回退 exec，但仍会尝试这个 stdio app-server 兼容路径；`"exec"` 会强制使用 `codex exec --yolo --json` 路径。
 
-`wecode codex-backend --jsonl` 会输出 OpenClaw 可识别的 JSONL。remote 模式会把 app-server turn 结果转换成兼容 JSONL，并在 app-server 返回 assistant/message JSON 外壳时提取内部文本，避免微信侧看到二次包装的响应 JSON；当 Codex remote 在 turn 中途完成一段非 final agent message 时，`wecode` 会立即把这段阶段性回复写入 JSONL 并 flush，让微信侧先收到进展，而不是一直等最终答案。exec fallback 模式会实时转发 `codex exec --json` 的 stdout/stderr，避免因为 Wecode 缓存输出导致 OpenClaw watchdog 超时。
+`wecode codex-backend --jsonl` 会输出 OpenClaw 可识别的 JSONL。remote 模式会把 app-server turn 结果转换成兼容 JSONL，并在 app-server 返回 assistant/message JSON 外壳时提取内部文本，避免微信侧看到二次包装的响应 JSON；当 Codex remote 在 turn 中途完成一段非 final agent message 时，`wecode` 会立即把这段阶段性回复写入 JSONL 并 flush，让微信侧先收到进展，而不是一直等最终答案。exec fallback 模式会实时转发 `codex exec --yolo --json` 的 stdout/stderr，避免因为 Wecode 缓存输出导致 OpenClaw watchdog 超时。
 
 要切换 Codex 处理的项目，只设置 `codex.cwd`，或在聊天里发送 `:cd <项目目录>`：
 
@@ -273,7 +273,7 @@ $XDG_CONFIG_HOME/wecode/config.json
 }
 ```
 
-这样 OpenClaw 的工作区保持固定，`wecode` 会把 `codex.cwd` 作为 `--cwd` 传给后端，并在调用 Codex 时把它作为 remote thread/turn 的 `cwd`；exec fallback 时使用 `codex exec -C <project_dir>`。`:resume` 不带参数时扫描 `~/.codex/sessions/**/rollout-*.jsonl`，选择最近的 Codex session 并返回 `thread_id`；带参数时直接绑定指定 session id。
+这样 OpenClaw 的工作区保持固定，`wecode` 会把 `codex.cwd` 作为 `--cwd` 传给后端，并在调用 Codex 时把它作为 remote thread/turn 的 `cwd`；exec fallback 时使用 `codex exec --yolo -C <project_dir>`。`:resume` 不带参数时扫描 `~/.codex/sessions/**/rollout-*.jsonl`，选择最近的 Codex session 并返回 `thread_id`；带参数时直接绑定指定 session id。
 
 `codex.models` 会生成 OpenClaw 的 `agents.defaults.models` 白名单。想在微信中使用更多 Codex 模型时，把模型名追加到这里，然后重新执行：
 
@@ -314,11 +314,12 @@ cargo run -- configure-codex
 
 ```text
 Command `deploy` requires approval.
-Approve: :approve appr-...
-Deny: :deny appr-...
+Approval: appr-...
+Approve: yes, :yes, or :yes appr-...
+Deny: no, :no, or :no appr-...
 ```
 
-发送 `:approve <id>` 后才会执行保存的 prompt；发送 `:deny <id>` 会删除待审批请求。
+只有一个待审批项时，发送 `yes` / `:yes` 会执行保存的 prompt，发送 `no` / `:no` 会拒绝。多个待审批项时使用 `:yes <id>` 或 `:no <id>` 指定审批 id。
 
 ## 调试日志
 
@@ -335,6 +336,7 @@ Deny: :deny appr-...
 - `backend_input_prepared`：从飞书/微信包装消息中提取后的命令输入，以及 Wecode 识别出的本地命令或最终 prompt。
 - `codex_prompt_dispatch`：准备发送给 Codex 的 prompt、model、resume/fresh 决策。
 - `codex_remote_dispatch`：准备通过 Codex app-server remote API 启动或续接 thread。
+- `codex_remote_native_approval_prompt_emitted`：Codex 原生审批提示已经写入 OpenClaw JSONL stdout，等待聊天里的批准或拒绝。
 - `codex_remote_turn_completed`：remote turn 完成后的 thread id 和最终消息大小。
 - `codex_remote_fallback_to_exec`：remote 不可用并回退到 `codex exec` 的原因。
 - `codex_exec_command`：实际执行的 `codex exec` 参数和 working root。
@@ -375,7 +377,9 @@ resumeVerified: true
 
 - 当前后端优先使用 Codex app-server remote API，不启动 Codex TUI；standalone Codex 可走 managed remote，非 standalone Codex 会走 `codex app-server --listen stdio://` 兼容路径。`codex --remote <ADDR>` 仍是 TUI 连接 remote app-server 的入口。
 - remote API 仍是 Codex 实验接口；默认 `"remote"` 会自动回退 `codex exec`，需要强校验时使用 `"remote-strict"`。
-- Codex 原生工具审批请求在 remote v1 中会被协议级拒绝，避免后端进程悬挂；现在的微信审批仍是 `wecode` 自己的确认队列，适合保护自定义高风险命令。
+- remote 模式会把 Codex app-server 原生审批请求转成微信/飞书可见的 `appr-...` 审批提示。只有一个待审批项时，回复 `yes` / `:yes` 批准，回复 `no` / `:no` 拒绝；多个待审批项时使用 `:yes appr-...` / `:no appr-...` 指定 id。这个能力只覆盖 remote/app-server transport；`codex exec` fallback 使用 `--yolo`，不做交互式审批桥接。
+- 如果你已经运行过旧版 `wecode configure-codex`，升级后重新运行一次 `wecode configure-codex`，让 OpenClaw backend 配置更新为 `serialize: false` 和 `jsonlDialect: "claude-stream-json"`。Wecode 会用自己的运行锁串行化 Codex turn，并允许审批回复在等待审批时进入；`jsonlDialect` 用来让审批提示在原 Codex turn 等待期间实时发送到微信/飞书。
+- 如果你使用旧版 bootstrap 出来的微信或飞书配置，升级后重新运行 `wecode bootstrap --weixin` 或 `wecode bootstrap --feishu`。新版会 patch OpenClaw 渠道运行时，让审批回复走控制旁路；微信还会固定安装 `@tencent-weixin/openclaw-weixin@2.4.4`、启用 block streaming，并把 Codex 审批 partial 转成普通微信文本消息，避免权限提示被缓冲到 Codex turn 结束后才发送。飞书新版也会写入 `streaming: true`、`renderMode: "card"` 和 `blockStreaming: true`。
 
 ## 项目结构
 

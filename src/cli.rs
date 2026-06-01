@@ -19,6 +19,7 @@ pub enum CliCommand {
     },
     PatchOpenclawRuntime {
         runtime_dir: String,
+        state_dir: String,
     },
     InstallWeixin,
     ConfigureCodex {
@@ -139,6 +140,7 @@ fn parse_bootstrap_command(args: &[String]) -> Result<CliCommand, String> {
 
 fn parse_patch_openclaw_runtime_command(args: &[String]) -> Result<CliCommand, String> {
     let mut runtime_dir = None;
+    let mut state_dir = None;
     let mut idx = 0;
 
     while idx < args.len() {
@@ -148,6 +150,14 @@ fn parse_patch_openclaw_runtime_command(args: &[String]) -> Result<CliCommand, S
                 runtime_dir = Some(
                     args.get(idx)
                         .ok_or_else(|| "--runtime-dir requires a path".to_string())?
+                        .clone(),
+                );
+            }
+            "--state-dir" => {
+                idx += 1;
+                state_dir = Some(
+                    args.get(idx)
+                        .ok_or_else(|| "--state-dir requires a path".to_string())?
                         .clone(),
                 );
             }
@@ -163,6 +173,7 @@ fn parse_patch_openclaw_runtime_command(args: &[String]) -> Result<CliCommand, S
     Ok(CliCommand::PatchOpenclawRuntime {
         runtime_dir: runtime_dir
             .ok_or_else(|| "patch-openclaw-runtime requires --runtime-dir".to_string())?,
+        state_dir: state_dir.unwrap_or_else(|| "~/.wecode/openclaw-state".to_string()),
     })
 }
 

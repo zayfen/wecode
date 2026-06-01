@@ -27,3 +27,23 @@ fn doctor_requires_node_22_19_openclaw_codex_and_npm() {
         .iter()
         .any(|item| item.name == "openclaw" && !item.ok));
 }
+
+#[test]
+fn doctor_does_not_require_npx_for_bootstrap() {
+    let report = diagnose_tools(&ToolSnapshot {
+        node_version: Some("v24.14.1".to_string()),
+        npm_found: true,
+        npx_found: false,
+        openclaw_version: Some("OpenClaw 2026.5.28".to_string()),
+        codex_version: Some("codex-cli 0.134.0".to_string()),
+    });
+
+    assert!(
+        report.ok,
+        "npx is not needed after Weixin install stopped shelling out to the installer CLI: {report:?}"
+    );
+    assert!(
+        !report.items.iter().any(|item| item.name == "npx"),
+        "doctor should not report npx as a required tool: {report:?}"
+    );
+}

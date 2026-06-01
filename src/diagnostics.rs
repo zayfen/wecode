@@ -103,12 +103,6 @@ pub fn diagnose_tools(snapshot: &ToolSnapshot) -> ToolReport {
         ToolCheck::fail("npm", "not found. Install Node with npm")
     });
 
-    items.push(if snapshot.npx_found {
-        ToolCheck::ok("npx", "found npx")
-    } else {
-        ToolCheck::fail("npx", "not found. Install Node with npx")
-    });
-
     items.push(match snapshot.openclaw_version.as_deref() {
         Some(version) => ToolCheck::ok("openclaw", format!("found {version}")),
         None => ToolCheck::fail(
