@@ -62,6 +62,13 @@ fn parses_cli_commands() {
     );
 
     assert_eq!(
+        parse_cli_args(["wecode", "runtime-status", "--config", "wecode.json"]),
+        Ok(CliCommand::RuntimeStatus {
+            config_path: Some("wecode.json".to_string())
+        })
+    );
+
+    assert_eq!(
         parse_cli_args(["wecode", "render", ":codex", "hello"]),
         Ok(CliCommand::Render {
             config_path: None,

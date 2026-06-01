@@ -2,8 +2,26 @@ use std::fs;
 
 use wecode::{
     default_config, prepare_backend_input, prepare_backend_prompt, read_config_str,
-    render_command_input, BackendInput,
+    render_command_input, BackendInput, WecodeConfig,
 };
+
+fn isolated_empty_config() -> WecodeConfig {
+    isolated_config_with(r#"{"commands":[]}"#)
+}
+
+fn isolated_config_with(config_json: &str) -> WecodeConfig {
+    let state_dir = tempfile::tempdir().expect("tempdir").path().join("state");
+    let mut value: serde_json::Value = serde_json::from_str(config_json).expect("config json");
+    let object = value.as_object_mut().expect("config object");
+    let openclaw = object
+        .entry("openclaw")
+        .or_insert_with(|| serde_json::json!({}));
+    openclaw.as_object_mut().expect("openclaw object").insert(
+        "stateDir".to_string(),
+        serde_json::Value::String(state_dir.display().to_string()),
+    );
+    read_config_str(&value.to_string()).expect("config should parse")
+}
 
 #[test]
 fn renders_custom_command_prompt_from_prefix_match() {
@@ -72,17 +90,18 @@ fn backend_prompt_rejects_custom_command_that_requires_confirmation() {
 }
 
 #[test]
-fn backend_input_rejects_removed_sessions_command() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+fn backend_input_treats_removed_sessions_command_as_undefined() {
+    let cfg = isolated_empty_config();
 
-    let error = prepare_backend_input(&cfg, ":sessions").expect_err("sessions removed");
-
-    assert!(error.contains("`:sessions` was removed"));
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":sessions").expect("sessions undefined"),
+        BackendInput::UndefinedCommand
+    ));
 }
 
 #[test]
 fn backend_input_recognizes_resume_command() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
 
     assert!(matches!(
         prepare_backend_input(&cfg, ":resume").expect("resume latest"),
@@ -99,7 +118,7 @@ fn backend_input_recognizes_resume_command() {
 
 #[test]
 fn backend_input_recognizes_fresh_thread_command() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
 
     assert!(matches!(
         prepare_backend_input(&cfg, ":fresh").expect("fresh"),
@@ -115,7 +134,7 @@ fn backend_input_recognizes_fresh_thread_command() {
 
 #[test]
 fn backend_input_converts_colon_codex_commands_to_slash_prompts() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
 
     for (command, expected) in [
         (":init", "/init"),
@@ -145,7 +164,7 @@ fn backend_input_converts_colon_codex_commands_to_slash_prompts() {
 
 #[test]
 fn backend_input_recognizes_control_commands() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
 
     assert!(matches!(
         prepare_backend_input(&cfg, ":help").expect("help"),
@@ -214,6 +233,75 @@ fn backend_input_recognizes_control_commands() {
 }
 
 #[test]
+fn backend_input_rejects_unknown_colon_command_without_invoking_codex() {
+    let cfg = isolated_empty_config();
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":unknown do something").expect("unknown command"),
+        BackendInput::UndefinedCommand
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":review").expect("removed review command"),
+        BackendInput::UndefinedCommand
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":review focus security").expect("removed review command"),
+        BackendInput::UndefinedCommand
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, "ordinary prompt").expect("ordinary prompt"),
+        BackendInput::Prompt(prompt) if prompt == "ordinary prompt"
+    ));
+}
+
+#[test]
+fn backend_input_recognizes_yolo_command() {
+    let cfg = isolated_empty_config();
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":yolo").expect("toggle yolo"),
+        BackendInput::YoloToggle
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":yolo true").expect("enable yolo"),
+        BackendInput::YoloSet { enabled: true }
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":yolo false").expect("disable yolo"),
+        BackendInput::YoloSet { enabled: false }
+    ));
+    assert_eq!(
+        prepare_backend_input(&cfg, ":yolo maybe"),
+        Err(":yolo expects true or false".to_string())
+    );
+}
+
+#[test]
+fn backend_input_recognizes_stop_even_while_approval_is_pending() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    let cfg = read_config_str(&format!(
+        r#"{{"openclaw":{{"stateDir":{}}},"commands":[]}}"#,
+        serde_json::to_string(&state_dir.display().to_string()).expect("state json")
+    ))
+    .expect("config should parse");
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":stop").expect("stop"),
+        BackendInput::Stop
+    ));
+
+    let native_dir = state_dir.join("approvals").join("native");
+    fs::create_dir_all(&native_dir).expect("native dir");
+    fs::write(native_dir.join("appr-one.json"), "{}").expect("pending native approval");
+
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":stop").expect("stop during approval"),
+        BackendInput::Stop
+    ));
+}
+
+#[test]
 fn backend_input_treats_plain_yes_no_as_approval_only_when_approval_is_pending() {
     let temp = tempfile::tempdir().expect("tempdir");
     let empty_state_dir = temp.path().join("empty-state");
@@ -260,8 +348,40 @@ fn backend_input_treats_plain_yes_no_as_approval_only_when_approval_is_pending()
 }
 
 #[test]
+fn backend_input_waits_for_approval_for_any_non_approval_input() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    let cfg = read_config_str(&format!(
+        r#"{{"openclaw":{{"stateDir":{}}},"commands":[]}}"#,
+        serde_json::to_string(&state_dir.display().to_string()).expect("state json")
+    ))
+    .expect("config should parse");
+    let native_dir = state_dir.join("approvals").join("native");
+    fs::create_dir_all(&native_dir).expect("native dir");
+    fs::write(native_dir.join("appr-one.json"), "{}").expect("pending native approval");
+
+    for input in ["ordinary prompt", ":status", ":unknown"] {
+        assert!(
+            matches!(
+                prepare_backend_input(&cfg, input).expect(input),
+                BackendInput::ApprovalWaiting
+            ),
+            "{input} should be held while approval is pending"
+        );
+    }
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":yes").expect("approve"),
+        BackendInput::Approve { approval_id: None }
+    ));
+    assert!(matches!(
+        prepare_backend_input(&cfg, ":no").expect("deny"),
+        BackendInput::Deny { approval_id: None }
+    ));
+}
+
+#[test]
 fn backend_input_recognizes_metadata_wrapped_control_command() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"Conversation info (untrusted metadata):
 ```json
 {
@@ -281,7 +401,7 @@ fn backend_input_recognizes_metadata_wrapped_control_command() {
 
 #[test]
 fn backend_input_does_not_treat_generic_json_string_as_channel_message() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"":help""#;
 
     assert!(matches!(
@@ -292,7 +412,7 @@ fn backend_input_does_not_treat_generic_json_string_as_channel_message() {
 
 #[test]
 fn backend_input_does_not_guess_generic_json_object_message_fields() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"{"message":":cd ~/Github/zcode"}"#;
 
     assert!(matches!(
@@ -303,7 +423,7 @@ fn backend_input_does_not_guess_generic_json_object_message_fields() {
 
 #[test]
 fn backend_input_extracts_feishu_text_event_message() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"{
       "schema": "2.0",
       "header": { "event_type": "im.message.receive_v1" },
@@ -327,7 +447,7 @@ fn backend_input_extracts_feishu_text_event_message() {
 
 #[test]
 fn backend_input_extracts_weixin_getupdates_text_message() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"{
       "ret": 0,
       "msgs": [
@@ -351,7 +471,7 @@ fn backend_input_extracts_weixin_getupdates_text_message() {
 
 #[test]
 fn backend_input_extracts_decorated_openclaw_plain_message_for_codex() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"Conversation info (untrusted metadata):
 ```json
 {"message_id":"om_x100b6e977ba6b4b0b34edb547991066"}
@@ -368,7 +488,7 @@ ou_08e494561f9ff0e2bd8015472c28e6e5: 解释 src/commands.rs 的输入处理"#;
 
 #[test]
 fn backend_input_recognizes_decorated_openclaw_control_command() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"Conversation info (untrusted metadata):
 ```json
 {"message_id":"om_x100b6e977ba6b4b0b34edb547991066"}
@@ -385,7 +505,7 @@ ou_08e494561f9ff0e2bd8015472c28e6e5: :cd ~/Github/zcode"#;
 
 #[test]
 fn backend_input_converts_decorated_openclaw_colon_command_to_slash_prompt() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"[message_id: om_x100b6e977ba6b4b0b34edb547991066]
 ou_08e494561f9ff0e2bd8015472c28e6e5: :compact keep decisions"#;
 
@@ -397,7 +517,7 @@ ou_08e494561f9ff0e2bd8015472c28e6e5: :compact keep decisions"#;
 
 #[test]
 fn backend_input_preserves_decorated_openclaw_multiline_feishu_command() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"Conversation info (untrusted metadata):
 ```json
 {"message_id":"om_x100b6e977ba6b4b0b34edb547991066"}
@@ -417,7 +537,7 @@ ou_08e494561f9ff0e2bd8015472c28e6e5: :compact keep decisions
 
 #[test]
 fn backend_input_preserves_decorated_openclaw_multiline_weixin_command() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
     let input = r#"[message_id: wx-msg-1]
 o9cq805CIQyEJ1pliCh0GGdeTy98@im.wechat: :plan 兼容微信多行消息
 - 提取 sender 后面的正文
@@ -432,7 +552,7 @@ o9cq805CIQyEJ1pliCh0GGdeTy98@im.wechat: :plan 兼容微信多行消息
 
 #[test]
 fn backend_input_recognizes_codex_builtin_commands() {
-    let cfg = read_config_str(r#"{"commands":[]}"#).expect("config should parse");
+    let cfg = isolated_empty_config();
 
     assert!(matches!(
         prepare_backend_input(&cfg, ":diff").expect("diff"),
@@ -451,14 +571,6 @@ fn backend_input_recognizes_codex_builtin_commands() {
         BackendInput::ModelSet { model } if model == "gpt-5.5"
     ));
     assert!(matches!(
-        prepare_backend_input(&cfg, ":review").expect("review"),
-        BackendInput::Review { instructions: None }
-    ));
-    assert!(matches!(
-        prepare_backend_input(&cfg, ":review focus security").expect("review with instructions"),
-        BackendInput::Review { instructions: Some(instructions) } if instructions == "focus security"
-    ));
-    assert!(matches!(
         prepare_backend_input(&cfg, ":report").expect("report"),
         BackendInput::Prompt(prompt)
             if prompt.contains("side analysis") && prompt.contains("User request: 任务状态")
@@ -473,7 +585,7 @@ fn backend_input_recognizes_codex_builtin_commands() {
 
 #[test]
 fn custom_commands_can_override_codex_builtin_command_prompts() {
-    let cfg = read_config_str(
+    let cfg = isolated_config_with(
         r#"{
           "commands": [
             {
@@ -490,8 +602,7 @@ fn custom_commands_can_override_codex_builtin_command_prompts() {
             }
           ]
         }"#,
-    )
-    .expect("config should parse");
+    );
 
     assert!(matches!(
         prepare_backend_input(&cfg, ":plan module split").expect("plan"),
@@ -506,7 +617,7 @@ fn custom_commands_can_override_codex_builtin_command_prompts() {
 
 #[test]
 fn backend_input_returns_approval_request_for_confirmed_command() {
-    let cfg = read_config_str(
+    let cfg = isolated_config_with(
         r#"{
           "commands": [
             {
@@ -517,8 +628,7 @@ fn backend_input_returns_approval_request_for_confirmed_command() {
             }
           ]
         }"#,
-    )
-    .expect("config should parse");
+    );
 
     let input = prepare_backend_input(&cfg, ":deploy production").expect("backend input");
 

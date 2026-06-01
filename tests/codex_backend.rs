@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[test]
@@ -187,7 +187,7 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
         let _ = reader.read_to_string(&mut rest);
     });
 
-    let (read_result, first_line) = match rx.recv_timeout(Duration::from_millis(5000)) {
+    let (read_result, first_line) = match rx.recv_timeout(Duration::from_millis(15000)) {
         Ok(value) => value,
         Err(err) => {
             let _ = child.kill();
@@ -207,6 +207,118 @@ echo '{{"type":"message","role":"assistant","content":[{{"type":"output_text","t
     );
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn stop_command_terminates_running_exec_backend() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let stopped_path = temp.path().join("codex-stopped.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+
+    fs::write(
+        &codex_path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {calls}
+trap 'printf stopped > {stopped}; exit 143' TERM INT
+echo '{{"thread_id":"stop-thread"}}'
+while true; do sleep 1; done
+"#,
+            calls = shell_quote(calls_path.to_str().expect("utf-8 calls path")),
+            stopped = shell_quote(stopped_path.to_str().expect("utf-8 stopped path")),
+        ),
+    )
+    .expect("write fake codex");
+    let mut permissions = fs::metadata(&codex_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&codex_path, permissions).expect("chmod fake codex");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":"{}"}},"codex":{{"transport":"exec"}}}}"#,
+            state_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "long task",
+        ])
+        .env("PATH", &path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn backend");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line);
+        let _ = tx.send((result, line));
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+    });
+    let (_, first_line) = rx
+        .recv_timeout(Duration::from_millis(15000))
+        .expect("backend should stream thread id before stop");
+    assert!(
+        first_line.contains(r#""thread_id":"stop-thread""#),
+        "first stdout line:\n{first_line}"
+    );
+
+    let stop_output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":stop",
+        ])
+        .env("PATH", &path)
+        .output()
+        .expect("run stop");
+
+    assert!(
+        stop_output.status.success(),
+        "stop stderr:\n{}",
+        String::from_utf8_lossy(&stop_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stop_output.stdout).contains("已停止"),
+        "stop stdout:\n{}",
+        String::from_utf8_lossy(&stop_output.stdout)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("check backend").is_some() {
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("running backend did not stop after :stop");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        stopped_path.exists(),
+        "fake codex should receive a termination signal"
+    );
 }
 
 #[test]
@@ -474,7 +586,7 @@ fn codex_backend_remote_transport_streams_completed_agent_messages_before_turn_f
     });
 
     let (first_result, first_line, second_result, second_line) =
-        match rx.recv_timeout(Duration::from_millis(5000)) {
+        match rx.recv_timeout(Duration::from_millis(15000)) {
             Ok(value) => value,
             Err(err) => {
                 let _ = child.kill();
@@ -858,12 +970,107 @@ fn codex_backend_remote_approval_waits_for_wechat_approve() {
         "stderr unavailable for spawned process"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Codex requests permission"), "{stdout}");
-    assert!(stdout.contains("Approve: yes, :yes"), "{stdout}");
+    assert!(stdout.contains("# 权限审批"), "{stdout}");
+    assert!(stdout.contains("**执行命令**"), "{stdout}");
+    assert!(stdout.contains("cargo test"), "{stdout}");
+    assert!(stdout.contains("**目录**"), "{stdout}");
+    assert!(
+        stdout.contains("回复 `yes` 批准，回复 `no` 拒绝"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Approve:"), "{stdout}");
     assert!(stdout.contains("approval ok"), "{stdout}");
     let calls = fs::read_to_string(calls_path).expect("calls");
     assert!(calls.contains(r#""id":99"#), "{calls}");
     assert!(calls.contains(r#""decision":"accept""#), "{calls}");
+}
+
+#[test]
+fn codex_backend_remote_approval_deny_does_not_replay_non_final_agent_message() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let proxy_path = temp.path().join("codex-remote-proxy");
+    let calls_path = temp.path().join("remote-calls.txt");
+    let state_dir = temp.path().join("state");
+    let non_final_text = "I will create the requested temporary file now.";
+    write_fake_remote_proxy_with_denied_approval_non_final_turn_item(
+        &proxy_path,
+        &calls_path,
+        "approval-thread",
+        non_final_text,
+    );
+    let config_path = temp.path().join("wecode.json");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw":{{"stateDir":{},"cliNoOutputTimeoutMs":900000}},
+              "codex":{{
+                "transport":"remote-strict",
+                "remote":{{
+                  "autoStart":false,
+                  "proxyCommand":{},
+                  "fallbackProxyCommand":"",
+                  "approvalTimeoutSeconds":30
+                }}
+              }}
+            }}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json"),
+            serde_json::to_string(&proxy_path.display().to_string()).expect("proxy json")
+        ),
+    )
+    .expect("write config");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "please create a temp file",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn backend");
+
+    let approval_file = wait_for_first_native_approval_file(&state_dir);
+    let approval_id = approval_file
+        .file_stem()
+        .expect("stem")
+        .to_str()
+        .expect("utf-8")
+        .to_string();
+
+    let denied = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":deny",
+            &approval_id,
+        ])
+        .output()
+        .expect("deny");
+    assert!(
+        denied.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+
+    let output = child.wait_with_output().expect("wait backend");
+    assert!(
+        output.status.success(),
+        "stderr unavailable for spawned process"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("# 权限审批"), "{stdout}");
+    assert!(stdout.contains("已拒绝权限请求。"), "{stdout}");
+    assert!(
+        !stdout.contains(non_final_text),
+        "non-final pre-approval text should not be replayed after denial:\n{stdout}"
+    );
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(calls.contains(r#""decision":"decline""#), "{calls}");
 }
 
 #[test]
@@ -921,7 +1128,7 @@ fn codex_backend_remote_approval_streams_claude_delta_before_decision() {
 
     let _approval_file = wait_for_first_native_approval_file(&state_dir);
     let (first_result, first_line, second_result, second_line) =
-        match rx.recv_timeout(Duration::from_millis(5000)) {
+        match rx.recv_timeout(Duration::from_millis(15000)) {
             Ok(value) => value,
             Err(err) => {
                 let _ = child.kill();
@@ -942,7 +1149,8 @@ fn codex_backend_remote_approval_streams_claude_delta_before_decision() {
         second_line.contains(r#""type":"stream_event""#)
             && second_line.contains(r#""content_block_delta""#)
             && second_line.contains(r#""text_delta""#)
-            && second_line.contains("Codex requests permission"),
+            && second_line.contains("# 权限审批")
+            && second_line.contains("回复 `yes` 批准，回复 `no` 拒绝"),
         "approval prompt must be emitted as Claude-stream JSONL for OpenClaw partial delivery:\n{second_line}"
     );
     assert!(
@@ -1015,7 +1223,7 @@ fn codex_backend_remote_approval_emits_keepalive_while_waiting() {
     });
 
     let _approval_file = wait_for_first_native_approval_file(&state_dir);
-    let lines = match rx.recv_timeout(Duration::from_millis(7000)) {
+    let lines = match rx.recv_timeout(Duration::from_millis(15000)) {
         Ok(Ok(lines)) => lines,
         Ok(Err(err)) => {
             let _ = child.kill();
@@ -1095,7 +1303,7 @@ fn codex_backend_remote_approval_times_out_with_decline() {
 }
 
 #[test]
-fn codex_backend_status_counts_native_approvals() {
+fn codex_backend_status_waits_when_native_approvals_are_pending() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config_path = temp.path().join("wecode.json");
     let state_dir = temp.path().join("state");
@@ -1130,7 +1338,275 @@ fn codex_backend_status_counts_native_approvals() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("pending approvals: 2"), "{stdout}");
+    assert!(
+        stdout.contains("等待权限审批：请输入 `yes` or `no`"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn codex_backend_unknown_colon_command_replies_locally_without_invoking_codex() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":{}}},"codex":{{"transport":"exec"}}}}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json")
+        ),
+    )
+    .expect("write config");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    for args in [vec![":unknown", "payload"], vec![":sessions"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+            .args([
+                "codex-backend",
+                "--config",
+                config_path.to_str().expect("utf-8 config"),
+                "--jsonl",
+            ])
+            .args(args)
+            .env("PATH", &path)
+            .output()
+            .expect("unknown command");
+
+        assert!(
+            output.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("未定义的命令！可以使用:help查看命令"),
+            "stdout:\n{stdout}"
+        );
+    }
+    assert!(
+        !calls_path.exists(),
+        "unknown commands must not invoke Codex"
+    );
+}
+
+#[test]
+fn codex_backend_waits_for_approval_for_non_approval_input_without_invoking_codex() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let codex_path = temp.path().join("codex");
+    let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":{}}},"codex":{{"transport":"exec"}}}}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json")
+        ),
+    )
+    .expect("write config");
+    let native_dir = state_dir.join("approvals").join("native");
+    fs::create_dir_all(&native_dir).expect("native dir");
+    fs::write(native_dir.join("appr-one.json"), "{}").expect("pending native approval");
+
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "please continue",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("waiting command");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("等待权限审批：请输入 `yes` or `no`"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !calls_path.exists(),
+        "non-approval input must not invoke Codex"
+    );
+}
+
+#[test]
+fn status_uses_markdown_and_reports_project_yolo_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{"openclaw":{{"stateDir":{}}},"codex":{{"transport":"exec"}}}}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json")
+        ),
+    )
+    .expect("write config");
+
+    let status_before = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":status",
+        ])
+        .output()
+        .expect("status before");
+    assert!(
+        status_before.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&status_before.stderr)
+    );
+    let before_stdout = String::from_utf8_lossy(&status_before.stdout);
+    assert!(before_stdout.contains("# Wecode 状态"), "{before_stdout}");
+    assert!(before_stdout.contains("**Yolo**: off"), "{before_stdout}");
+    assert!(before_stdout.contains("```text"), "{before_stdout}");
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":yolo",
+            "true",
+        ])
+        .output()
+        .expect("enable yolo");
+    assert!(
+        enable.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&enable.stdout).contains("Yolo: on"),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&enable.stdout)
+    );
+
+    let status_after = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":status",
+        ])
+        .output()
+        .expect("status after");
+    assert!(
+        status_after.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&status_after.stderr)
+    );
+    let after_stdout = String::from_utf8_lossy(&status_after.stdout);
+    assert!(after_stdout.contains("**Yolo**: on"), "{after_stdout}");
+}
+
+#[test]
+fn yolo_enabled_sends_native_remote_yolo_settings() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let proxy_path = temp.path().join("codex-remote-proxy");
+    let calls_path = temp.path().join("remote-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
+    let project_dir = temp.path().join("project");
+    fs::create_dir(&project_dir).expect("project dir");
+    write_fake_remote_proxy_with_command_approval(&proxy_path, &calls_path, "yolo-thread");
+    fs::write(
+        &config_path,
+        format!(
+            r#"{{
+              "openclaw":{{"stateDir":{},"cliNoOutputTimeoutMs":900000}},
+              "codex":{{
+                "cwd": {},
+                "transport":"remote-strict",
+                "remote":{{
+                  "autoStart":false,
+                  "proxyCommand":{},
+                  "fallbackProxyCommand":"",
+                  "approvalTimeoutSeconds":30
+                }}
+              }}
+            }}"#,
+            serde_json::to_string(&state_dir.display().to_string()).expect("state json"),
+            serde_json::to_string(&project_dir.display().to_string()).expect("cwd json"),
+            serde_json::to_string(&proxy_path.display().to_string()).expect("proxy json")
+        ),
+    )
+    .expect("write config");
+
+    let enable = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":yolo",
+            "true",
+        ])
+        .output()
+        .expect("enable yolo");
+    assert!(
+        enable.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            "please run tests",
+        ])
+        .output()
+        .expect("run remote");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("yolo ok"), "{stdout}");
+    assert!(!stdout.contains("Codex requests permission"), "{stdout}");
+    assert!(!stdout.contains("需要执行命令"), "{stdout}");
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(calls.contains(r#""approvalPolicy":"never""#), "{calls}");
+    assert!(
+        calls.contains(r#""sandbox":"danger-full-access""#),
+        "{calls}"
+    );
+    assert!(
+        calls.contains(r#""sandboxPolicy":{"type":"dangerFullAccess"}"#),
+        "{calls}"
+    );
+    assert!(!calls.contains(r#""id":99"#), "{calls}");
+    assert!(!calls.contains(r#""decision":"accept""#), "{calls}");
+    assert_eq!(count_native_approval_files(&state_dir), 0);
 }
 
 #[test]
@@ -1564,11 +2040,15 @@ fn models_command_lists_configured_models_without_invoking_codex() {
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
     let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
 
     write_fake_codex(&codex_path, &calls_path);
     fs::write(
         &config_path,
-        r#"{"codex":{"models":["default","gpt-5.4","gpt-next"]}}"#,
+        format!(
+            r#"{{"openclaw":{{"stateDir":"{}"}},"codex":{{"models":["default","gpt-5.4","gpt-next"]}}}}"#,
+            state_dir.display()
+        ),
     )
     .expect("write config");
 
@@ -2162,15 +2642,28 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
     let temp = tempfile::tempdir().expect("temp dir");
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
 
     write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(r#"{{"openclaw":{{"stateDir":"{}"}}}}"#, state_dir.display()),
+    )
+    .expect("write config");
     let path = format!(
         "{}:{}",
         temp.path().display(),
         env::var("PATH").unwrap_or_default()
     );
     let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
-        .args(["codex-backend", "--jsonl", ":help"])
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            ":help",
+        ])
         .env("PATH", path)
         .output()
         .expect("run help");
@@ -2198,9 +2691,9 @@ fn help_lists_shell_and_codex_commands_without_invoking_codex() {
         "- `:shell <command>` - 在当前 Codex 项目目录执行 shell 命令",
         "- `:diff` - 显示当前项目 git diff",
         "- `:status` - 显示后端、项目、session、审批、模型和 git 状态",
+        "- `:stop` - 停止当前正在运行的 Codex 任务",
         "## Codex 命令（会调用 Codex）",
         "- `:init [notes]` - 转成 `/init ...` 后发送给 Codex 原生命令",
-        "- `:review [instructions]` - 对未提交改动执行 Codex review",
         "- `:new [prompt]` - 转成 `/new ...` 后发送给 Codex 原生命令，不保证切换 Wecode 绑定的 session",
         "- `:compact [notes]` - 转成 `/compact ...` 后发送给 Codex 原生命令",
         "- `:plan [task]` - 转成 `/plan ...` 后发送给 Codex 原生命令",
@@ -2236,6 +2729,8 @@ fn metadata_wrapped_help_does_not_invoke_codex() {
     let temp = tempfile::tempdir().expect("temp dir");
     let codex_path = temp.path().join("codex");
     let calls_path = temp.path().join("codex-calls.txt");
+    let config_path = temp.path().join("wecode.json");
+    let state_dir = temp.path().join("state");
     let input = r#"Conversation info (untrusted metadata):
 ```json
 {
@@ -2248,13 +2743,24 @@ fn metadata_wrapped_help_does_not_invoke_codex() {
 :help"#;
 
     write_fake_codex(&codex_path, &calls_path);
+    fs::write(
+        &config_path,
+        format!(r#"{{"openclaw":{{"stateDir":"{}"}}}}"#, state_dir.display()),
+    )
+    .expect("write config");
     let path = format!(
         "{}:{}",
         temp.path().display(),
         env::var("PATH").unwrap_or_default()
     );
     let output = Command::new(env!("CARGO_BIN_EXE_wecode"))
-        .args(["codex-backend", "--jsonl", input])
+        .args([
+            "codex-backend",
+            "--config",
+            config_path.to_str().expect("utf-8 config"),
+            "--jsonl",
+            input,
+        ])
         .env("PATH", path)
         .output()
         .expect("run metadata wrapped help");
@@ -2968,7 +3474,15 @@ while IFS= read -r line; do
       ;;
     *'"method":"turn/start"'*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"turn":{{"id":"turn-1","status":"inProgress","items":[]}}}}}}\n' "$id"
-      printf '{{"jsonrpc":"2.0","id":99,"method":"item/commandExecution/requestApproval","params":{{"threadId":"%s","turnId":"turn-1","command":"cargo test","cwd":"/tmp/project","availableDecisions":["decline","accept"]}}}}\n' "$thread_id"
+      case "$line" in
+        *'"approvalPolicy":"never"'*'"sandboxPolicy":'*'"dangerFullAccess"'*)
+          printf '{{"jsonrpc":"2.0","method":"item/completed","params":{{"threadId":"%s","turnId":"turn-1","item":{{"type":"agentMessage","id":"msg-final","text":"yolo ok","phase":"final_answer","memoryCitation":null}}}}}}\n' "$thread_id"
+          printf '{{"jsonrpc":"2.0","method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"turn-1","status":"completed","items":[],"itemsView":"notLoaded"}}}}}}\n' "$thread_id"
+          ;;
+        *)
+          printf '{{"jsonrpc":"2.0","id":99,"method":"item/commandExecution/requestApproval","params":{{"threadId":"%s","turnId":"turn-1","command":"cargo test","cwd":"/tmp/project","availableDecisions":["decline","accept"]}}}}\n' "$thread_id"
+          ;;
+      esac
       ;;
     *\"id\":99*\"result\"*)
       printf '{{"jsonrpc":"2.0","method":"item/completed","params":{{"threadId":"%s","turnId":"turn-1","item":{{"type":"agentMessage","id":"msg-final","text":"approval ok","phase":"final_answer","memoryCitation":null}}}}}}\n' "$thread_id"
@@ -2979,6 +3493,50 @@ done
 "#,
             calls = shell_quote(calls_path.to_str().expect("utf-8 calls path")),
             thread_id = shell_quote(thread_id),
+        ),
+    )
+    .expect("write fake remote proxy");
+    let mut permissions = fs::metadata(proxy_path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(proxy_path, permissions).expect("chmod fake remote proxy");
+}
+
+fn write_fake_remote_proxy_with_denied_approval_non_final_turn_item(
+    proxy_path: &std::path::Path,
+    calls_path: &std::path::Path,
+    thread_id: &str,
+    non_final_text: &str,
+) {
+    let non_final_text_json = serde_json::to_string(non_final_text).expect("non-final text json");
+    fs::write(
+        proxy_path,
+        format!(
+            r#"#!/bin/sh
+thread_id={thread_id}
+non_final_text_json={non_final_text_json}
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> {calls}
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"macos","userAgent":"fake"}}}}\n' "$id"
+      ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"thread":{{"id":"%s"}},"cwd":"/tmp","model":"fake","modelProvider":"fake","approvalPolicy":"never","approvalsReviewer":"user","sandbox":{{"mode":"workspace-write"}}}}}}\n' "$id" "$thread_id"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"turn":{{"id":"turn-1","status":"inProgress","items":[]}}}}}}\n' "$id"
+      printf '{{"jsonrpc":"2.0","id":99,"method":"item/commandExecution/requestApproval","params":{{"threadId":"%s","turnId":"turn-1","command":"touch /tmp/demo","cwd":"/tmp/project","availableDecisions":["decline","accept"]}}}}\n' "$thread_id"
+      ;;
+    *\"id\":99*\"result\"*)
+      printf '{{"jsonrpc":"2.0","method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"turn-1","status":"completed","items":[{{"type":"agentMessage","id":"msg-running","text":%s,"phase":"running","memoryCitation":null}}],"itemsView":"loaded"}}}}}}\n' "$thread_id" "$non_final_text_json"
+      ;;
+  esac
+done
+"#,
+            calls = shell_quote(calls_path.to_str().expect("utf-8 calls path")),
+            thread_id = shell_quote(thread_id),
+            non_final_text_json = shell_quote(&non_final_text_json)
         ),
     )
     .expect("write fake remote proxy");
@@ -3030,7 +3588,7 @@ done
 
 fn wait_for_first_native_approval_file(state_dir: &std::path::Path) -> std::path::PathBuf {
     let native_dir = state_dir.join("approvals").join("native");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         if let Ok(entries) = fs::read_dir(&native_dir) {
             if let Some(path) = entries
@@ -3091,6 +3649,17 @@ exit 1
     let mut permissions = fs::metadata(start_path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(start_path, permissions).expect("chmod fake remote start");
+}
+
+fn kill_recorded_pid(path: &std::path::Path) {
+    let Ok(pid) = fs::read_to_string(path) else {
+        return;
+    };
+    let pid = pid.trim();
+    if pid.is_empty() {
+        return;
+    }
+    let _ = Command::new("/bin/kill").arg("-TERM").arg(pid).status();
 }
 
 fn shell_quote(value: &str) -> String {

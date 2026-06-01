@@ -10,6 +10,7 @@ pub mod openclaw;
 pub mod paths;
 pub mod run_lock;
 pub mod sessions;
+pub mod yolo;
 
 pub use cli::{parse_cli_args, BootstrapChannel, CliCommand};
 pub use command_step::CommandStep;

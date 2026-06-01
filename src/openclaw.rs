@@ -139,16 +139,16 @@ pub fn gateway_launch_agent_path(config: &WecodeConfig) -> PathBuf {
 
 pub fn prevent_sleep_program_arguments(args: &[String], mode: PreventSleepMode) -> Vec<String> {
     let stripped = strip_wecode_caffeinate_wrapper(args);
-    match mode {
-        PreventSleepMode::Off => stripped,
-        PreventSleepMode::Ac => {
-            let mut wrapped = Vec::with_capacity(stripped.len() + 2);
-            wrapped.push(CAFFEINATE_PATH.to_string());
-            wrapped.push("-s".to_string());
-            wrapped.extend(stripped);
-            wrapped
-        }
-    }
+    let flag = match mode {
+        PreventSleepMode::Off => return stripped,
+        PreventSleepMode::Ac => "-s",
+        PreventSleepMode::Always => "-i",
+    };
+    let mut wrapped = Vec::with_capacity(stripped.len() + 2);
+    wrapped.push(CAFFEINATE_PATH.to_string());
+    wrapped.push(flag.to_string());
+    wrapped.extend(stripped);
+    wrapped
 }
 
 pub fn patch_gateway_launch_agent_prevent_sleep(config: &WecodeConfig) -> Result<(), String> {
@@ -184,7 +184,7 @@ pub fn patch_gateway_launch_agent_prevent_sleep_at(
 }
 
 fn strip_wecode_caffeinate_wrapper(args: &[String]) -> Vec<String> {
-    if args.len() >= 2 && args[0] == CAFFEINATE_PATH && args[1] == "-s" {
+    if args.len() >= 2 && args[0] == CAFFEINATE_PATH && matches!(args[1].as_str(), "-s" | "-i") {
         args[2..].to_vec()
     } else {
         args.to_vec()
@@ -708,8 +708,6 @@ async function handleWecodeNativeApprovalControl(params) {
         await sendWecodeApprovalControlMessage(params, `Failed to update Codex approval ${approvalId}: ${String(err)}`);
         return true;
     }
-    const action = approval.decision === "approve" ? "Approved" : "Denied";
-    await sendWecodeApprovalControlMessage(params, `${action} Codex approval ${approvalId}. Codex will continue in the original turn.`);
     return true;
 }
 
@@ -728,6 +726,10 @@ async function handleWecodeNativeApprovalControl(params) {
             ));
         }
     }
+
+    patched = ensure_wecode_stop_control_helpers(&patched);
+    patched = ensure_wecode_stop_control_branch_weixin(&patched);
+    patched = remove_legacy_wecode_native_approval_ack(&patched);
 
     const CONTEXT_TOKEN_BLOCK: &str = r#"    const contextToken = getContextTokenFromMsgContext(ctx);
     if (contextToken) {
@@ -761,9 +763,13 @@ async function handleWecodeNativeApprovalControl(params) {
 }
 
 fn patch_weixin_approval_partial_sender(source: &str, path: &Path) -> Result<String, String> {
-    if source.contains("sendWecodeApprovalPromptFromReplyPayload") {
-        return Ok(source.to_string());
-    }
+    const LEGACY_APPROVAL_PROMPT_DETECTION: &str = r#"                            const text = String(payload?.text ?? "");
+                            if (!text.includes("Codex requests permission") || !text.includes("Approval: appr-")) return;
+                            const match = text.match(/Approval:\s*(appr-[\w-]+)/);
+                            const approvalId = match?.[1];"#;
+    const APPROVAL_PROMPT_DETECTION: &str = r#"                            const text = String(payload?.text ?? "");
+                            const approvalId = text.match(/审批 ID\**:\s*`?(appr-[\w-]+)`?/)?.[1]
+                                ?? text.match(/Approval:\s*(appr-[\w-]+)/)?.[1];"#;
     const ORIGINAL: &str = r#"...(replyProgressSender?.replyOptions ?? {}),
                     disableBlockStreaming: false,"#;
     const OLD_PATCHED: &str = r#"...(replyProgressSender?.replyOptions ?? {}),
@@ -784,6 +790,15 @@ fn patch_weixin_approval_partial_sender(source: &str, path: &Path) -> Result<Str
                         };
                     })(),
                     disableBlockStreaming: false,"#;
+    if source.contains("sendWecodeApprovalPromptFromReplyPayload") {
+        if source.contains(APPROVAL_PROMPT_DETECTION) {
+            return Ok(source.to_string());
+        }
+        if source.contains(LEGACY_APPROVAL_PROMPT_DETECTION) {
+            return Ok(source.replace(LEGACY_APPROVAL_PROMPT_DETECTION, APPROVAL_PROMPT_DETECTION));
+        }
+        return Ok(source.to_string());
+    }
     const PATCHED: &str = r#"...(replyProgressSender?.replyOptions ?? {}),
                     ...(() => {
                         const wecodeBaseReplyOptions = {
@@ -793,9 +808,8 @@ fn patch_weixin_approval_partial_sender(source: &str, path: &Path) -> Result<Str
                         const wecodeSentApprovalIds = new Set();
                         const sendWecodeApprovalPromptFromReplyPayload = async (payload) => {
                             const text = String(payload?.text ?? "");
-                            if (!text.includes("Codex requests permission") || !text.includes("Approval: appr-")) return;
-                            const match = text.match(/Approval:\s*(appr-[\w-]+)/);
-                            const approvalId = match?.[1];
+                            const approvalId = text.match(/审批 ID\**:\s*`?(appr-[\w-]+)`?/)?.[1]
+                                ?? text.match(/Approval:\s*(appr-[\w-]+)/)?.[1];
                             if (!approvalId || wecodeSentApprovalIds.has(approvalId)) return;
                             wecodeSentApprovalIds.add(approvalId);
                             logger.info(`wecode approval prompt detected approvalId=${approvalId} textLen=${text.length}`);
@@ -1164,8 +1178,6 @@ async function handleWecodeNativeApprovalControl(params) {
 		await sendWecodeApprovalControlMessage({ ...params, error }, `Failed to update Codex approval ${approvalId}: ${String(err)}`);
 		return true;
 	}
-	const action = approval.decision === "approve" ? "Approved" : "Denied";
-	await sendWecodeApprovalControlMessage({ ...params, error }, `${action} Codex approval ${approvalId}. Codex will continue in the original turn.`);
 	return true;
 }
 
@@ -1179,6 +1191,10 @@ async function handleWecodeNativeApprovalControl(params) {
             ));
         }
     }
+
+    patched = ensure_wecode_stop_control_helpers(&patched);
+    patched = ensure_wecode_stop_control_branch_feishu(&patched);
+    patched = remove_legacy_wecode_native_approval_ack(&patched);
 
     const FEISHU_FROM_LINE: &str = r#"const feishuFrom = `feishu:${ctx.senderOpenId}`;"#;
     if !patched.contains("if (await handleWecodeNativeApprovalControl({") {
@@ -1214,11 +1230,227 @@ async function handleWecodeNativeApprovalControl(params) {
     Ok(patched)
 }
 
+fn ensure_wecode_stop_control_helpers(source: &str) -> String {
+    if source.contains("function parseWecodeStopControlText") {
+        return source.to_string();
+    }
+
+    const HELPERS: &str = r#"function parseWecodeStopControlText(text) {
+    return String(text ?? "").trim().toLowerCase() === ":stop";
+}
+function wecodeRunLocksDir() {
+    return path.join(resolveWecodeOpenClawStateDir(), "locks");
+}
+function listWecodeRunLockPaths(log = () => {}) {
+    const dir = wecodeRunLocksDir();
+    try {
+        return fs.readdirSync(dir, { withFileTypes: true })
+            .filter((entry) => entry.isFile() && entry.name.startsWith("codex-run-") && entry.name.endsWith(".lock"))
+            .map((entry) => path.join(dir, entry.name))
+            .sort();
+    }
+    catch (err) {
+        if (err?.code !== "ENOENT") log(`wecode stop lock list failed dir=${dir} err=${String(err)}`);
+        return [];
+    }
+}
+function readWecodeRunLockPid(lockPath, log = () => {}) {
+    try {
+        const content = fs.readFileSync(lockPath, "utf8");
+        const line = content.split(/\r?\n/).find((item) => item.startsWith("pid="));
+        const pid = Number(line?.slice("pid=".length).trim());
+        return Number.isInteger(pid) && pid > 0 ? pid : null;
+    }
+    catch (err) {
+        if (err?.code !== "ENOENT") log(`wecode stop lock read failed path=${lockPath} err=${String(err)}`);
+        return null;
+    }
+}
+function wecodeProcessIsAlive(pid) {
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (err) {
+        return err?.code === "EPERM";
+    }
+}
+async function wecodeChildPids(pid, log = () => {}) {
+    try {
+        const { execFileSync } = await import("node:child_process");
+        const output = execFileSync("/usr/bin/pgrep", ["-P", String(pid)], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+        });
+        return output.split(/\r?\n/)
+            .map((line) => Number(line.trim()))
+            .filter((child) => Number.isInteger(child) && child > 0 && child !== process.pid);
+    }
+    catch (err) {
+        if (err?.status !== 1) log(`wecode stop child pid lookup failed pid=${pid} err=${String(err)}`);
+        return [];
+    }
+}
+async function wecodeDescendantPids(pid, log = () => {}, seen = new Set()) {
+    if (seen.has(pid)) return [];
+    seen.add(pid);
+    const result = [];
+    for (const child of await wecodeChildPids(pid, log)) {
+        result.push(...await wecodeDescendantPids(child, log, seen), child);
+    }
+    return result;
+}
+function signalWecodeProcess(pid, signal, log = () => {}) {
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return;
+    try {
+        process.kill(pid, signal);
+    }
+    catch (err) {
+        if (err?.code !== "ESRCH") log(`wecode stop signal failed pid=${pid} signal=${signal} err=${String(err)}`);
+    }
+}
+async function stopWecodeProcessTree(pid, log = () => {}) {
+    const descendants = await wecodeDescendantPids(pid, log);
+    for (const child of descendants.slice().reverse()) signalWecodeProcess(child, "SIGTERM", log);
+    signalWecodeProcess(pid, "SIGTERM", log);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (wecodeProcessIsAlive(pid)) {
+        for (const child of descendants.slice().reverse()) signalWecodeProcess(child, "SIGKILL", log);
+        signalWecodeProcess(pid, "SIGKILL", log);
+    }
+}
+function removeWecodeFileIfExists(filePath, log = () => {}) {
+    try {
+        fs.unlinkSync(filePath);
+    }
+    catch (err) {
+        if (err?.code !== "ENOENT") log(`wecode stop file cleanup failed path=${filePath} err=${String(err)}`);
+    }
+}
+function clearWecodeJsonFiles(dir, log = () => {}) {
+    try {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            if (entry.isFile() && entry.name.endsWith(".json")) {
+                removeWecodeFileIfExists(path.join(dir, entry.name), log);
+            }
+        }
+    }
+    catch (err) {
+        if (err?.code !== "ENOENT") log(`wecode stop approval cleanup failed dir=${dir} err=${String(err)}`);
+    }
+}
+function clearWecodePendingApprovals(log = () => {}) {
+    const approvalsDir = path.join(resolveWecodeOpenClawStateDir(), "approvals");
+    clearWecodeJsonFiles(approvalsDir, log);
+    clearWecodeJsonFiles(path.join(approvalsDir, "native"), log);
+}
+async function stopWecodeCodexRuns(log = () => {}) {
+    let stopped = false;
+    for (const lockPath of listWecodeRunLockPaths(log)) {
+        const pid = readWecodeRunLockPid(lockPath, log);
+        if (pid && wecodeProcessIsAlive(pid)) {
+            await stopWecodeProcessTree(pid, log);
+            stopped = true;
+        }
+        removeWecodeFileIfExists(lockPath, log);
+    }
+    return stopped;
+}
+"#;
+
+    let anchors = [
+        "function wecodeNativeApprovalsDir()",
+        "async function sendWecodeApprovalControlMessage",
+        "async function handleWecodeNativeApprovalControl",
+    ];
+    for anchor in anchors {
+        if source.contains(anchor) {
+            return source.replace(anchor, &format!("{HELPERS}{anchor}"));
+        }
+    }
+    source.to_string()
+}
+
+fn ensure_wecode_stop_control_branch_weixin(source: &str) -> String {
+    if source.contains("parseWecodeStopControlText(params.text)") {
+        return source.to_string();
+    }
+    const HANDLE_START: &str = "async function handleWecodeNativeApprovalControl(params) {";
+    const BRANCH: &str = r#"async function handleWecodeNativeApprovalControl(params) {
+    if (parseWecodeStopControlText(params.text)) {
+        const stopped = await stopWecodeCodexRuns();
+        clearWecodePendingApprovals();
+        await sendWecodeApprovalControlMessage(params, stopped ? "已停止当前任务。" : "没有正在运行的任务。");
+        return true;
+    }"#;
+    source.replace(HANDLE_START, BRANCH)
+}
+
+fn ensure_wecode_stop_control_branch_feishu(source: &str) -> String {
+    if source.contains("parseWecodeStopControlText(params.text)") {
+        return source.to_string();
+    }
+    const LOG_BLOCK: &str = r#"	const log = typeof params.log === "function" ? params.log : console.log;
+	const error = typeof params.error === "function" ? params.error : console.error;"#;
+    const LOG_BLOCK_WITH_STOP: &str = r#"	const log = typeof params.log === "function" ? params.log : console.log;
+	const error = typeof params.error === "function" ? params.error : console.error;
+	if (parseWecodeStopControlText(params.text)) {
+		const stopped = await stopWecodeCodexRuns(log);
+		clearWecodePendingApprovals(log);
+		await sendWecodeApprovalControlMessage({ ...params, error }, stopped ? "已停止当前任务。" : "没有正在运行的任务。");
+		return true;
+	}"#;
+    if source.contains(LOG_BLOCK) {
+        return source.replace(LOG_BLOCK, LOG_BLOCK_WITH_STOP);
+    }
+
+    const HANDLE_START: &str = "async function handleWecodeNativeApprovalControl(params) {";
+    const BRANCH: &str = r#"async function handleWecodeNativeApprovalControl(params) {
+	const log = typeof params.log === "function" ? params.log : console.log;
+	const error = typeof params.error === "function" ? params.error : console.error;
+	if (parseWecodeStopControlText(params.text)) {
+		const stopped = await stopWecodeCodexRuns(log);
+		clearWecodePendingApprovals(log);
+		await sendWecodeApprovalControlMessage({ ...params, error }, stopped ? "已停止当前任务。" : "没有正在运行的任务。");
+		return true;
+	}"#;
+    source.replace(HANDLE_START, BRANCH)
+}
+
+fn remove_legacy_wecode_native_approval_ack(source: &str) -> String {
+    let mut patched = source.to_string();
+    for legacy in [
+        r#"    const action = approval.decision === "approve" ? "Approved" : "Denied";
+    await sendWecodeApprovalControlMessage(params, `${action} Codex approval ${approvalId}. Codex will continue in the original turn.`);
+"#,
+        r#"	const action = approval.decision === "approve" ? "Approved" : "Denied";
+	await sendWecodeApprovalControlMessage({ ...params, error }, `${action} Codex approval ${approvalId}. Codex will continue in the original turn.`);
+"#,
+    ] {
+        patched = patched.replace(legacy, "");
+    }
+    patched
+}
+
 fn patch_feishu_approval_partial_sender(source: &str, path: &Path) -> Result<String, String> {
-    if source.contains("sendWecodeApprovalPromptFromReplyPayload") {
+    const LEGACY_APPROVAL_PROMPT_DETECTION: &str = r#"					const text = String(payload?.text ?? "");
+					if (!text.includes("Codex requests permission") || !text.includes("Approval: appr-")) return;
+					const match = text.match(/Approval:\s*(appr-[\w-]+)/);
+					const approvalId = match?.[1];"#;
+    const APPROVAL_PROMPT_DETECTION: &str = r#"					const text = String(payload?.text ?? "");
+					const approvalId = text.match(/审批 ID\**:\s*`?(appr-[\w-]+)`?/)?.[1]
+						?? text.match(/Approval:\s*(appr-[\w-]+)/)?.[1];"#;
+    if !source.contains("function createFeishuReplyDispatcher") {
         return Ok(source.to_string());
     }
-    if !source.contains("function createFeishuReplyDispatcher") {
+    if source.contains("sendWecodeApprovalPromptFromReplyPayload") {
+        if source.contains(APPROVAL_PROMPT_DETECTION) {
+            return Ok(source.to_string());
+        }
+        if source.contains(LEGACY_APPROVAL_PROMPT_DETECTION) {
+            return Ok(source.replace(LEGACY_APPROVAL_PROMPT_DETECTION, APPROVAL_PROMPT_DETECTION));
+        }
         return Ok(source.to_string());
     }
     const ORIGINAL: &str = r#"			onPartialReply: streamingEnabled ? (payload) => {
@@ -1240,9 +1472,8 @@ fn patch_feishu_approval_partial_sender(source: &str, path: &Path) -> Result<Str
 				const wecodeFeishuSentApprovalIds = new Set();
 				const sendWecodeApprovalPromptFromReplyPayload = async (payload) => {
 					const text = String(payload?.text ?? "");
-					if (!text.includes("Codex requests permission") || !text.includes("Approval: appr-")) return;
-					const match = text.match(/Approval:\s*(appr-[\w-]+)/);
-					const approvalId = match?.[1];
+					const approvalId = text.match(/审批 ID\**:\s*`?(appr-[\w-]+)`?/)?.[1]
+						?? text.match(/Approval:\s*(appr-[\w-]+)/)?.[1];
 					if (!approvalId || wecodeFeishuSentApprovalIds.has(approvalId)) return;
 					wecodeFeishuSentApprovalIds.add(approvalId);
 					params.runtime.log?.(`wecode feishu approval prompt detected approvalId=${approvalId} textLen=${text.length}`);
@@ -1310,10 +1541,22 @@ fn patch_feishu_approval_partial_sender(source: &str, path: &Path) -> Result<Str
 
 fn ensure_wecode_approval_control_helper(source: &str, anchor: &str) -> Result<String, String> {
     if source.contains("function isWecodeApprovalControlText") {
+        if source.contains(r#"normalized === ":stop""#) {
+            return Ok(source.to_string());
+        }
+        let original = r#"	const normalized = String(text ?? "").trim().toLowerCase();
+	return /^(?::?(?:yes|no|approve|deny))(?:\s+[\w-]+)?$/.test(normalized);"#;
+        let patched = r#"	const normalized = String(text ?? "").trim().toLowerCase();
+	if (normalized === ":stop") return true;
+	return /^(?::?(?:yes|no|approve|deny))(?:\s+[\w-]+)?$/.test(normalized);"#;
+        if source.contains(original) {
+            return Ok(source.replace(original, patched));
+        }
         return Ok(source.to_string());
     }
     let helper = r#"function isWecodeApprovalControlText(text) {
 	const normalized = String(text ?? "").trim().toLowerCase();
+	if (normalized === ":stop") return true;
 	return /^(?::?(?:yes|no|approve|deny))(?:\s+[\w-]+)?$/.test(normalized);
 }
 

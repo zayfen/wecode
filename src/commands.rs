@@ -18,9 +18,6 @@ pub struct PreparedBackendInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendInput {
     Prompt(String),
-    Review {
-        instructions: Option<String>,
-    },
     Help,
     Status,
     Diff,
@@ -54,6 +51,13 @@ pub enum BackendInput {
     Deny {
         approval_id: Option<String>,
     },
+    YoloToggle,
+    YoloSet {
+        enabled: bool,
+    },
+    Stop,
+    UndefinedCommand,
+    ApprovalWaiting,
     ApprovalRequired {
         command_name: String,
         prompt: String,
@@ -123,7 +127,15 @@ pub fn prepare_backend_input_with_trace(
                 prompt: rendered.prompt,
             },
             Some(rendered) => BackendInput::Prompt(rendered.prompt),
-            None => BackendInput::Prompt(normalize_prompt_input(command_input)),
+            None => {
+                if let Some(prompt) = codex_builtin_prompt(command_input) {
+                    BackendInput::Prompt(prompt)
+                } else if command_input.trim().starts_with(':') {
+                    BackendInput::UndefinedCommand
+                } else {
+                    BackendInput::Prompt(command_input.to_string())
+                }
+            }
         },
     };
     Ok(PreparedBackendInput {
@@ -431,6 +443,14 @@ fn parse_control_command(
     input: &str,
 ) -> Result<Option<BackendInput>, String> {
     let trimmed = input.trim();
+    if trimmed == ":stop" {
+        return Ok(Some(BackendInput::Stop));
+    }
+    if has_pending_approval(config) {
+        return Ok(Some(
+            parse_approval_reply(trimmed, true)?.unwrap_or(BackendInput::ApprovalWaiting),
+        ));
+    }
     if matches!(trimmed, ":help" | ":commands") {
         return Ok(Some(BackendInput::Help));
     }
@@ -477,23 +497,15 @@ fn parse_control_command(
         let model = parse_single_arg(rest, ":model")?;
         return Ok(Some(BackendInput::ModelSet { model }));
     }
-    if trimmed == ":review" {
-        return Ok(Some(BackendInput::Review { instructions: None }));
+    if trimmed == ":yolo" {
+        return Ok(Some(BackendInput::YoloToggle));
     }
-    if let Some(rest) = trimmed.strip_prefix(":review ") {
-        return Ok(Some(BackendInput::Review {
-            instructions: Some(rest.trim().to_string()),
-        }));
+    if let Some(rest) = trimmed.strip_prefix(":yolo ") {
+        return parse_yolo_value(rest).map(|enabled| Some(BackendInput::YoloSet { enabled }));
     }
     if trimmed == ":report" || trimmed.starts_with(":report ") {
         let details = trimmed.strip_prefix(":report").unwrap_or("").trim();
         return Ok(Some(BackendInput::Prompt(report_prompt(details))));
-    }
-    if trimmed == ":sessions" {
-        return Err(
-            "`:sessions` was removed; use `:resume` to resume the previous Codex session."
-                .to_string(),
-        );
     }
     if trimmed == ":resume" {
         return Ok(Some(BackendInput::Resume { session_id: None }));
@@ -518,6 +530,14 @@ fn parse_control_command(
         }));
     }
 
+    if let Some(reply) = parse_approval_reply(trimmed, false)? {
+        return Ok(Some(reply));
+    }
+
+    Ok(None)
+}
+
+fn parse_approval_reply(trimmed: &str, allow_plain: bool) -> Result<Option<BackendInput>, String> {
     if matches!(trimmed, ":approve" | ":yes") {
         return Ok(Some(BackendInput::Approve { approval_id: None }));
     }
@@ -554,16 +574,13 @@ fn parse_control_command(
         });
     }
 
-    match trimmed.to_ascii_lowercase().as_str() {
-        "yes" if has_pending_approval(config) => {
-            return Ok(Some(BackendInput::Approve { approval_id: None }));
+    if allow_plain {
+        match trimmed.to_ascii_lowercase().as_str() {
+            "yes" => return Ok(Some(BackendInput::Approve { approval_id: None })),
+            "no" => return Ok(Some(BackendInput::Deny { approval_id: None })),
+            _ => {}
         }
-        "no" if has_pending_approval(config) => {
-            return Ok(Some(BackendInput::Deny { approval_id: None }));
-        }
-        _ => {}
     }
-
     Ok(None)
 }
 
@@ -601,9 +618,21 @@ fn pending_approval_files(dir: PathBuf) -> Vec<PathBuf> {
 
 fn normalize_prompt_input(input: &str) -> String {
     let trimmed = input.trim();
-    colon_command_body(trimmed)
-        .map(|body| format!("/{body}"))
-        .unwrap_or_else(|| input.to_string())
+    codex_builtin_prompt(trimmed).unwrap_or_else(|| input.to_string())
+}
+
+fn codex_builtin_prompt(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let body = colon_command_body(trimmed)?;
+    let command_name = body.split_whitespace().next()?;
+    if matches!(
+        command_name,
+        "init" | "new" | "compact" | "plan" | "goal" | "agent" | "side"
+    ) {
+        Some(format!("/{body}"))
+    } else {
+        None
+    }
 }
 
 fn command_input_candidate(input: &str) -> Option<&str> {
@@ -683,6 +712,17 @@ fn parse_shell_command(input: &str) -> Result<String, String> {
         return Err(":shell expects a command".to_string());
     }
     Ok(command.to_string())
+}
+
+fn parse_yolo_value(input: &str) -> Result<bool, String> {
+    let value = input.trim();
+    if value.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(":yolo expects true or false".to_string())
+    }
 }
 
 fn side_prompt(details: &str) -> String {

@@ -18,7 +18,7 @@ GitHub 默认展示的文档就是本文件 `README.md`，因此这里使用中�
 
 - **把手机变成开发入口**：微信或飞书负责输入和通知，Codex 仍在你的机器、你的仓库、你的配置里运行。
 - **保留真实项目上下文**：同一聊天会话续接同一个 Codex `thread_id`，避免每条消息都变成孤立任务。
-- **适合长任务和异步工作**：可以在路上发起实现、回到电脑前查看改动，也可以用 `:report`、`:diff`、`:review` 跟进进展。
+- **适合长任务和异步工作**：可以在路上发起实现、回到电脑前查看改动，也可以用 `:report`、`:diff` 跟进进展。
 - **默认安全边界清晰**：默认 sandbox 是 `workspace-write`，自定义高风险命令可要求微信审批，本地状态目录可检查。
 - **工程上可维护**：OpenClaw 管通信，`wecode` 管本地配置和命令转换，Codex 管代码理解和执行；每层职责明确，出了问题容易定位。
 - **不绑定单一路径**：优先使用 Codex app-server remote API，managed remote 不可用时可走 stdio app-server，再必要时回退 `codex exec`。
@@ -49,7 +49,7 @@ GitHub 默认展示的文档就是本文件 `README.md`，因此这里使用中�
 - 聊天中管理 session：`:resume [session_id]` 绑定到最近或指定的本机 Codex session，`:fresh [prompt]` 硬新开 Codex thread。
 - 聊天审批：配置了 `requireConfirm: true` 的命令会先生成审批 id；Codex remote 原生审批也会转成同样的审批提示。只有一个待审批项时直接回复 `yes` / `no` 或 `:yes` / `:no` 即可，多个待审批项时回复 `:yes <id>` / `:no <id>`。
 - 私有 OpenClaw 运行时：默认安装到 `~/.wecode/openclaw-runtime`，不污染全局 OpenClaw 配置。
-- macOS AC 防睡眠：默认用 `caffeinate -s` 包装 OpenClaw Gateway LaunchAgent，避免外接电源下息屏后系统睡眠导致消息不处理。
+- macOS 防睡眠：默认用 `caffeinate -s` 包装 OpenClaw Gateway LaunchAgent，避免外接电源下息屏后系统睡眠导致消息不处理；需要尽量 7x24 在线时可设置 `openclaw.preventSleep` 为 `"always"`。
 
 ## 架构
 
@@ -74,7 +74,7 @@ Codex app-server remote API
   |-- compatible: codex app-server --listen stdio://
   |
   v
-fallback: codex exec / codex exec resume / codex exec review
+fallback: codex exec / codex exec resume
   |
   v
 当前项目目录
@@ -148,6 +148,7 @@ wecode codex-backend --jsonl --cwd /Users/riven/Github/wecode --model wecode-cod
 
 ```bash
 cargo run -- doctor
+cargo run -- runtime-status
 cargo run -- sample-config
 cargo run -- bootstrap --dry-run --weixin
 cargo run -- bootstrap --weixin
@@ -174,11 +175,12 @@ node scripts/openclaw-agent-smoke.mjs
 :cd <目录>                切换 Codex 项目根目录，后续 Codex 任务使用该目录
 :shell <命令>             在当前 Codex 项目目录执行任意 shell 命令并返回输出
 :status                   显示后端、session、审批和 git 状态
+:yolo [true|false]        切换或设置当前项目 yolo 模式，默认关闭
+:stop                     停止当前正在运行的 Codex 任务
 :model                    显示当前项目使用的 Codex 模型
 :models                   列出配置中的 Codex 模型候选
 :model <model>            设置当前项目后续 Codex 调用使用的模型
 :model default            清除当前项目的模型覆盖，回到 Codex 默认模型
-:review [说明]            执行 codex exec review --uncommitted
 :new [prompt]             转成 /new 后发送给 Codex 原生命令，不保证切换 Wecode 绑定的 session
 :compact [说明]           转成 /compact 后发送给 Codex 原生命令
 :plan [任务]              转成 /plan 后发送给 Codex 原生命令
@@ -194,14 +196,16 @@ node scripts/openclaw-agent-smoke.mjs
 
 处理方式：
 
-- `:help`、`:diff`、`:pwd`、`:ls`、`:cat`、`:cd`、`:shell`、`:status`、`:model`、`:models`、`:resume`、`:fresh`、`:approve`、`:yes`、`:deny`、`:no` 由 `wecode` 本地直接回答或执行，不会作为 prompt 进入 Codex。普通本地命令结果会以 markdown code block 返回；`:resume` 是 session 控制命令，会返回 `thread_id` 让 OpenClaw 绑定 session。
+- `:help`、`:diff`、`:pwd`、`:ls`、`:cat`、`:cd`、`:shell`、`:status`、`:yolo`、`:stop`、`:model`、`:models`、`:resume`、`:fresh`、`:approve`、`:yes`、`:deny`、`:no` 由 `wecode` 本地直接回答或执行，不会作为 prompt 进入 Codex。普通本地命令结果会以 markdown code block 返回；`:status` 会以 markdown 展示当前 yolo 状态；`:resume` 是 session 控制命令，会返回 `thread_id` 让 OpenClaw 绑定 session。
 - `:cd <目录>` 会把目标目录写入 `openclaw.stateDir/codex-cwd.txt`，并让下一次 Codex 请求新开 thread，避免续接旧项目 session。
 - `:fresh` 会让下一次 Codex 请求不带 `--resume`；`:fresh <prompt>` 会立刻以新 Codex thread 执行 `<prompt>`。
 - `:shell <命令>` 会在当前 Codex 项目目录执行命令；Unix/macOS 使用 `sh -lc`，Windows 使用 `cmd /C`，返回命令真实 stdout/stderr 内容。
+- `:yolo` 不带参数时切换当前项目 yolo 状态，`:yolo true` 开启，`:yolo false` 关闭。状态按项目目录保存到 `openclaw.stateDir/codex-yolo/`，默认关闭。remote/app-server 模式会传递 Codex 原生 `approvalPolicy: "never"` 和 danger sandbox；exec fallback 仍始终使用 `codex exec --yolo`。
+- `:stop` 会停止当前 session 或当前项目正在运行的 Codex 后端任务，并清理待审批文件，避免后续输入继续卡在审批等待。
 - `:model` 和 `:models` 由 `wecode` 本地处理；模型状态按项目目录保存到 `openclaw.stateDir/codex-models/`。
-- `:review` 调用 Codex 的非交互评审子命令。
 - `:init`、`:new`、`:compact`、`:plan`、`:goal`、`:agent`、`:side` 默认会先把开头的 `:` 转成 `/`，再作为原始输入发送给 Codex；如果用户在配置中添加同前缀的自定义命令，会按自定义模板覆盖。注意 `:new` 在 `codex exec resume <old-session> -- "<prompt>"` 场景里只是 prompt，不保证改变 OpenClaw/Wecode 当前绑定的 session；需要硬新开 thread 时使用 `:fresh`。
 - `:report` 会转换成类似 `/side 任务状态` 语义的 Codex prompt，用来在长任务中旁路查询进展。
+- 未定义的 `:` 命令不会进入 Codex，会直接返回“未定义的命令！可以使用:help查看命令”。存在待审批项时，除 `yes` / `no` / `:yes` / `:no` / `:approve` / `:deny` / `:stop` 外，其他输入都会直接提示“等待权限审批：请输入 `yes` or `no`”。
 
 ## 配置
 
@@ -251,11 +255,11 @@ $XDG_CONFIG_HOME/wecode/config.json
 
 `openclaw.timeoutSeconds` 会写入 OpenClaw 的 `agents.defaults.timeoutSeconds`，控制一次 agent turn 的整体超时。`openclaw.cliNoOutputTimeoutMs` 会写入 `agents.defaults.cliBackends.wecode-codex.reliability.watchdog.fresh/resume.noOutputTimeoutMs`，控制 Codex CLI 子进程多长时间没有 stdout/stderr 输出后才被 OpenClaw watchdog 终止。默认值分别是 1200 秒和 900000 毫秒。
 
-`openclaw.preventSleep` 控制 wecode 是否改写 OpenClaw Gateway 的 macOS LaunchAgent。默认值 `"ac"` 会把 Gateway 启动命令包装成 `/usr/bin/caffeinate -s ...`，只在外接电源时阻止系统睡眠，不阻止显示器息屏；设置为 `"off"` 会移除 wecode 添加的 `caffeinate` 包装。修改这个配置后运行 `wecode configure-codex` 或重新 `bootstrap`，LaunchAgent 才会被更新。
+`openclaw.preventSleep` 控制 wecode 是否改写 OpenClaw Gateway 的 macOS LaunchAgent。默认值 `"ac"` 会把 Gateway 启动命令包装成 `/usr/bin/caffeinate -s ...`，只在外接电源时阻止系统睡眠，不阻止显示器息屏；设置为 `"always"` 会包装成 `/usr/bin/caffeinate -i ...`，在电池和外接电源下都尽量阻止 idle sleep，适合需要长期在线处理消息的机器；设置为 `"off"` 会移除 wecode 添加的 `caffeinate` 包装。修改这个配置后运行 `wecode configure-codex` 或重新 `bootstrap`，LaunchAgent 才会被更新。
 
 `codex.transport` 控制 wecode 如何调用 Codex。默认 `"remote"` 会先通过 `codex remote-control start --json` + `codex app-server proxy` 使用 managed remote；如果本机 Codex 不是 standalone 安装，或者 managed proxy 不可用，会改用 `codex.remote.fallbackProxyCommand`，默认是 `codex app-server --listen stdio://`。只有两条 remote 路径都失败时，`"remote"` 才自动回退 `codex exec`；`"remote-strict"` 不会回退 exec，但仍会尝试这个 stdio app-server 兼容路径；`"exec"` 会强制使用 `codex exec --yolo --json` 路径。
 
-`wecode codex-backend --jsonl` 会输出 OpenClaw 可识别的 JSONL。remote 模式会把 app-server turn 结果转换成兼容 JSONL，并在 app-server 返回 assistant/message JSON 外壳时提取内部文本，避免微信侧看到二次包装的响应 JSON；当 Codex remote 在 turn 中途完成一段非 final agent message 时，`wecode` 会立即把这段阶段性回复写入 JSONL 并 flush，让微信侧先收到进展，而不是一直等最终答案。exec fallback 模式会实时转发 `codex exec --yolo --json` 的 stdout/stderr，避免因为 Wecode 缓存输出导致 OpenClaw watchdog 超时。
+`wecode codex-backend --jsonl` 会输出 OpenClaw 可识别的 JSONL。remote 模式会把 app-server turn 结果转换成兼容 JSONL，并在 app-server 返回 assistant/message JSON 外壳时提取内部文本，避免微信侧看到二次包装的响应 JSON；当 Codex remote 在 turn 中途完成一段非 final agent message 时，`wecode` 会立即把这段阶段性回复写入 JSONL 并 flush，让微信侧先收到进展，而不是一直等最终答案。项目 yolo 开启时，remote 模式会在 `thread/start`、`thread/resume` 和 `turn/start` 中使用 Codex app-server 原生审批/沙箱覆盖；exec fallback 模式会实时转发 `codex exec --yolo --json` 的 stdout/stderr，避免因为 Wecode 缓存输出导致 OpenClaw watchdog 超时。
 
 要切换 Codex 处理的项目，只设置 `codex.cwd`，或在聊天里发送 `:cd <项目目录>`：
 
@@ -323,6 +327,8 @@ Deny: no, :no, or :no appr-...
 
 ## 调试日志
 
+`wecode runtime-status` 会只读检查当前运行态：配置里的 `preventSleep`、OpenClaw Gateway LaunchAgent 是否存在、LaunchAgent 是否已经被 `caffeinate` 包装、Gateway 进程是否在运行，以及 `/tmp/openclaw` 下最近的 OpenClaw 日志。它不会修改本机状态。
+
 `wecode codex-backend` 会把用户输入的 prompt 流转写入：
 
 ```text
@@ -377,7 +383,7 @@ resumeVerified: true
 
 - 当前后端优先使用 Codex app-server remote API，不启动 Codex TUI；standalone Codex 可走 managed remote，非 standalone Codex 会走 `codex app-server --listen stdio://` 兼容路径。`codex --remote <ADDR>` 仍是 TUI 连接 remote app-server 的入口。
 - remote API 仍是 Codex 实验接口；默认 `"remote"` 会自动回退 `codex exec`，需要强校验时使用 `"remote-strict"`。
-- remote 模式会把 Codex app-server 原生审批请求转成微信/飞书可见的 `appr-...` 审批提示。只有一个待审批项时，回复 `yes` / `:yes` 批准，回复 `no` / `:no` 拒绝；多个待审批项时使用 `:yes appr-...` / `:no appr-...` 指定 id。这个能力只覆盖 remote/app-server transport；`codex exec` fallback 使用 `--yolo`，不做交互式审批桥接。
+- remote 模式会把 Codex app-server 原生审批请求转成微信/飞书可见的 `appr-...` 审批提示。只有一个待审批项时，回复 `yes` / `:yes` 批准，回复 `no` / `:no` 拒绝；多个待审批项时使用 `:yes appr-...` / `:no appr-...` 指定 id。这个能力只覆盖 remote/app-server transport；`codex exec` fallback 使用 `--yolo`，不做交互式审批桥接。项目 yolo 开启时，remote 模式会优先使用 Codex app-server 原生 `approvalPolicy: "never"` 和 danger sandbox，若旧版 app-server 仍发出审批请求，Wecode 会按 yolo 语义自动批准。
 - 如果你已经运行过旧版 `wecode configure-codex`，升级后重新运行一次 `wecode configure-codex`，让 OpenClaw backend 配置更新为 `serialize: false` 和 `jsonlDialect: "claude-stream-json"`。Wecode 会用自己的运行锁串行化 Codex turn，并允许审批回复在等待审批时进入；`jsonlDialect` 用来让审批提示在原 Codex turn 等待期间实时发送到微信/飞书。
 - 如果你使用旧版 bootstrap 出来的微信或飞书配置，升级后重新运行 `wecode bootstrap --weixin` 或 `wecode bootstrap --feishu`。新版会 patch OpenClaw 渠道运行时，让审批回复走控制旁路；微信还会固定安装 `@tencent-weixin/openclaw-weixin@2.4.4`、启用 block streaming，并把 Codex 审批 partial 转成普通微信文本消息，避免权限提示被缓冲到 Codex turn 结束后才发送。飞书新版也会写入 `streaming: true`、`renderMode: "card"` 和 `blockStreaming: true`。
 

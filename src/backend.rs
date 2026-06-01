@@ -13,13 +13,6 @@ pub struct BackendRunRequest<'a> {
     pub resume_session_id: Option<&'a str>,
 }
 
-pub struct BackendReviewRequest<'a> {
-    pub config: &'a WecodeConfig,
-    pub instructions: Option<&'a str>,
-    pub jsonl: bool,
-    pub selected_model: Option<&'a str>,
-}
-
 pub trait AssistantBackend {
     fn id(&self) -> &'static str;
 

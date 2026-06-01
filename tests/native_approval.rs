@@ -111,7 +111,13 @@ fn native_record_is_written_under_native_approval_dir() {
     assert!(native_approvals_dir(&config)
         .join(format!("{}.json", record.approval_id))
         .exists());
-    assert!(record.prompt.contains(":yes "));
-    assert!(record.prompt.contains(":no "));
+    assert!(record.prompt.contains("# 权限审批"));
+    assert!(record.prompt.contains("**执行命令**"));
+    assert!(record.prompt.contains("```bash\ncargo test\n```"));
+    assert!(record.prompt.contains("**目录**"));
+    assert!(record.prompt.contains("`/tmp/project`"));
+    assert!(record.prompt.contains("回复 `yes` 批准，回复 `no` 拒绝"));
+    assert!(!record.prompt.contains("Approve:"));
+    assert!(!record.prompt.contains("Deny:"));
     assert!(record.prompt.contains("cargo test"));
 }

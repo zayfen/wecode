@@ -879,12 +879,118 @@ export async function processOneMessage(full, deps) {
         patched.contains("onPartialReply:")
             && patched.contains("onBlockReplyQueued:")
             && patched.contains("sendWecodeApprovalPromptFromReplyPayload")
-            && patched.contains("Codex requests permission")
-            && patched.contains("Approval: appr-")
+            && patched.contains(r#"text.match(/审批 ID\**:\s*`?(appr-[\w-]+)`?/)"#)
+            && patched.contains(r#"text.match(/Approval:\s*(appr-[\w-]+)/)"#)
             && patched.contains("sendMessageWeixin"),
         "weixin approval partials must be sent as ordinary Weixin text messages:\n{patched}"
     );
+    assert!(
+        !patched.contains(r#"text.includes("Codex requests permission")"#),
+        "approval prompt detection must not depend on the old English prompt text:\n{patched}"
+    );
     assert!(!patched.contains("disableBlockStreaming: true"));
+}
+
+#[test]
+fn patch_openclaw_runtime_upgrades_weixin_approval_prompt_detection() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_messaging = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("messaging");
+    fs::create_dir_all(&weixin_messaging).expect("weixin messaging dir");
+    let process_file = weixin_messaging.join("process-message.js");
+    fs::write(
+        &process_file,
+        r#"import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { sendMessageWeixin } from "./send.js";
+/** Extract text body from item_list (for slash command detection). */
+function extractTextBody(itemList) {
+    return itemList?.[0]?.text_item?.text ?? "";
+}
+export async function processOneMessage(full, deps) {
+    const textBody = extractTextBody(full.item_list);
+    const ctx = weixinMessageToMsgContext(full, deps.accountId, {});
+    const finalized = deps.channelRuntime.reply.finalizeInboundContext(ctx);
+    const contextToken = getContextTokenFromMsgContext(ctx);
+    if (contextToken) {
+        setContextToken(deps.accountId, full.from_user_id ?? "", contextToken);
+    }
+    const runId = randomUUID();
+    await deps.channelRuntime.reply.dispatchReplyFromConfig({
+                ctx: finalized,
+                cfg: deps.config,
+                dispatcher,
+                replyOptions: {
+                    ...replyOptions,
+                    ...(replyProgressSender?.replyOptions ?? {}),
+                    ...(() => {
+                        const wecodeBaseReplyOptions = {
+                            ...replyOptions,
+                            ...(replyProgressSender?.replyOptions ?? {}),
+                        };
+                        const wecodeSentApprovalIds = new Set();
+                        const sendWecodeApprovalPromptFromReplyPayload = async (payload) => {
+                            const text = String(payload?.text ?? "");
+                            if (!text.includes("Codex requests permission") || !text.includes("Approval: appr-")) return;
+                            const match = text.match(/Approval:\s*(appr-[\w-]+)/);
+                            const approvalId = match?.[1];
+                            if (!approvalId || wecodeSentApprovalIds.has(approvalId)) return;
+                            wecodeSentApprovalIds.add(approvalId);
+                            await sendMessageWeixin({
+                                to: ctx.To,
+                                text,
+                                opts: { baseUrl: deps.baseUrl, token: deps.token, contextToken, runId },
+                            });
+                        };
+                        return {
+                            onPartialReply: async (payload) => {
+                                await sendWecodeApprovalPromptFromReplyPayload(payload);
+                            },
+                            onBlockReplyQueued: async (payload, context) => {
+                                await sendWecodeApprovalPromptFromReplyPayload(payload);
+                            },
+                        };
+                    })(),
+                    disableBlockStreaming: false,
+                },
+            });
+}
+"#,
+    )
+    .expect("process message file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+
+    let patched = fs::read_to_string(&process_file).expect("patched process message");
+    assert!(
+        patched.contains(r#"text.match(/审批 ID\**:\s*`?(appr-[\w-]+)`?/)"#),
+        "existing weixin approval prompt sender should be upgraded for the Markdown approval prompt:\n{patched}"
+    );
+    assert!(
+        !patched.contains(r#"text.includes("Codex requests permission")"#),
+        "upgraded prompt detection must not keep the old English-only gate:\n{patched}"
+    );
 }
 
 #[test]
@@ -961,14 +1067,27 @@ export async function processOneMessage(full, deps) {
     assert!(
         patched.contains("handleWecodeNativeApprovalControl")
             && patched.contains("parseWecodeApprovalControlText")
+            && patched.contains("parseWecodeStopControlText")
+            && patched.contains("stopWecodeCodexRuns")
             && patched.contains(r#""approvals", "native""#),
         "weixin approval control helper should be installed:\n{patched}"
+    );
+    assert!(
+        patched.contains(r#""locks""#)
+            && patched.contains(r#""codex-run-""#)
+            && patched.contains("已停止当前任务。")
+            && patched.contains("没有正在运行的任务。"),
+        "weixin :stop should be handled before the agent queue and reply immediately:\n{patched}"
     );
     assert!(
         patched.contains("`${approvalId}.decision.json`")
             && patched.contains(r#"decision: approval.decision"#)
             && patched.contains(r#"await sendMessageWeixin({"#),
-        "weixin approval replies should write Codex native approval decisions and acknowledge in chat:\n{patched}"
+        "weixin approval replies should write Codex native approval decisions and keep error replies available:\n{patched}"
+    );
+    assert!(
+        !patched.contains("Codex will continue in the original turn."),
+        "weixin approval replies should not send a second success acknowledgement after writing the decision:\n{patched}"
     );
     let approval_index = patched
         .find("if (await handleWecodeNativeApprovalControl({")
@@ -987,6 +1106,109 @@ export async function processOneMessage(full, deps) {
             .count(),
         1,
         "approval control branch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_upgrades_existing_weixin_native_control_for_stop() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_messaging = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("messaging");
+    fs::create_dir_all(&weixin_messaging).expect("weixin messaging dir");
+    let process_file = weixin_messaging.join("process-message.js");
+    fs::write(
+        &process_file,
+        r#"import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { sendMessageWeixin } from "./send.js";
+function parseWecodeApprovalControlText(text) {
+    const match = String(text ?? "").trim().match(/^(?::?(yes|approve|no|deny))(?:\s+([\w-]+))?$/i);
+    if (!match) return null;
+    const action = match[1].toLowerCase();
+    return {
+        decision: action === "yes" || action === "approve" ? "approve" : "deny",
+        approvalId: match[2],
+    };
+}
+async function sendWecodeApprovalControlMessage(params, text) {
+    await sendMessageWeixin({ to: params.to, text, opts: { runId: params.runId } });
+}
+async function handleWecodeNativeApprovalControl(params) {
+    const approval = parseWecodeApprovalControlText(params.text);
+    if (!approval) return false;
+    const approvalId = "appr-old";
+    const action = approval.decision === "approve" ? "Approved" : "Denied";
+    await sendWecodeApprovalControlMessage(params, `${action} Codex approval ${approvalId}. Codex will continue in the original turn.`);
+    return true;
+}
+function extractTextBody(itemList) {
+    return itemList?.[0]?.text_item?.text ?? "";
+}
+export async function processOneMessage(full, deps) {
+    const textBody = extractTextBody(full.item_list);
+    const ctx = weixinMessageToMsgContext(full, deps.accountId, {});
+    const finalized = deps.channelRuntime.reply.finalizeInboundContext(ctx);
+    const contextToken = getContextTokenFromMsgContext(ctx);
+    if (contextToken) {
+        setContextToken(deps.accountId, full.from_user_id ?? "", contextToken);
+    }
+    const runId = randomUUID();
+    await deps.channelRuntime.reply.dispatchReplyFromConfig({
+                ctx: finalized,
+                cfg: deps.config,
+                dispatcher,
+                replyOptions: {
+                    ...replyOptions,
+                    ...(replyProgressSender?.replyOptions ?? {}),
+                    disableBlockStreaming: true,
+                },
+            });
+}
+"#,
+    )
+    .expect("process message file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&process_file).expect("patched process message");
+    assert!(
+        patched.contains("parseWecodeStopControlText")
+            && patched.contains("stopWecodeCodexRuns")
+            && patched.contains("已停止当前任务。")
+            && patched.contains("没有正在运行的任务。"),
+        "existing weixin native control helper should be upgraded for :stop:\n{patched}"
+    );
+    assert!(
+        !patched.contains("Codex will continue in the original turn."),
+        "existing weixin native control helper should stop sending duplicate approval acknowledgements:\n{patched}"
+    );
+    assert_eq!(
+        patched.matches("parseWecodeStopControlText").count(),
+        2,
+        "weixin :stop helper upgrade should be idempotent:\n{patched}"
     );
 }
 
@@ -1184,8 +1406,69 @@ fn patch_openclaw_runtime_routes_weixin_approval_replies_on_control_lane() {
     let patched = fs::read_to_string(&lane_file).expect("patched lane key");
     assert!(patched.contains("isWecodeApprovalControlText"));
     assert!(
+        patched.contains(r#"normalized === ":stop""#),
+        "weixin :stop should bypass the busy main lane:\n{patched}"
+    );
+    assert!(
         patched.contains("isWeixinAbortMessage(ctx.msg) || isWecodeApprovalControlText(textBody)"),
         "weixin approval replies should bypass the busy main lane:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_upgrades_existing_control_helper_for_stop() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_messaging = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("messaging");
+    fs::create_dir_all(&weixin_messaging).expect("weixin messaging dir");
+    let lane_file = weixin_messaging.join("lane-key.js");
+    fs::write(
+        &lane_file,
+        r#"function isWecodeApprovalControlText(text) {
+	const normalized = String(text ?? "").trim().toLowerCase();
+	return /^(?::?(?:yes|no|approve|deny))(?:\s+[\w-]+)?$/.test(normalized);
+}
+
+export function getWeixinLaneKey(ctx) {
+    const userId = ctx.msg.from_user_id?.trim() || "unknown";
+    const baseKey = `wx:${ctx.accountId}:${userId}`;
+    const textBody = extractTextBodyForLane(ctx.msg).trim();
+    if (isWeixinAbortMessage(ctx.msg) || isWecodeApprovalControlText(textBody)) {
+        return `${baseKey}:control`;
+    }
+    return baseKey;
+}
+"#,
+    )
+    .expect("lane key file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+
+    let patched = fs::read_to_string(&lane_file).expect("patched lane key");
+    assert!(
+        patched.contains(r#"normalized === ":stop""#),
+        "existing control helper should be upgraded for :stop:\n{patched}"
     );
 }
 
@@ -1233,6 +1516,10 @@ fn patch_openclaw_runtime_routes_feishu_approval_replies_on_control_lane() {
 
     let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
     assert!(patched.contains("isWecodeApprovalControlText"));
+    assert!(
+        patched.contains(r#"normalized === ":stop""#),
+        "feishu :stop should bypass the busy per-chat FIFO lane:\n{patched}"
+    );
     assert!(
         patched.contains("if (isAbortRequestText(text) || isWecodeApprovalControlText(text)) return `${baseKey}:control`;"),
         "feishu approval replies should bypass the busy per-chat FIFO lane:\n{patched}"
@@ -1298,14 +1585,27 @@ async function handleFeishuMessage(params) {
     assert!(
         patched.contains("handleWecodeNativeApprovalControl")
             && patched.contains("parseWecodeApprovalControlText")
+            && patched.contains("parseWecodeStopControlText")
+            && patched.contains("stopWecodeCodexRuns")
             && patched.contains(r#""approvals", "native""#),
         "feishu approval control helper should be installed:\n{patched}"
+    );
+    assert!(
+        patched.contains(r#""locks""#)
+            && patched.contains(r#""codex-run-""#)
+            && patched.contains("已停止当前任务。")
+            && patched.contains("没有正在运行的任务。"),
+        "feishu :stop should be handled before the agent queue and reply immediately:\n{patched}"
     );
     assert!(
         patched.contains("`${approvalId}.decision.json`")
             && patched.contains(r#"decision: approval.decision"#)
             && patched.contains("sendMessageFeishu({"),
-        "feishu approval replies should write Codex native approval decisions and acknowledge in chat:\n{patched}"
+        "feishu approval replies should write Codex native approval decisions and keep error replies available:\n{patched}"
+    );
+    assert!(
+        !patched.contains("Codex will continue in the original turn."),
+        "feishu approval replies should not send a second success acknowledgement after writing the decision:\n{patched}"
     );
     let approval_index = patched
         .find("if (await handleWecodeNativeApprovalControl({")
@@ -1321,6 +1621,97 @@ async function handleFeishuMessage(params) {
             .count(),
         1,
         "approval control branch should be idempotent:\n{patched}"
+    );
+}
+
+#[test]
+fn patch_openclaw_runtime_upgrades_existing_feishu_native_control_for_stop() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let feishu_dist = state_dir
+        .join("npm")
+        .join("projects")
+        .join("feishu-project")
+        .join("node_modules")
+        .join("@openclaw")
+        .join("feishu")
+        .join("dist");
+    fs::create_dir_all(&feishu_dist).expect("feishu dist dir");
+    let monitor_file = feishu_dist.join("monitor.account-test.js");
+    fs::write(
+        &monitor_file,
+        r#"function getFeishuSequentialKey(params) {
+	const { accountId, event, botOpenId, botName } = params;
+	const baseKey = `feishu:${accountId}:${event.message.chat_id?.trim() || "unknown"}`;
+	const text = parseFeishuMessageEvent(event, botOpenId, botName).content.trim();
+	if (isAbortRequestText(text)) return `${baseKey}:control`;
+	if (isBtwRequestText(text)) return `${baseKey}:btw`;
+	return baseKey;
+}
+function parseWecodeApprovalControlText(text) {
+	const match = String(text ?? "").trim().match(/^(?::?(yes|approve|no|deny))(?:\s+([\w-]+))?$/i);
+	if (!match) return null;
+	const action = match[1].toLowerCase();
+	return {
+		decision: action === "yes" || action === "approve" ? "approve" : "deny",
+		approvalId: match[2],
+	};
+}
+async function sendWecodeApprovalControlMessage(params, text) {
+	await sendMessageFeishu({ cfg: params.cfg, to: `chat:${params.chatId}`, text, accountId: params.accountId });
+}
+async function handleWecodeNativeApprovalControl(params) {
+	const log = typeof params.log === "function" ? params.log : console.log;
+	const error = typeof params.error === "function" ? params.error : console.error;
+	const approval = parseWecodeApprovalControlText(params.text);
+	if (!approval) return false;
+	const approvalId = "appr-old";
+	const action = approval.decision === "approve" ? "Approved" : "Denied";
+	await sendWecodeApprovalControlMessage({ ...params, error }, `${action} Codex approval ${approvalId}. Codex will continue in the original turn.`);
+	return true;
+}
+async function handleFeishuMessage(params) {
+	const { cfg, accountId } = params;
+	const account = { accountId };
+	const ctx = { content: ":stop", chatId: "oc_test" };
+	const feishuFrom = `feishu:${ctx.senderOpenId}`;
+	await dispatchToAgent({ feishuFrom });
+}
+"#,
+    )
+    .expect("feishu monitor file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
+    assert!(
+        patched.contains("parseWecodeStopControlText")
+            && patched.contains("stopWecodeCodexRuns")
+            && patched.contains("已停止当前任务。")
+            && patched.contains("没有正在运行的任务。"),
+        "existing feishu native control helper should be upgraded for :stop:\n{patched}"
+    );
+    assert!(
+        !patched.contains("Codex will continue in the original turn."),
+        "existing feishu native control helper should stop sending duplicate approval acknowledgements:\n{patched}"
+    );
+    assert_eq!(
+        patched.matches("parseWecodeStopControlText").count(),
+        2,
+        "feishu :stop helper upgrade should be idempotent:\n{patched}"
     );
 }
 
@@ -1409,8 +1800,8 @@ async function handleFeishuMessage(params) {
     let patched = fs::read_to_string(&monitor_file).expect("patched feishu monitor");
     assert!(
         patched.contains("sendWecodeApprovalPromptFromReplyPayload")
-            && patched.contains("Codex requests permission")
-            && patched.contains("Approval: appr-")
+            && patched.contains(r#"text.match(/审批 ID\**:\s*`?(appr-[\w-]+)`?/)"#)
+            && patched.contains(r#"text.match(/Approval:\s*(appr-[\w-]+)/)"#)
             && patched.contains("sendMessageFeishu({"),
         "feishu approval prompts should also be sent as ordinary text messages:\n{patched}"
     );
@@ -1525,6 +1916,41 @@ fn prevent_sleep_wraps_gateway_launch_agent_arguments_on_ac_power() {
         prevent_sleep_program_arguments(&wrapped, PreventSleepMode::Off),
         original,
         "turning the mode off should remove the wecode caffeinate wrapper"
+    );
+}
+
+#[test]
+fn prevent_sleep_wraps_gateway_launch_agent_arguments_always() {
+    let original = vec![
+        "/Users/riven/.wecode/openclaw-state/service-env/ai.openclaw.wecode-env-wrapper.sh"
+            .to_string(),
+        "/Users/riven/.wecode/openclaw-state/service-env/ai.openclaw.wecode.env".to_string(),
+        "/opt/homebrew/opt/node@22/bin/node".to_string(),
+        "/Users/riven/.wecode/openclaw-runtime/node_modules/openclaw/dist/index.js".to_string(),
+        "gateway".to_string(),
+        "--port".to_string(),
+        "19789".to_string(),
+    ];
+
+    let wrapped = prevent_sleep_program_arguments(&original, PreventSleepMode::Always);
+
+    assert_eq!(wrapped[0], "/usr/bin/caffeinate");
+    assert_eq!(wrapped[1], "-i");
+    assert_eq!(&wrapped[2..], original.as_slice());
+    assert_eq!(
+        prevent_sleep_program_arguments(&wrapped, PreventSleepMode::Always),
+        wrapped,
+        "always sleep prevention wrapper should be idempotent"
+    );
+    assert_eq!(
+        prevent_sleep_program_arguments(&wrapped, PreventSleepMode::Ac)[1],
+        "-s",
+        "switching from always to ac should replace the caffeinate mode"
+    );
+    assert_eq!(
+        prevent_sleep_program_arguments(&wrapped, PreventSleepMode::Off),
+        original,
+        "turning the mode off should remove the always caffeinate wrapper"
     );
 }
 

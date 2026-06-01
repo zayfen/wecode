@@ -3,12 +3,21 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::{config::WecodeConfig, paths::expand_tilde};
 
 pub struct CodexRunLock {
     path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopCodexRunResult {
+    pub stopped: bool,
+    pub pid: Option<u32>,
+    pub lock_path: PathBuf,
 }
 
 impl Drop for CodexRunLock {
@@ -23,11 +32,11 @@ pub fn try_acquire_codex_run_lock(
     config: &WecodeConfig,
     key: &str,
 ) -> Result<CodexRunLock, String> {
-    let lock_dir = PathBuf::from(expand_tilde(&config.openclaw.state_dir)).join("locks");
+    let lock_dir = codex_run_lock_dir(config);
     if fs::create_dir_all(&lock_dir).is_err() {
         return Ok(CodexRunLock { path: None });
     }
-    let path = lock_dir.join(format!("codex-run-{}.lock", stable_key_hash(key)));
+    let path = codex_run_lock_path(config, key);
     let content = format!("pid={}\nkey={key}\n", std::process::id());
     match create_lock_file(&path) {
         Ok(mut file) => {
@@ -53,6 +62,42 @@ pub fn try_acquire_codex_run_lock(
         }
         Err(_) => Ok(CodexRunLock { path: None }),
     }
+}
+
+pub fn stop_codex_run(config: &WecodeConfig, key: &str) -> Result<StopCodexRunResult, String> {
+    let path = codex_run_lock_path(config, key);
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Ok(StopCodexRunResult {
+            stopped: false,
+            pid: None,
+            lock_path: path,
+        });
+    };
+    let pid = lock_pid(&content);
+    let stopped = if let Some(pid) = pid {
+        if process_is_alive(pid) {
+            terminate_process_tree(pid);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let _ = fs::remove_file(&path);
+    Ok(StopCodexRunResult {
+        stopped,
+        pid,
+        lock_path: path,
+    })
+}
+
+fn codex_run_lock_dir(config: &WecodeConfig) -> PathBuf {
+    PathBuf::from(expand_tilde(&config.openclaw.state_dir)).join("locks")
+}
+
+fn codex_run_lock_path(config: &WecodeConfig, key: &str) -> PathBuf {
+    codex_run_lock_dir(config).join(format!("codex-run-{}.lock", stable_key_hash(key)))
 }
 
 fn create_lock_file(path: &Path) -> io::Result<fs::File> {
@@ -98,6 +143,63 @@ fn process_is_alive(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(true)
+}
+
+fn terminate_process_tree(pid: u32) {
+    let descendants = descendant_pids(pid);
+    for child in descendants.iter().rev() {
+        signal_process(*child, "TERM");
+    }
+    signal_process(pid, "TERM");
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while process_is_alive(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if process_is_alive(pid) {
+        for child in descendants.iter().rev() {
+            signal_process(*child, "KILL");
+        }
+        signal_process(pid, "KILL");
+    }
+}
+
+fn descendant_pids(pid: u32) -> Vec<u32> {
+    let mut result = Vec::new();
+    for child in child_pids(pid) {
+        result.extend(descendant_pids(child));
+        result.push(child);
+    }
+    result
+}
+
+fn child_pids(pid: u32) -> Vec<u32> {
+    let output = Command::new("/usr/bin/pgrep")
+        .arg("-P")
+        .arg(pid.to_string())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|child| *child > 0 && *child != std::process::id())
+        .collect()
+}
+
+fn signal_process(pid: u32, signal: &str) {
+    if pid == std::process::id() {
+        return;
+    }
+    let _ = Command::new("/bin/kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn stable_key_hash(value: &str) -> String {

@@ -53,6 +53,7 @@ pub struct OpenclawConfig {
 pub enum PreventSleepMode {
     Off,
     Ac,
+    Always,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
