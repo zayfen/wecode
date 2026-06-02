@@ -2820,9 +2820,7 @@ fn supported_node_bin_dir_candidates() -> Vec<PathBuf> {
     ];
 
     #[cfg(windows)]
-    let mut candidates = vec![
-        PathBuf::from(r"C:\Program Files\nodejs"),
-    ];
+    let mut candidates = vec![PathBuf::from(r"C:\Program Files\nodejs")];
 
     if let Some(home) = wecode::platform::home_dir() {
         #[cfg(not(windows))]
@@ -2830,9 +2828,7 @@ fn supported_node_bin_dir_candidates() -> Vec<PathBuf> {
             candidates.extend(versioned_node_bin_dirs(
                 home.join(".local/share/mise/installs/node"),
             ));
-            candidates.extend(versioned_node_bin_dirs(
-                home.join(".nvm/versions/node"),
-            ));
+            candidates.extend(versioned_node_bin_dirs(home.join(".nvm/versions/node")));
         }
         candidates.push(home.join(".volta").join("bin"));
     }

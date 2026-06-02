@@ -7,6 +7,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod native_approval;
 pub mod openclaw;
+mod openclaw_patch_sources;
 pub mod paths;
 pub mod platform;
 pub mod run_lock;

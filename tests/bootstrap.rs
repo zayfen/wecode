@@ -879,16 +879,49 @@ export async function processOneMessage(full, deps) {
         patched.contains("onPartialReply:")
             && patched.contains("onBlockReplyQueued:")
             && patched.contains("sendWecodeApprovalPromptFromReplyPayload")
+            && patched.contains("startWecodeWeixinNativeApprovalWatcher")
+            && patched.contains("globalThis.__wecodeWeixinSentApprovalIds")
             && patched.contains(r#"text.match(/审批 ID\**:\s*`?(appr-[\w-]+)`?/)"#)
             && patched.contains(r#"text.match(/Approval:\s*(appr-[\w-]+)/)"#)
             && patched.contains("sendMessageWeixin"),
         "weixin approval partials must be sent as ordinary Weixin text messages:\n{patched}"
     );
     assert!(
+        patched.contains(r#""approvals", "native""#)
+            && patched.contains("wecode approval watcher detected")
+            && patched.contains("wecode approval watcher sent")
+            && patched.contains("clearInterval(wecodeApprovalWatcher)"),
+        "weixin native approval watcher must send every pending approval prompt independently of OpenClaw stream callbacks:\n{patched}"
+    );
+    assert!(
         !patched.contains(r#"text.includes("Codex requests permission")"#),
         "approval prompt detection must not depend on the old English prompt text:\n{patched}"
     );
     assert!(!patched.contains("disableBlockStreaming: true"));
+}
+
+#[test]
+fn openclaw_runtime_patch_sources_are_kept_in_js_files() {
+    let rust_source = fs::read_to_string("src/openclaw.rs").expect("openclaw source");
+    let js_source = fs::read_to_string("src/openclaw_patches/native_approval.js")
+        .expect("native approval patch source");
+
+    assert!(
+        !rust_source.contains("function readWecodeNativeApproval(approvalId) {")
+            && !rust_source.contains("function readWecodeNativeApproval(approvalId, log) {")
+            && !rust_source.contains("function stopWecodeCodexRuns(log = () => {}) {")
+            && !rust_source.contains("wecode approval prompt detected approvalId")
+            && !rust_source.contains("wecode feishu approval prompt detected approvalId")
+            && !rust_source.contains("weixin processOneMessage error lane"),
+        "large JS runtime patch helpers should live in dedicated JS files, not src/openclaw.rs"
+    );
+    assert!(
+        js_source.contains("@wecode-patch weixin-native-approval-control")
+            && js_source.contains("@wecode-patch feishu-native-approval-control")
+            && js_source.contains("@wecode-patch stop-control-helpers")
+            && js_source.contains("function stopWecodeCodexRuns"),
+        "native approval JS patch source should contain the extracted helper blocks"
+    );
 }
 
 #[test]
@@ -1107,6 +1140,146 @@ export async function processOneMessage(full, deps) {
         1,
         "approval control branch should be idempotent:\n{patched}"
     );
+}
+
+#[test]
+fn patch_openclaw_runtime_handles_weixin_244_dispatcher_finally_shape() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime_dist = temp
+        .path()
+        .join("runtime")
+        .join("node_modules")
+        .join("openclaw")
+        .join("dist");
+    fs::create_dir_all(&runtime_dist).expect("runtime dist");
+    fs::write(
+        runtime_dist.join("commands-text-routing-test.js"),
+        openclaw_text_routing_source(),
+    )
+    .expect("routing file");
+    let state_dir = temp.path().join("state");
+    let weixin_messaging = state_dir
+        .join("npm")
+        .join("projects")
+        .join("weixin-project")
+        .join("node_modules")
+        .join("@tencent-weixin")
+        .join("openclaw-weixin")
+        .join("dist")
+        .join("src")
+        .join("messaging");
+    fs::create_dir_all(&weixin_messaging).expect("weixin messaging dir");
+    let process_file = weixin_messaging.join("process-message.js");
+    fs::write(
+        &process_file,
+        r#"import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { sendMessageWeixin } from "./send.js";
+/** Extract text body from item_list (for slash command detection). */
+function extractTextBody(itemList) {
+    return itemList?.[0]?.text_item?.text ?? "";
+}
+export async function processOneMessage(full, deps) {
+    const textBody = extractTextBody(full.item_list);
+    const ctx = weixinMessageToMsgContext(full, deps.accountId, {});
+    const finalized = deps.channelRuntime.reply.finalizeInboundContext(ctx);
+    const contextToken = getContextTokenFromMsgContext(ctx);
+    if (contextToken) {
+        setContextToken(deps.accountId, full.from_user_id ?? "", contextToken);
+    }
+    const runId = randomUUID();
+    const replyProgressSender = resolveReplyProgressMessagesEnabled(deps.config)
+        ? new WeixinReplyProgressSender({
+            runId,
+            to: ctx.To,
+            accountId: deps.accountId,
+            opts: {
+                baseUrl: deps.baseUrl,
+                token: deps.token,
+                contextToken,
+            },
+        })
+        : undefined;
+    const humanDelay = deps.channelRuntime.reply.resolveHumanDelayConfig(deps.config, "agent");
+    const { dispatcher, replyOptions, markDispatchIdle } = deps.channelRuntime.reply.createReplyDispatcherWithTyping({
+        humanDelay,
+        deliver: async (payload) => {
+            await sendMessageWeixin({
+                to: ctx.To,
+                text: payload.text ?? "",
+                opts: { baseUrl: deps.baseUrl, token: deps.token, contextToken, runId },
+            });
+        },
+    });
+    logger.debug(`dispatchReplyFromConfig: starting agentId=agent`);
+    try {
+        await deps.channelRuntime.reply.withReplyDispatcher({
+            dispatcher,
+            run: () => deps.channelRuntime.reply.dispatchReplyFromConfig({
+                ctx: finalized,
+                cfg: deps.config,
+                dispatcher,
+                replyOptions: {
+                    ...replyOptions,
+                    ...(replyProgressSender?.replyOptions ?? {}),
+                    disableBlockStreaming: true,
+                },
+            }),
+        });
+        logger.debug(`dispatchReplyFromConfig: done agentId=agent`);
+    }
+    catch (err) {
+        logger.error(`dispatchReplyFromConfig: error agentId=agent err=${String(err)}`);
+        throw err;
+    }
+    finally {
+        markDispatchIdle();
+        await replyProgressSender?.finalize();
+    }
+}
+"#,
+    )
+    .expect("process message file");
+
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime");
+    patch_openclaw_runtime(&temp.path().join("runtime"), &state_dir).expect("patch runtime again");
+
+    let patched = fs::read_to_string(&process_file).expect("patched process message");
+    let run_id_index = patched.find("const runId = randomUUID();").expect("run id");
+    let watcher_index = patched
+        .find("const wecodeApprovalWatcher = startWecodeWeixinNativeApprovalWatcher")
+        .expect("approval watcher");
+    let dispatcher_index = patched
+        .find("createReplyDispatcherWithTyping")
+        .expect("dispatcher");
+    let dispatch_index = patched.find("withReplyDispatcher").expect("dispatch");
+    let clear_index = patched
+        .find("clearInterval(wecodeApprovalWatcher);")
+        .expect("clear watcher");
+    let mark_idle_index = patched.find("markDispatchIdle();").expect("mark idle");
+    assert!(
+        run_id_index < watcher_index
+            && watcher_index < dispatcher_index
+            && dispatcher_index < dispatch_index
+            && dispatch_index < clear_index
+            && clear_index < mark_idle_index,
+        "weixin native approval watcher should cover the full dispatch lifetime:\n{patched}"
+    );
+    assert_eq!(
+        patched
+            .matches("const wecodeApprovalWatcher = startWecodeWeixinNativeApprovalWatcher")
+            .count(),
+        1,
+        "approval watcher patch should be idempotent:\n{patched}"
+    );
+    assert_eq!(
+        patched
+            .matches("clearInterval(wecodeApprovalWatcher);")
+            .count(),
+        1,
+        "approval watcher cleanup should be idempotent:\n{patched}"
+    );
+    assert!(!patched.contains("disableBlockStreaming: true"));
 }
 
 #[test]
