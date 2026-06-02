@@ -1,5 +1,7 @@
 # wecode
 
+[中文文档](README_CN.md)
+
 Turn WeChat or Feishu into a remote console for your local [Codex CLI](https://github.com/openai/codex) — dispatch coding tasks from your phone while your machine does the real work.
 
 ## Why wecode
